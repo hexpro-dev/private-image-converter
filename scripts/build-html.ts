@@ -33,6 +33,13 @@ function sha256(text: string): string {
 	return createHash('sha256').update(text, 'utf8').digest('base64');
 }
 
+/** The exact text between a tag's open and close, as the browser will hash it. */
+function elementContent(html: string, tag: 'script' | 'style'): string {
+	const match = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(html);
+	if (!match?.[1]) throw new Error(`the built document has no ${tag} element`);
+	return match[1];
+}
+
 export async function buildStandaloneHtml(): Promise<StandaloneBuildResult> {
 	const manifest = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8')) as {
 		version: string;
@@ -63,11 +70,16 @@ export async function buildStandaloneHtml(): Promise<StandaloneBuildResult> {
 	// script and produced a file that parsed as HTML and not as a program.
 	let html = template.replace('<!--STYLE-->', () => style).replace('<!--SCRIPT-->', () => script);
 
-	// Hashed after substitution rather than before, because the CSP has to
-	// describe what actually landed in the document. Hashing the bundle
-	// directly is subtly wrong the moment anything reformats the element.
-	const scriptSha256 = sha256(script);
-	const styleSha256 = sha256(style);
+	// Hashed from what actually landed in the document, not from the bundle.
+	//
+	// This is not a theoretical distinction. Running the formatter over the
+	// template put each placeholder on its own indented line, so the script
+	// element's content gained a leading newline and two tabs, the hash in the
+	// policy no longer described it, and the browser refused to run the file.
+	// Every other assertion in the build test still passed. Read the element
+	// back out of the finished document and there is nothing left to get wrong.
+	const scriptSha256 = sha256(elementContent(html, 'script'));
+	const styleSha256 = sha256(elementContent(html, 'style'));
 
 	const csp = [
 		"default-src 'none'",

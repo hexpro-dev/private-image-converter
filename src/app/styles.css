@@ -238,6 +238,16 @@ input[type='range'] {
 	flex: none;
 }
 
+.result__thumb--label {
+	display: grid;
+	place-items: center;
+	font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	font-size: 0.7rem;
+	letter-spacing: 0.08em;
+	color: var(--accent-light);
+	border: 1px solid var(--edge);
+}
+
 .result__body {
 	flex: 1 1 16rem;
 	min-width: 0;

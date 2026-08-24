@@ -62,11 +62,33 @@ function isobmffBrands(bytes: Uint8Array): string[] {
 	const size = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0);
 	const brands: string[] = [ascii(bytes, 8, 4)];
 	// major brand, then a four byte minor version, then the compatible list.
+	//
+	// Read from the whole buffer rather than from the sniffing window. Apple
+	// writes several brands and the list can run past 64 bytes, and the brand
+	// that decides between AVIF and HEIC is not guaranteed to be an early one.
+	// Truncating the list there made a thirteen brand AVIF read as HEIC, which
+	// then handed an AV1 bitstream to an HEVC decoder.
 	const end = Math.min(size, bytes.length);
 	for (let offset = 16; offset + 4 <= end; offset += 4) {
 		brands.push(ascii(bytes, offset, 4));
 	}
 	return brands;
+}
+
+/**
+ * Whether an ICO or CUR directory header is real.
+ *
+ * `00 00 02 00` is a valid CUR header and also the first four bytes of the most
+ * common TGA there is: no identification field, no colour map, image type 2.
+ * The two are told apart by the image count, which an ICO directory requires to
+ * be at least one and which lands on a TGA's colour map length, zero for any
+ * truecolour file. Without this check every uncompressed TGA was reported as a
+ * cursor.
+ */
+function looksLikeIco(bytes: Uint8Array): boolean {
+	if (bytes.length < 6) return false;
+	const count = (bytes[4] as number) | ((bytes[5] as number) << 8);
+	return count >= 1;
 }
 
 /**
@@ -134,12 +156,17 @@ export function sniffFormat(bytes: Uint8Array): FormatId | undefined {
 	if (ascii(head, 0, 4) === 'qoif') return 'qoi';
 	if (ascii(head, 0, 8) === 'farbfeld') return 'farbfeld';
 	if (startsWith(head, [0x42, 0x4d])) return 'bmp';
-	if (startsWith(head, [0x00, 0x00, 0x01, 0x00])) return 'ico';
-	if (startsWith(head, [0x00, 0x00, 0x02, 0x00])) return 'ico'; // .cur, same container
-	if (ascii(head, 0, 4) === 'II\x2a\x00' || ascii(head, 0, 4) === 'MM\x00\x2a') return 'tiff';
+	if (startsWith(head, [0x00, 0x00, 0x01, 0x00]) && looksLikeIco(head)) return 'ico';
+	// .cur, the same container with a different type field.
+	if (startsWith(head, [0x00, 0x00, 0x02, 0x00]) && looksLikeIco(head)) return 'ico';
+	// Compared byte by byte rather than as a string, because the fourth byte of
+	// the little endian signature is a NUL and `ascii` pads a short buffer with
+	// those: read as text, a three byte file containing `II*` matched.
+	if (startsWith(head, [0x49, 0x49, 0x2a, 0x00]) || startsWith(head, [0x4d, 0x4d, 0x00, 0x2a]))
+		return 'tiff';
 
 	if (head.length >= 12 && ascii(head, 4, 4) === 'ftyp') {
-		const brands = isobmffBrands(head);
+		const brands = isobmffBrands(bytes);
 		// AVIF first. An AVIF is also mif1-compatible, so testing HEIF first
 		// would hand an AV1 bitstream to the HEVC decoder.
 		if (brands.some((brand) => AVIF_BRANDS.has(brand))) return 'avif';

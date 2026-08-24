@@ -176,6 +176,22 @@ export const FORMATS: { readonly [K in FormatId]: FormatInfo } = {
 
 export const FORMAT_IDS: readonly FormatId[] = Object.keys(FORMATS) as FormatId[];
 
+/**
+ * Formats a browser will render in an `img` element.
+ *
+ * Worth knowing before showing a preview of a conversion. QOI, TGA, PNM and
+ * farbfeld are perfectly good files that no browser can display, so a preview
+ * of one is a broken image icon sitting next to a successful conversion, which
+ * reads as a failure. AVIF and WebP are here because every current browser
+ * decodes them, and a stale one showing a broken thumbnail is a smaller problem
+ * than never previewing them at all.
+ */
+const DISPLAYABLE = new Set<FormatId>(['png', 'jpeg', 'webp', 'avif', 'gif', 'bmp', 'ico', 'svg']);
+
+export function isDisplayable(format: FormatId): boolean {
+	return DISPLAYABLE.has(format);
+}
+
 export function formatInfo(id: FormatId): FormatInfo {
 	return FORMATS[id];
 }

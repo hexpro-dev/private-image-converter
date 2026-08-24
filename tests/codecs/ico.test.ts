@@ -682,3 +682,266 @@ describe('decodeIco', () => {
 		expect(error.code).toBe('input/too-large');
 	});
 });
+
+/* ── Conformance against bytes this codec did not write ───────────────── */
+
+/**
+ * Everything above this line builds its input with `buildIco` and `buildDib`,
+ * which are helpers written from the same reading of the format as the codec
+ * they exercise. That is enough to catch a slip, and not enough to catch a
+ * misreading: flip the AND mask's bit order in the decoder and in `buildDib`
+ * at the same time and every test above still passes.
+ *
+ * So the fixtures below come from somewhere else. Each icon is either one
+ * ImageMagick wrote, or, where its writer will not produce the shape at all,
+ * one assembled from the published layout and then handed back to ImageMagick
+ * to read. The expected pixels are always ImageMagick's, never this decoder's,
+ * which is what makes them worth asserting.
+ */
+
+function fromHex(hex: string): Uint8Array {
+	const out = new Uint8Array(hex.length / 2);
+	for (let i = 0; i < out.length; i += 1) {
+		out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+	}
+	return out;
+}
+
+/**
+ * The 54 byte directory ImageMagick writes for a 256, 64 and 16 pixel icon,
+ * copied out of its output. The payload lengths are the only part of it
+ * specific to that file, and the offsets follow from them.
+ */
+const FOREIGN_DIRECTORY =
+	'000001000300000000000100200028200400360000004040000001002000284200005e200400' +
+	'10100000010020006804000086620400';
+const FOREIGN_PAYLOAD_BYTES = [270376, 16936, 1128] as const;
+
+interface Fixture {
+	readonly what: string;
+	readonly bytes: string;
+	readonly width: number;
+	readonly height: number;
+	readonly hasAlpha: boolean;
+	readonly rgba: readonly number[];
+}
+
+const FIXTURES: readonly Fixture[] = [
+	{
+		// Written by ImageMagick. Five pixels across at one bit each is five
+		// bits in a four byte row, so all but the first byte is padding, and
+		// the mask row beside it is padded the same way.
+		what: 'a one bit icon at an odd width, written by another tool',
+		bytes:
+			'0000010001000503020001000100480000001600000028000000050000000600000001000100000000000c00' +
+			'0000000000000000000002000000020000000000000000ffff0078000000f8000000d8000000800000000000' +
+			'000020000000',
+		width: 5,
+		height: 3,
+		hasAlpha: true,
+		rgba: [
+			255, 255, 0, 255, 255, 255, 0, 255, 0, 0, 0, 0, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255,
+			0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 0, 0, 0, 0,
+			255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255,
+		],
+	},
+	{
+		// Written by ImageMagick. Two and a half bytes of pixels per row, so
+		// the high nibble of the third byte is the last pixel and the low
+		// nibble is padding.
+		what: 'a four bit icon at an odd width, written by another tool',
+		bytes:
+			'0000010001000503100001000400800000001600000028000000050000000600000001000400000000000c00' +
+			'00000000000000000000100000001000000000000000111111000000ff002244880000cc000055bb550000ff' +
+			'ff0088442200ee774400bb55bb00ff00ff00ffff0000cccccc00ffffff0000000000000000000859d000b37c' +
+			'10002406a000800000000000000020000000',
+		width: 5,
+		height: 3,
+		hasAlpha: true,
+		rgba: [
+			255, 0, 0, 255, 0, 204, 0, 255, 0, 0, 0, 0, 255, 255, 0, 255, 255, 0, 255, 255, 0, 255, 255,
+			255, 136, 68, 34, 255, 34, 68, 136, 255, 204, 204, 204, 255, 17, 17, 17, 255, 0, 0, 0, 0, 68,
+			119, 238, 255, 85, 187, 85, 255, 187, 85, 187, 255, 255, 255, 255, 255,
+		],
+	},
+	{
+		// Assembled by hand, because ImageMagick's writer always emits the
+		// full 256 entry palette and this one declares six. Getting the
+		// palette size wrong would move the pixels by a kilobyte, so the case
+		// is worth having. ImageMagick reads it back to the pixels below.
+		what: 'an eight bit icon whose header declares a six colour palette',
+		bytes:
+			'00000100010007050600010008007c0000001600000028000000070000000a00000001000800000000000000' +
+			'0000000000000000000006000000000000000000ff0000ff0000ff000000332211001964c800090909000203' +
+			'0405000102000405000102030500010102020303040005040302010001000001020304050000020000000800' +
+			'0000c00000000000000022000000',
+		width: 7,
+		height: 5,
+		hasAlpha: true,
+		rgba: [
+			255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 0, 17, 34, 51, 255, 200, 100, 25, 255, 9, 9, 9,
+			255, 255, 0, 0, 0, 9, 9, 9, 255, 200, 100, 25, 255, 17, 34, 51, 255, 0, 0, 255, 255, 0, 255,
+			0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 255, 0, 0, 0, 255, 0, 0, 0, 0, 255, 255, 0, 0, 255,
+			255, 17, 34, 51, 255, 17, 34, 51, 255, 200, 100, 25, 255, 200, 100, 25, 255, 9, 9, 9, 255,
+			255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 0, 17, 34, 51, 255, 9, 9, 9, 255, 0, 0, 255, 255,
+			17, 34, 51, 255, 200, 100, 25, 255, 9, 9, 9, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255,
+			0,
+		],
+	},
+	{
+		// Assembled by hand as well: ImageMagick writes 32 bits whenever an
+		// icon carries transparency, so 24 bits beside a mask is a shape it
+		// never produces. Fifteen bytes of pixels in a sixteen byte row.
+		what: 'a twenty four bit icon that carries its transparency in the mask',
+		bytes:
+			'0000010001000503000001001800640000001600000028000000050000000600000001001800000000000000' +
+			'0000000000000000000000000000000000003c32285a5046786e64968c82b4aaa000030201060504090807fc' +
+			'fbfa808080000000ff00ff00ff000000ffff1e140a0018000000c000000020000000',
+		width: 5,
+		height: 3,
+		hasAlpha: true,
+		rgba: [
+			255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 0, 255, 255, 0, 255, 10, 20, 30, 255, 1, 2, 3, 0,
+			4, 5, 6, 0, 7, 8, 9, 255, 250, 251, 252, 255, 128, 128, 128, 255, 40, 50, 60, 255, 70, 80, 90,
+			255, 100, 110, 120, 255, 130, 140, 150, 0, 160, 170, 180, 0,
+		],
+	},
+	{
+		// Written by ImageMagick. The alpha channel carries the transparency
+		// here, and the mask underneath it says the same thing, so this pins
+		// the case where the two agree.
+		what: 'a thirty two bit icon with straight alpha, written by another tool',
+		bytes:
+			'0000010001000503000001002000700000001600000028000000050000000600000001002000000000003c00' +
+			'0000000000000000000000000000000000003c78f000f0783cff5ab45affb45ab4ffffffffffffff00ff2040' +
+			'80ff804020ffc8c8c8ff101010ff0000ffff00c800ffff00000000ffffffff00ffff80000000000000002000' +
+			'0000',
+		width: 5,
+		height: 3,
+		hasAlpha: true,
+		rgba: [
+			255, 0, 0, 255, 0, 200, 0, 255, 0, 0, 255, 0, 255, 255, 0, 255, 255, 0, 255, 255, 0, 255, 255,
+			255, 128, 64, 32, 255, 32, 64, 128, 255, 200, 200, 200, 255, 16, 16, 16, 255, 240, 120, 60, 0,
+			60, 120, 240, 255, 90, 180, 90, 255, 180, 90, 180, 255, 255, 255, 255, 255,
+		],
+	},
+];
+
+describe('conformance', () => {
+	it('writes the directory another implementation writes, byte for byte', () => {
+		const ico = encodeIco([
+			{ width: 256, height: 256, png: pngLike(FOREIGN_PAYLOAD_BYTES[0]) },
+			{ width: 64, height: 64, png: pngLike(FOREIGN_PAYLOAD_BYTES[1]) },
+			{ width: 16, height: 16, png: pngLike(FOREIGN_PAYLOAD_BYTES[2]) },
+		]);
+		const expected = fromHex(FOREIGN_DIRECTORY);
+		expect(Array.from(ico.subarray(0, expected.length))).toEqual(Array.from(expected));
+	});
+
+	for (const fixture of FIXTURES) {
+		it(`decodes ${fixture.what} to the pixels another implementation reads`, () => {
+			const image = decodeIco(fromHex(fixture.bytes));
+			expect(image.width).toBe(fixture.width);
+			expect(image.height).toBe(fixture.height);
+			expect(image.colourSpace).toBe('srgb');
+			expect(image.hasAlpha).toBe(fixture.hasAlpha);
+			expect(pixels(image.data)).toEqual(fixture.rgba);
+		});
+	}
+
+	/**
+	 * `biClrUsed` above eight bits per pixel.
+	 *
+	 * Windows documents it there as the size of a colour table kept to help an
+	 * eight bit display, and nothing indexes it. Both icons below carry one,
+	 * filled with 0x7f so that mistaking it for pixels is unmistakable rather
+	 * than merely wrong. ImageMagick reads past the table to the same eight
+	 * pixels in each case.
+	 */
+	const TABLE_ABOVE_EIGHT_BITS = [
+		{
+			what: 'a thirty two bit icon carrying a two entry colour table',
+			bytes:
+				'0000010001000402000001002000580000001600000028000000040000000400000001002000000000000000' +
+				'0000000000000000000002000000000000007f7f7f7f7f7f7f7f3c3228ff5a5046ff786e64ff968c82ff0000' +
+				'ffff00ff00ffff0000ff1e140aff0000000000000000',
+		},
+		{
+			what: 'a twenty four bit icon carrying a three entry colour table',
+			bytes:
+				'0000010001000402000001001800540000001600000028000000040000000400000001001800000000000000' +
+				'0000000000000000000003000000000000007f7f7f7f7f7f7f7f7f7f7f7f3c32285a5046786e64968c820000' +
+				'ff00ff00ff00001e140a0000000000000000',
+		},
+	] as const;
+	const TABLE_ABOVE_EIGHT_BITS_RGBA = [
+		255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90,
+		255, 100, 110, 120, 255, 130, 140, 150, 255,
+	];
+
+	for (const fixture of TABLE_ABOVE_EIGHT_BITS) {
+		it(`starts the pixels after the colour table in ${fixture.what}`, () => {
+			const image = decodeIco(fromHex(fixture.bytes));
+			expect(image.width).toBe(4);
+			expect(image.height).toBe(2);
+			expect(pixels(image.data)).toEqual(TABLE_ABOVE_EIGHT_BITS_RGBA);
+		});
+	}
+
+	it('refuses a colour table larger than the bitmap it sits in', () => {
+		const bytes = fromHex(TABLE_ABOVE_EIGHT_BITS[0].bytes);
+		// Four billion colour table entries, which is where ignoring the count
+		// used to hand back the table itself as the picture.
+		new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint32(
+			22 + 32,
+			0xffffffff,
+			true,
+		);
+		const error = failureOf(() => decodeIco(bytes));
+		expect(error).toBeInstanceOf(DecodeFailedError);
+		expect(error.message).toContain('colour table');
+		expect(error.message.endsWith('.')).toBe(true);
+	});
+
+	it('reads every entry of a foreign icon out of its directory intact', () => {
+		const bytes = fromHex(FIXTURES[4]?.bytes ?? '');
+		const directory = readIcoDirectory(bytes);
+		expect(directory.kind).toBe('icon');
+		expect(directory.entries.length).toBe(1);
+		expect(directory.entries[0]?.width).toBe(5);
+		expect(directory.entries[0]?.height).toBe(3);
+		expect(directory.entries[0]?.bitCount).toBe(32);
+		expect(directory.entries[0]?.payloadKind).toBe('dib');
+		// The payload is the rest of the file, and it is a view rather than a copy.
+		expect(directory.entries[0]?.payload.length).toBe(bytes.length - 22);
+	});
+
+	it('refuses the whole icon when the largest image is a PNG, bitmaps or not', () => {
+		// The standard modern Windows icon is small sizes as bitmaps with 256
+		// as an embedded PNG. Reading the largest is the documented contract,
+		// so this file has to be taken apart with `readIcoDirectory` rather
+		// than handed to `decodeIco`, and that is worth pinning rather than
+		// discovering.
+		const small = buildDib({
+			width: 2,
+			declaredHeight: 4,
+			bitCount: 24,
+			rows: [
+				[1, 2, 3, 4, 5, 6],
+				[7, 8, 9, 10, 11, 12],
+			],
+			mask: [
+				[false, false],
+				[false, false],
+			],
+		});
+		const file = buildIco([
+			{ width: 2, height: 2, payload: small, bitCount: 24 },
+			{ width: 256, height: 256, payload: pngLike(64) },
+		]);
+		expect(failureOf(() => decodeIco(file))).toBeInstanceOf(UnsupportedHereError);
+
+		const directory = readIcoDirectory(file);
+		expect(directory.entries.map((entry) => entry.payloadKind)).toEqual(['dib', 'png']);
+	});
+});

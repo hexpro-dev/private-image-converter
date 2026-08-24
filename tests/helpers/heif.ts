@@ -28,7 +28,7 @@ function fromBase64(text: string): Uint8Array {
 export const SAMPLE_HVCC = fromBase64(HVCC_BASE64);
 export const SAMPLE_TILE = fromBase64(TILE_BASE64);
 
-function concat(parts: readonly Uint8Array[]): Uint8Array {
+export function concat(parts: readonly Uint8Array[]): Uint8Array {
 	let total = 0;
 	for (const part of parts) total += part.length;
 	const out = new Uint8Array(total);
@@ -40,28 +40,28 @@ function concat(parts: readonly Uint8Array[]): Uint8Array {
 	return out;
 }
 
-function u8(...values: number[]): Uint8Array {
+export function u8(...values: number[]): Uint8Array {
 	return Uint8Array.from(values);
 }
 
-function u16(value: number): Uint8Array {
+export function u16(value: number): Uint8Array {
 	return u8((value >> 8) & 0xff, value & 0xff);
 }
 
-function u32(value: number): Uint8Array {
+export function u32(value: number): Uint8Array {
 	return u8((value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff);
 }
 
-function ascii(text: string): Uint8Array {
+export function ascii(text: string): Uint8Array {
 	return Uint8Array.from([...text].map((c) => c.charCodeAt(0)));
 }
 
-function box(type: string, ...payload: Uint8Array[]): Uint8Array {
+export function box(type: string, ...payload: Uint8Array[]): Uint8Array {
 	const body = concat(payload);
 	return concat([u32(body.length + 8), ascii(type), body]);
 }
 
-function fullBox(
+export function fullBox(
 	type: string,
 	version: number,
 	flags: number,
@@ -92,6 +92,14 @@ export interface HeifFixtureOptions {
 	readonly exif?: Uint8Array;
 	/** Declare a grid whose tiles do not cover its stated size. */
 	readonly underCoveredGrid?: boolean;
+	/**
+	 * Carry an ICC profile instead of an nclx block.
+	 *
+	 * Apple writes a profile rather than a set of primaries, so this is the
+	 * path a real photograph takes and the one where the gamut has to be read
+	 * out of the profile itself.
+	 */
+	readonly icc?: Uint8Array;
 }
 
 /**
@@ -142,7 +150,9 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 		fullBox('ispe', 0, 0, u32(tileSize), u32(tileSize)), // 1: tile size
 		box('hvcC', SAMPLE_HVCC), // 2
 		fullBox('ispe', 0, 0, u32(width), u32(height)), // 3: image size
-		box('colr', ascii('nclx'), u16(options.primaries ?? 1), u16(13), u16(6), u8(0x80)), // 4
+		options.icc
+			? box('colr', ascii('prof'), options.icc) // 4
+			: box('colr', ascii('nclx'), u16(options.primaries ?? 1), u16(13), u16(6), u8(0x80)), // 4
 	];
 	let next = 5;
 	let rotationIndex = 0;

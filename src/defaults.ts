@@ -14,6 +14,7 @@
  *    50+ left free for a host application's plugin, typically WebAssembly
  */
 
+import { ImageTooLargeError } from './errors.js';
 import { FORMATS } from './formats.js';
 import { declaresWideGamut, findIccProfile } from './metadata/icc.js';
 import { registerDecoder, registerEncoder } from './registry.js';
@@ -106,9 +107,19 @@ function pureDecoder(
 		async available() {
 			return available();
 		},
-		async decode(bytes) {
+		async decode(bytes, context) {
+			const image = await decode(bytes);
+			// Checked here rather than inside each codec. A codec receives bytes
+			// and knows nothing about the caller's budget, and every one of them
+			// already refuses a dishonest header before allocating, so what is
+			// left is an honest header for an image larger than this caller is
+			// willing to handle. Without this the ceiling would apply to the
+			// HEIC path and quietly not to any other, which is worse than having
+			// no ceiling at all because it would look like it worked.
+			const pixels = image.width * image.height;
+			if (pixels > context.maxPixels) throw new ImageTooLargeError(pixels, context.maxPixels);
 			return {
-				image: await decode(bytes),
+				image,
 				orientation: { rotation: 0, mirror: 'none', source: 'none' },
 			};
 		},

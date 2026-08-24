@@ -439,6 +439,104 @@ describe('decodeTga on files this encoder does not write', () => {
 	});
 });
 
+/**
+ * Whole files captured byte for byte from ImageMagick 7 and ffmpeg.
+ *
+ * A round trip through this package's own encoder and decoder shows the two
+ * agree with each other and says nothing at all about the format. These are the
+ * other half of the question: bytes somebody else wrote, against the pixels
+ * those same tools read back out of them. Every one of these is the output of
+ * one command on one 4 by 3 picture, so the expected pixels below are the same
+ * twelve colours seen five different ways.
+ */
+function hex(text: string): Uint8Array {
+	const out = new Uint8Array(text.length / 2);
+	for (let i = 0; i < out.length; i += 1) {
+		out[i] = Number.parseInt(text.slice(i * 2, i * 2 + 2), 16);
+	}
+	return out;
+}
+
+function hexOf(image: RasterImage): string {
+	return Array.from(image.data, (value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+/** What ImageMagick and ffmpeg both decode the 24 and 32 bit fixtures to. */
+const TWELVE_COLOURS =
+	'1e90ffff1e90ffff1e90ffffff4500ff228b22ff8a2be2ffffd700ff000000ff' +
+	'ffffffffffffffff7f7f7fff010203ff';
+
+describe('decodeTga against files other tools wrote', () => {
+	it('reads ImageMagick run length encoded 24 bit output', () => {
+		// magick src.png -type TrueColor -compress RLE out.tga
+		// A version 1 file: ImageMagick writes no footer, and the last row is a
+		// literal packet that happens to contain a repeat, which is legal and
+		// which this package's own encoder would have written as a run.
+		const decoded = decodeTga(
+			hex(
+				'00000a00000000000000000004000300182082ff901e000045ff03228b22e22b8a00d7ff0000000' +
+					'3ffffffffffff7f7f7f030201',
+			),
+		);
+		expect([decoded.width, decoded.height]).toEqual([4, 3]);
+		expect(hexOf(decoded)).toBe(TWELVE_COLOURS);
+		expect(decoded.hasAlpha).toBe(false);
+	});
+
+	it('reads ImageMagick uncompressed 24 bit output', () => {
+		// magick src.png -type TrueColor -compress none out.tga
+		const decoded = decodeTga(
+			hex(
+				'000002000000000000000000040003001820ff901eff901eff901e0045ff228b22e22b8a00d7ff0' +
+					'00000ffffffffffff7f7f7f030201',
+			),
+		);
+		expect(hexOf(decoded)).toBe(TWELVE_COLOURS);
+	});
+
+	it('reads ImageMagick uncompressed 8 bit greyscale output', () => {
+		// magick src.png -colorspace Gray -type Grayscale -compress none out.tga
+		const decoded = decodeTga(hex('000003000000000000000000040003000820808080686d4cd000ffff7f02'));
+		expect(hexOf(decoded)).toBe(
+			'808080ff808080ff808080ff686868ff6d6d6dff4c4c4cffd0d0d0ff000000ff' +
+				'ffffffffffffffff7f7f7fff020202ff',
+		);
+		expect(decoded.hasAlpha).toBe(false);
+	});
+
+	it('reads ffmpeg run length encoded 32 bit output, footer and all', () => {
+		// ffmpeg -i src.png -pix_fmt bgra -c:v targa out.tga
+		const decoded = decodeTga(
+			hex(
+				'00000a00000000000000000004000300202882ff901eff000045ffff03228b22ffe22b8aff00d7f' +
+					'fff000000ff81ffffffff017f7f7fff030201ff00000000000000005452554556495349' +
+					'4f4e2d5846494c452e00',
+			),
+		);
+		expect(hexOf(decoded)).toBe(TWELVE_COLOURS);
+		// Every pixel is opaque, so the channel carries nothing.
+		expect(decoded.hasAlpha).toBe(false);
+	});
+
+	it('reads ffmpeg 16 bit output, widening the way ffmpeg does', () => {
+		// ffmpeg -i src.png -pix_fmt rgb555le -c:v targa out.tga
+		// These are ffmpeg's own pixels for these bytes. ImageMagick lands one
+		// off on some of them because it scales five bits to eight by
+		// multiplying rather than by repeating them, which puts 31 at 248.
+		const decoded = decodeTga(
+			hex(
+				'0000020000000000000000000400030010205f125f0eb04daf45912970294d73000cff7fff7fef4' +
+					'12100000000000000000054525545564953494f4e2d5846494c452e00',
+			),
+		);
+		expect(hexOf(decoded)).toBe(
+			'2194ffff1894ffff9c6b84ff8c6b7bff52638cff525a84ffe7d66bff180000ff' +
+				'ffffffffffffffff847b7bff000808ff',
+		);
+		expect(decoded.hasAlpha).toBe(false);
+	});
+});
+
 describe('decodeTga refusals', () => {
 	it('refuses a file too short to hold a header', () => {
 		expect(() => decodeTga(new Uint8Array(17))).toThrow(DecodeFailedError);
@@ -517,8 +615,20 @@ describe('decodeTga refusals', () => {
 		expect(() => decodeTga(file(header(5, 1, 1, 24, 0x20)))).toThrow(/image type of 5/);
 	});
 
-	it('refuses a pixel depth the format does not define', () => {
-		expect(() => decodeTga(file(header(2, 1, 1, 48, 0x20)))).toThrow(/pixel depth of 48/);
+	it('refuses a truecolour depth the format does not define', () => {
+		expect(() => decodeTga(file(header(2, 1, 1, 48, 0x20)))).toThrow(/truecolour depth of 48/);
+	});
+
+	it('names 8 bits as a depth truecolour cannot use, not one the format lacks', () => {
+		// Eight bits is perfectly well defined, just not here, and a message
+		// saying otherwise sends somebody hunting the wrong fault in their file.
+		expect(() => decodeTga(file(header(2, 1, 1, 8, 0x20)))).toThrow(
+			/defines truecolour only at 15, 16, 24 and 32/,
+		);
+	});
+
+	it('refuses a header that declares no image data', () => {
+		expect(() => decodeTga(file(header(0, 4, 4, 24, 0x20)))).toThrow(/carries no image data/);
 	});
 
 	it('refuses 16 bit greyscale by name', () => {

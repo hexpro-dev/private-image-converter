@@ -292,6 +292,19 @@ describe('BMP round trips', () => {
 		expect(back.hasAlpha).toBe(true);
 		expect(pixelsOf(back)).toEqual([10, 20, 30, 0, 40, 50, 60, 255]);
 	});
+
+	it('carries an image that is transparent everywhere through unchanged', () => {
+		// The hard case for the reader's alpha salvage. The file our writer emits
+		// names an alpha mask, so a decoder that took every zero as a mistake
+		// would hand back an opaque rectangle and the round trip would silently
+		// lose the whole alpha channel.
+		const source = raster(2, 2, new Array<number>(16).fill(0), true);
+		for (let i = 0; i < 16; i += 4) source.data.set([10, 20, 30, 0], i);
+		const back = decodeBmp(encodeBmp(source));
+
+		expect(back.hasAlpha).toBe(true);
+		expect(pixelsOf(back)).toEqual(pixelsOf(source));
+	});
 });
 
 /* ── Decoding ─────────────────────────────────────────────────────────── */
@@ -487,6 +500,28 @@ describe('decodeBmp', () => {
 		expect(pixelsOf(decodeBmp(file))).toEqual([0, 255, 0, 0]);
 	});
 
+	it('reads only the lowest contiguous run of a mask that is not contiguous', () => {
+		// Red claims bits 4 to 7 and, dishonestly, bits 12 to 15 as well. The run
+		// this reader uses is the low one, so the first pixel, which sets only the
+		// high group, is not red at all. Extracting through the mask as declared
+		// would produce a number far larger than four bits can hold, which scales
+		// past 255 and clamps, and both pixels would come out fully lit.
+		const file = buildBmp({
+			width: 2,
+			height: 1,
+			bitCount: 32,
+			headerSize: 108,
+			compression: 3,
+			masks: [0x0000f0f0, 0x000f0000, 0x00f00000, 0],
+			rows: [
+				// 0x0000f000, then 0x000000f0.
+				[0x00, 0xf0, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x00],
+			],
+		});
+
+		expect(pixelsOf(decodeBmp(file))).toEqual([0, 0, 0, 255, 255, 0, 0, 255]);
+	});
+
 	it('treats a 32 bit BI_RGB file with no alpha byte set as opaque', () => {
 		const file = buildBmp({
 			width: 2,
@@ -573,6 +608,53 @@ describe('decodeBmp', () => {
 		new DataView(spaced.buffer).setUint32(10, 62, true);
 
 		expect(pixelsOf(decodeBmp(spaced))).toEqual([3, 2, 1, 255]);
+	});
+});
+
+/* ── A file this package did not write ────────────────────────────────── */
+
+describe('decodeBmp against a file from another writer', () => {
+	/**
+	 * A two by two BMP written by ImageMagick 7, byte for byte.
+	 *
+	 * Every other decoder fixture here is assembled from the field values in
+	 * the specification, which is a better test than a round trip but is still
+	 * this package's reading of the format on both sides. This one is not: it
+	 * is a real file from an implementation with no connection to this one, and
+	 * it is the shape the hand built fixtures never produce, a 124 byte
+	 * BITMAPV5HEADER with the colour space, intent and profile fields filled
+	 * in, BI_BITFIELDS masks inside the header and a real alpha channel.
+	 *
+	 * The pixels below are what ImageMagick itself reads back out of it.
+	 */
+	const magickV5 = Uint8Array.from([
+		0x42, 0x4d, 0x9a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8a, 0x00, 0x00, 0x00, 0x7c, 0x00,
+		0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0x03, 0x00,
+		0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x42, 0x47, 0x52, 0x73, 0x8f, 0xc2, 0xf5, 0x28, 0x51, 0xb8,
+		0x1e, 0x15, 0x1e, 0x85, 0xeb, 0x01, 0x33, 0x33, 0x33, 0x13, 0x66, 0x66, 0x66, 0x26, 0x66, 0x66,
+		0x66, 0x06, 0x99, 0x99, 0x99, 0x09, 0x3d, 0x0a, 0xd7, 0x03, 0x28, 0x5c, 0x8f, 0x32, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
+		0xff, 0x40, 0x32, 0x64, 0xc8, 0xff, 0x1e, 0x14, 0x0a, 0x80,
+	]);
+
+	it('reads a BITMAPV5HEADER file written by ImageMagick', () => {
+		const image = decodeBmp(magickV5);
+
+		expect(image.width).toBe(2);
+		expect(image.height).toBe(2);
+		expect(image.hasAlpha).toBe(true);
+		expect(pixelsOf(image)).toEqual([
+			200, 100, 50, 255, 10, 20, 30, 128, 0, 0, 0, 0, 255, 255, 255, 64,
+		]);
+	});
+
+	it('re-encodes that file to something with the same pixels in it', () => {
+		const again = decodeBmp(encodeBmp(decodeBmp(magickV5)));
+
+		expect(pixelsOf(again)).toEqual(pixelsOf(decodeBmp(magickV5)));
 	});
 });
 

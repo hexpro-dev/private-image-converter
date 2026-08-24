@@ -7,7 +7,7 @@
  * path it was never meant to touch.
  */
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { installDefaultCodecs, resetDefaultCodecs } from '../src/defaults.js';
 import { emptyCapabilities } from '../src/detect/capabilities.js';
 import {
@@ -118,6 +118,42 @@ const DEFAULT_DECODER_IDS = [
 	'farbfeld-pure',
 ];
 
+/**
+ * The ladder as the package publishes it, keyed on the rung an id names.
+ *
+ * Priority is a cost rather than a preference: 10 for the platform's own
+ * decoder, 20 for our own reader driving the platform's video decoder, 40 for
+ * a pure TypeScript implementation, and 50 upwards left free for a host's
+ * plugin. A host registers against those numbers, so they are a contract
+ * rather than an internal detail, and the path is what `ConvertReport` shows
+ * the person waiting to explain why one file took longer than another.
+ */
+const DOCUMENTED_DECODER_RUNGS = {
+	native: { priority: 10, path: 'native-image' },
+	webcodecs: { priority: 20, path: 'webcodecs' },
+	pure: { priority: 40, path: 'pure' },
+} as const;
+
+/**
+ * An encoder is either the browser's canvas or our own code.
+ *
+ * There is no third entry, because nothing here writes through WebCodecs.
+ * Writing HEIC is a refusal rather than a gap: nothing in a browser encodes
+ * HEVC, and doing it ourselves carries patent obligations a free tool has no
+ * way to meet.
+ */
+const DOCUMENTED_ENCODER_PATHS = { native: 'canvas', pure: 'pure', webcodecs: undefined } as const;
+
+/** The lowest priority left free for a host application's plugin. */
+const PLUGIN_BAND = 50;
+
+/** The rung an id names, which is whatever follows the format it handles. */
+function rungOf(id: string): keyof typeof DOCUMENTED_DECODER_RUNGS {
+	const rung = id.slice(id.indexOf('-') + 1);
+	if (rung === 'native' || rung === 'webcodecs' || rung === 'pure') return rung;
+	throw new Error(`${id} does not name a rung of the documented ladder`);
+}
+
 const DEFAULT_ENCODER_IDS = [
 	'png-native',
 	'jpeg-native',
@@ -137,6 +173,13 @@ beforeEach(() => {
 	// this has to go with it. Without it the first test to install them wins and
 	// every later one sees an empty registry.
 	resetDefaultCodecs();
+});
+
+afterEach(() => {
+	// Two tests stand a browser global up to reach the half of the shipped
+	// availability checks that Node cannot otherwise get to. Left in place it
+	// would change what the rest of the file measures.
+	vi.unstubAllGlobals();
 });
 
 describe('registering a codec', () => {
@@ -172,6 +215,18 @@ describe('registering a codec', () => {
 		expect(priorityOf(registeredEncoders(), 'png-x')).toBe(20);
 	});
 
+	it('hands back a snapshot rather than the map it is still using', () => {
+		// The return type says readonly, which is a compile-time promise and no
+		// help at all to the host application calling this from JavaScript. What
+		// matters is that a list already handed out cannot change underneath its
+		// owner, so a caller can hold one while registering a plugin.
+		registerDecoder(fakeDecoder('png-x'));
+		const taken = registeredDecoders();
+		registerDecoder(fakeDecoder('png-y'));
+		expect(ids(taken)).toEqual(['png-x']);
+		expect(ids(registeredDecoders())).toEqual(['png-x', 'png-y']);
+	});
+
 	it('keeps decoder ids and encoder ids in separate namespaces', () => {
 		// The built-ins deliberately reuse one id across both: png-pure is a
 		// decoder and an encoder, and neither may evict the other.
@@ -198,6 +253,27 @@ describe('choosing a decoder', () => {
 			'fast',
 			'middling',
 			'slow',
+		]);
+	});
+
+	it('orders on the number and not on how the number reads', async () => {
+		// The shipped ladder is 10, 20 and 40, which happen to sort into the same
+		// order as text, so nothing else in this file can tell a numeric compare
+		// from a lexicographic one. These cannot: as text, 9 lands after 100.
+		// Both ends are legal. A host is told to go below the built-ins to win
+		// outright, and 50 upwards is the band left free for its plugins, so a
+		// WebAssembly decoder at 100 must be tried last rather than second.
+		registerDecoder(fakeDecoder('hundred', { priority: 100 }));
+		registerDecoder(fakeDecoder('nine', { priority: 9 }));
+		registerDecoder(fakeDecoder('below-everything', { priority: -5 }));
+		registerDecoder(fakeDecoder('ten', { priority: 10 }));
+		registerDecoder(fakeDecoder('zero', { priority: 0 }));
+		expect(ids(await decodersFor('png', emptyCapabilities()))).toEqual([
+			'below-everything',
+			'zero',
+			'nine',
+			'ten',
+			'hundred',
 		]);
 	});
 
@@ -235,6 +311,32 @@ describe('choosing a decoder', () => {
 		expect(await decodersFor('png', emptyCapabilities())).toEqual([]);
 	});
 
+	it('never asks a decoder for another format whether it can run', async () => {
+		// Filtering before probing rather than after. A host's plugin probe is
+		// the expensive one, since it typically has to fetch and instantiate a
+		// WebAssembly module to answer, and converting a QOI must not pay for the
+		// HEIC decoder's answer. Asserting the result alone cannot see this: the
+		// wrong order returns exactly the same list.
+		const other = fakeDecoder('heic-x', { formats: ['heic'] });
+		registerDecoder(other);
+		registerDecoder(fakeDecoder('png-x', { formats: ['png'] }));
+		await decodersFor('png', emptyCapabilities());
+		expect(other.seen).toEqual([]);
+	});
+
+	it('ignores a decoder that lists no formats at all', async () => {
+		// A host that works its format list out at runtime can hand over an empty
+		// one, and the honest reading of that is a decoder that reads nothing.
+		// It stays registered, so unregistering it still works, and it is never
+		// offered and never probed.
+		const nothing = fakeDecoder('reads-nothing', { formats: [] });
+		registerDecoder(nothing);
+		expect(ids(registeredDecoders())).toEqual(['reads-nothing']);
+		expect(await decodersFor('png', emptyCapabilities())).toEqual([]);
+		expect(nothing.seen).toEqual([]);
+		expect(await readableFormats(emptyCapabilities())).toEqual(new Set());
+	});
+
 	it('hands the probe the capability set it was asked about', async () => {
 		const decoder = fakeDecoder('png-x');
 		registerDecoder(decoder);
@@ -269,6 +371,21 @@ describe('choosing an encoder', () => {
 		registerEncoder(fakeEncoder('working', { priority: 20 }));
 		expect(ids(await encodersFor('png', emptyCapabilities()))).toEqual(['working']);
 	});
+
+	it('never asks an encoder for another format whether it can run', async () => {
+		const other = fakeEncoder('avif-x', { format: 'avif' });
+		registerEncoder(other);
+		registerEncoder(fakeEncoder('png-x', { format: 'png' }));
+		await encodersFor('png', emptyCapabilities());
+		expect(other.seen).toEqual([]);
+	});
+
+	it('orders encoders on the number and not on how the number reads', async () => {
+		registerEncoder(fakeEncoder('hundred', { priority: 100 }));
+		registerEncoder(fakeEncoder('nine', { priority: 9 }));
+		registerEncoder(fakeEncoder('ten', { priority: 10 }));
+		expect(ids(await encodersFor('png', emptyCapabilities()))).toEqual(['nine', 'ten', 'hundred']);
+	});
 });
 
 describe('memoised availability', () => {
@@ -282,6 +399,24 @@ describe('memoised availability', () => {
 		await decodersFor('png', capabilities);
 		await decodersFor('png', capabilities);
 		await readableFormats(capabilities);
+		expect(decoder.seen).toHaveLength(1);
+	});
+
+	it('probes once when two lookups are in flight together', async () => {
+		// The answer is cached as the promise, before it settles, so the second
+		// caller waits on the first probe rather than starting another. An
+		// implementation that awaited the probe and then cached the boolean
+		// returns all the same answers and quietly probes twice, which on the
+		// real ladder means decoding and encoding the sample images twice.
+		// Converting several files at once is the ordinary case, not a corner.
+		const decoder = fakeDecoder('png-x');
+		registerDecoder(decoder);
+		const capabilities = emptyCapabilities();
+		await Promise.all([
+			decodersFor('png', capabilities),
+			decodersFor('png', capabilities),
+			readableFormats(capabilities),
+		]);
 		expect(decoder.seen).toHaveLength(1);
 	});
 
@@ -314,6 +449,28 @@ describe('memoised availability', () => {
 		registerDecoder(fakeDecoder('png-y'));
 		await decodersFor('png', capabilities);
 		expect(decoder.seen).toHaveLength(2);
+	});
+
+	it('forgets the old answer when an id is registered over', async () => {
+		// The override case, and the one where a stale answer does real damage.
+		// A host replaces our PNG decoder with its own, its own says it cannot
+		// run here, and a cache still holding the first decoder's yes puts the
+		// replacement on the ladder anyway. Registering a different id, which is
+		// the other test above, cannot see this: only the id already in the map
+		// has a cached answer to go stale.
+		const capabilities = emptyCapabilities();
+		registerDecoder(fakeDecoder('png-x'));
+		expect(ids(await decodersFor('png', capabilities))).toEqual(['png-x']);
+		registerDecoder(fakeDecoder('png-x', { probe: 'no' }));
+		expect(ids(await decodersFor('png', capabilities))).toEqual([]);
+	});
+
+	it('forgets the old encoder answer when an id is registered over', async () => {
+		const capabilities = emptyCapabilities();
+		registerEncoder(fakeEncoder('png-x', { probe: 'no' }));
+		expect(ids(await encodersFor('png', capabilities))).toEqual([]);
+		registerEncoder(fakeEncoder('png-x'));
+		expect(ids(await encodersFor('png', capabilities))).toEqual(['png-x']);
 	});
 
 	it('re-probes once a new encoder is registered', async () => {
@@ -512,6 +669,44 @@ describe('the default codec set', () => {
 		expect(priorityOf(encoders, 'jpeg-native')).toBeLessThan(priorityOf(encoders, 'png-native'));
 	});
 
+	it('numbers each rung the way the ladder is published', () => {
+		// Relative ordering on its own cannot hold this. Moving the pure rung
+		// from 40 to 60 keeps every ordering assertion in this file green and
+		// silently takes away the band a host was told it could register in, so
+		// its WebAssembly HEIC decoder at 50 starts running ahead of ours.
+		installDefaultCodecs();
+		for (const decoder of registeredDecoders()) {
+			const rung = DOCUMENTED_DECODER_RUNGS[rungOf(decoder.id)];
+			expect(decoder.priority, decoder.id).toBe(rung.priority);
+		}
+		for (const encoder of registeredEncoders()) {
+			// The canvas is 10 everywhere except PNG, where ours goes first and
+			// the canvas sits behind it at 20. Every pure encoder is 10.
+			expect(encoder.priority, encoder.id).toBe(encoder.id === 'png-native' ? 20 : 10);
+		}
+		for (const codec of [...registeredDecoders(), ...registeredEncoders()]) {
+			expect(codec.priority, `${codec.id} stays out of the plugin band`).toBeLessThan(PLUGIN_BAND);
+		}
+	});
+
+	it('labels each rung with the path it really runs on', () => {
+		// `ConvertReport.decodePath` reaches the interface and is shown to the
+		// person waiting, because somebody on a software plugin is waiting
+		// several times longer than somebody on the hardware path and saying so
+		// is the difference between a slow tool and a broken one. A rung that
+		// reports the wrong path tells them the wrong story, and every id and
+		// priority assertion in this file passes while it does.
+		installDefaultCodecs();
+		for (const decoder of registeredDecoders()) {
+			expect(decoder.path, decoder.id).toBe(DOCUMENTED_DECODER_RUNGS[rungOf(decoder.id)].path);
+		}
+		for (const encoder of registeredEncoders()) {
+			const rung = rungOf(encoder.id);
+			expect(rung, `${encoder.id} does not encode through WebCodecs`).not.toBe('webcodecs');
+			expect(encoder.path, encoder.id).toBe(DOCUMENTED_ENCODER_PATHS[rung]);
+		}
+	});
+
 	it('offers no HEIC decoder to a browser with neither HEIC nor HEVC', async () => {
 		installDefaultCodecs();
 		expect(await decodersFor('heic', emptyCapabilities())).toEqual([]);
@@ -521,6 +716,86 @@ describe('the default codec set', () => {
 		installDefaultCodecs();
 		expect(ids(await encodersFor('jpeg', emptyCapabilities()))).toEqual([]);
 		expect(ids(await encodersFor('avif', emptyCapabilities()))).toEqual([]);
+	});
+
+	it('offers the WebCodecs rung to a browser whose video decoder does HEVC', async () => {
+		// The counterpart to the test above, and the reason it means anything.
+		// Every negative assertion in this file would still pass if each shipped
+		// probe simply returned false, which is one edit away in a file where
+		// most of the checks read `capabilities.something`. This is Chromium on
+		// a machine with a decode block: no HEIC decoder of its own, so our
+		// reader drives the video decoder instead.
+		installDefaultCodecs();
+		const chromium = emptyCapabilities({ hevcVideoDecoder: true });
+		expect(ids(await decodersFor('heic', chromium))).toEqual(['heic-webcodecs']);
+		expect(await readableFormats(chromium)).toContain('heic');
+	});
+
+	it('offers a canvas encoder only for the types the canvas really wrote', async () => {
+		// Safari has never written WebP and does not say so: asked for one it
+		// returns a PNG with the wrong type on it. The capability set is the
+		// result of sniffing what actually came back, so a format missing from
+		// it is missing because the probe caught the lie, and the registry has
+		// to honour that rather than offering the canvas for everything it
+		// nominally supports.
+		installDefaultCodecs();
+		const safari = emptyCapabilities({ canvasEncode: new Set(['image/png', 'image/jpeg']) });
+		expect(ids(await encodersFor('jpeg', safari))).toEqual(['jpeg-native']);
+		expect(ids(await encodersFor('webp', safari))).toEqual([]);
+		expect(await writableFormats(safari)).not.toContain('webp');
+	});
+
+	it('asks the browser only for the types it said it could decode', async () => {
+		// The other half of the native availability check, which no capability
+		// set alone can reach: Node has no createImageBitmap, so under this
+		// suite every native rung is unavailable for that reason rather than for
+		// the one being tested, and a check reading `||` instead of `&&` passes
+		// everything. Where it matters, an older Safari offers png-native for a
+		// PNG and must not offer bmp-native for a BMP it cannot read, or the
+		// interface lists a format that then fails at decode time.
+		vi.stubGlobal('createImageBitmap', () => {
+			throw new Error('the registry picks decoders, it must never run one');
+		});
+		installDefaultCodecs();
+		const older = emptyCapabilities({ nativeDecode: new Set(['image/png']) });
+		// png-pure rides on CompressionStream, which is an environment fact
+		// rather than a package one, so only the first rung is asserted here.
+		expect(ids(await decodersFor('png', older))[0]).toBe('png-native');
+		expect(ids(await decodersFor('bmp', older))).toEqual(['bmp-pure']);
+
+		// A fresh capability object, because the answers above are memoised
+		// against the old one and pulling the global would not disturb them.
+		vi.stubGlobal('createImageBitmap', undefined);
+		const noDecoder = emptyCapabilities({ nativeDecode: new Set(['image/png']) });
+		expect(ids(await decodersFor('png', noDecoder))).not.toContain('png-native');
+	});
+
+	it('writes no HEIC however capable the browser is', async () => {
+		// A deliberate refusal rather than a gap. Nothing in a browser encodes
+		// HEVC, and doing it ourselves would carry patent obligations a free
+		// tool has no way to meet. HEIC is read-only and always will be, so it
+		// must never appear on the writable list even with everything switched
+		// on, and a format arriving in the union later must not quietly acquire
+		// an encoder either.
+		installDefaultCodecs();
+		const everything = emptyCapabilities({
+			nativeDecode: new Set(['image/heic', 'image/png', 'image/jpeg', 'image/webp', 'image/avif']),
+			canvasEncode: new Set(['image/png', 'image/jpeg', 'image/webp', 'image/avif']),
+			hevcVideoDecoder: true,
+			compressionStream: true,
+		});
+		expect(await encodersFor('heic', everything)).toEqual([]);
+		expect([...(await writableFormats(everything))].sort()).toEqual([
+			'avif',
+			'bmp',
+			'farbfeld',
+			'jpeg',
+			'png',
+			'pnm',
+			'qoi',
+			'tga',
+			'webp',
+		]);
 	});
 
 	it('still reads and writes the pure formats with no browser capability at all', async () => {

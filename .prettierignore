@@ -6,3 +6,10 @@ pnpm-lock.yaml
 # Generated images and their manifest. Reformatting the manifest would change
 # its bytes and break the fixture hash check.
 tests/fixtures/
+
+# The offline app's template. Its whitespace is load-bearing: the placeholders
+# sit directly inside their elements, and the Content-Security-Policy names the
+# sha256 of exactly what ends up between the tags. The build now hashes the
+# finished document rather than the bundle, so a reformat no longer breaks it,
+# but there is still nothing to gain from reformatting this file.
+src/app/index.html

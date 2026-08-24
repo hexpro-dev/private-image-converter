@@ -12,7 +12,7 @@
 
 import { convert } from '../convert.js';
 import { detectCapabilities } from '../detect/capabilities.js';
-import { FORMATS } from '../formats.js';
+import { FORMATS, isDisplayable } from '../formats.js';
 import { isConverterError } from '../errors.js';
 import { downloadBlob, outputName } from '../dom/download.js';
 import type { ConvertResult, FormatId } from '../types.js';
@@ -90,16 +90,28 @@ function render(result: ConvertResult, filename: string, blob: Blob): void {
 	const card = document.createElement('article');
 	card.className = 'result';
 
-	const thumb = document.createElement('img');
-	thumb.className = 'result__thumb';
-	thumb.alt = '';
-	// The preview is the converted file itself, so what is shown is what will
-	// be saved rather than a re-render of the source.
-	const preview = URL.createObjectURL(blob);
-	thumb.src = preview;
-	// Not revoked on a timer: the thumbnail stays on screen for as long as the
-	// page is open, and revoking under a live <img> blanks it in Safari.
-	thumb.addEventListener('error', () => URL.revokeObjectURL(preview), { once: true });
+	// The preview is the converted file itself, so what is shown is what will be
+	// saved rather than a re-render of the source. Where the browser cannot
+	// render the format, the slot carries its name instead: a broken image icon
+	// beside a successful conversion reads as a failure.
+	let thumb: HTMLElement;
+	if (isDisplayable(result.report.to)) {
+		const image = document.createElement('img');
+		image.className = 'result__thumb';
+		image.alt = '';
+		const preview = URL.createObjectURL(blob);
+		image.src = preview;
+		// Not revoked on a timer: the thumbnail stays on screen for as long as
+		// the page is open, and revoking under a live img blanks it in Safari.
+		image.addEventListener('error', () => URL.revokeObjectURL(preview), { once: true });
+		thumb = image;
+	} else {
+		const slot = document.createElement('span');
+		slot.className = 'result__thumb result__thumb--label';
+		slot.textContent = FORMATS[result.report.to].label;
+		slot.setAttribute('aria-hidden', 'true');
+		thumb = slot;
+	}
 
 	const body = document.createElement('div');
 	body.className = 'result__body';

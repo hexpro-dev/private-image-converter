@@ -224,10 +224,17 @@ function decodeDib(payload: Uint8Array, declaredHeight: number): RasterImage {
 			`the bitmap declares ${paletteCount} palette colours, which ${bitCount} bits per pixel cannot index.`,
 		);
 	}
+	// Above eight bits nothing indexes a palette, but the header can still
+	// declare a colour table: Windows documents `biClrUsed` at 16, 24 and 32
+	// bits as the size of one kept to help an eight bit display pick colours.
+	// The table is dead weight to this reader, and skipping it is still the
+	// difference between the pixels and two rows of somebody's palette, so the
+	// count is honoured at every depth even though only the low ones read it.
+	const tableCount = bitCount <= 8 ? paletteCount : colourCount;
 	const paletteStart = headerBytes;
-	const pixelStart = headerBytes + paletteCount * 4;
+	const pixelStart = headerBytes + tableCount * 4;
 	if (pixelStart > payload.length) {
-		fail('the palette runs past the end of the image data.');
+		fail('the colour table runs past the end of the image data.');
 	}
 
 	// Rows of both the pixels and the mask are padded out to four bytes.

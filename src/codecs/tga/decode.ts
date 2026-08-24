@@ -26,6 +26,8 @@ const DECODER_ID = 'tga-pure';
 /** Fixed at 18 bytes, ahead of the image id and the colour map. */
 const HEADER_BYTES = 18;
 
+/** A header on its own. Legal, and the one type that carries nothing to draw. */
+const IMAGE_TYPE_NONE = 0;
 const IMAGE_TYPE_COLOUR_MAPPED = 1;
 const IMAGE_TYPE_TRUECOLOUR = 2;
 const IMAGE_TYPE_GREYSCALE = 3;
@@ -140,9 +142,14 @@ function expandRle(
  * Decode a TGA into straight RGBA.
  *
  * The result is always tagged sRGB. TGA has no way to carry a colour space: the
- * version 2 extension area holds a gamma ratio and nothing else, and no profile
- * at all, so an image written as a TGA has already lost any record of what its
- * numbers meant.
+ * version 2 extension area holds a gamma ratio and an optional colour
+ * correction table, but no profile and no space, so an image written as a TGA
+ * has already lost any record of what its numbers meant.
+ *
+ * Alpha comes back straight, and is assumed to have been straight. The
+ * extension area's attributes type byte is the format's only statement on that
+ * question, and this reader does not go and look at it, so the rare file
+ * written with premultiplied alpha comes back premultiplied.
  */
 export function decodeTga(bytes: Uint8Array): RasterImage {
 	if (bytes.length < HEADER_BYTES) {
@@ -184,6 +191,11 @@ export function decodeTga(bytes: Uint8Array): RasterImage {
 		case IMAGE_TYPE_HUFFMAN_QUADTREE:
 			fail('it uses one of the Huffman compressed types, which this reader does not implement.');
 			break;
+		case IMAGE_TYPE_NONE:
+			// Type 0 is a real thing rather than a corrupt byte: a header, and
+			// sometimes an id field or a colour table, with no picture behind it.
+			fail('its header says it carries no image data at all.');
+			break;
 		default:
 			fail(`the header gives an image type of ${imageType}, which the format does not define.`);
 	}
@@ -200,7 +212,12 @@ export function decodeTga(bytes: Uint8Array): RasterImage {
 		fail(`it is ${depth} bit greyscale, and this reader implements only the 8 bit kind.`);
 	}
 	if (!greyscale && depth !== 15 && depth !== 16 && depth !== 24 && depth !== 32) {
-		fail(`the header gives a pixel depth of ${depth} bits, which the format does not define.`);
+		// Not "the format does not define it": 8 bits is perfectly well defined,
+		// just not for a truecolour image, and saying otherwise sends somebody
+		// looking for the wrong fault in their file.
+		fail(
+			`the header gives a truecolour depth of ${depth} bits, and the format defines truecolour only at 15, 16, 24 and 32.`,
+		);
 	}
 
 	// A truecolour image may still carry a colour map it never reads from, so

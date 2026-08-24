@@ -54,5 +54,8 @@ export function outputName(sourceName: string, extension: string): string {
 	if (trimmed === '') return `image.${extension}`;
 	const dot = trimmed.lastIndexOf('.');
 	const stem = dot > 0 ? trimmed.slice(0, dot) : trimmed;
-	return `${stem}.${extension}`;
+	// A stem of nothing but dots is what a path like `../../etc/passwd` leaves
+	// behind once its separators are gone. Saving that as `....png` is not
+	// dangerous, just useless, so it falls back with everything else.
+	return `${/^\.*$/.test(stem) ? 'image' : stem}.${extension}`;
 }

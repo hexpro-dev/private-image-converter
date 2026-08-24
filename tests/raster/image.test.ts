@@ -8,9 +8,18 @@
  * instead of its own. On a symmetrical or single-colour test raster every one
  * of those produces the correct answer.
  *
- * The colour expectations are worked out from the matrices and the sRGB
- * transfer function rather than captured from a run, so they pin the
- * conversion rather than recording whatever it currently does.
+ * The colour expectations are worked out from the published primaries rather
+ * than captured from a run or read back out of the package's own constants.
+ * Both matrices were rederived from the BT.709 and Display P3 chromaticities
+ * against a D65 white, composed through XYZ, and the numbers below are what
+ * that derivation produces to the byte.
+ *
+ * Anchoring matters more in one direction than the other. A matrix whose rows
+ * still sum to one preserves white, black and every neutral grey, and its
+ * inverse still round trips, so a matrix that is wrong by a hundredth in a row
+ * passes a round trip and a white check and shifts every saturated colour in
+ * the picture. Both directions therefore need a saturated colour pinned to a
+ * number.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -24,6 +33,7 @@ import {
 	flatten,
 	mirror,
 	rotate,
+	withColourSpace,
 } from '../../src/raster/image.js';
 import { outOfSrgbGamut, toColourSpace } from '../../src/raster/colour.js';
 import type { ColourSpace, RasterImage } from '../../src/types.js';
@@ -93,6 +103,36 @@ function expectClose(actual: readonly number[], expected: readonly number[], tol
 	});
 }
 
+describe('creating a raster', () => {
+	it('allocates four bytes a pixel and zeroes every one of them', () => {
+		// A fresh raster is transparent black, and `blit` relies on that: a grid
+		// whose tiles do not cover the whole buffer leaves the gaps as they were
+		// allocated, so a buffer of anything other than zero shows up as fringing
+		// along the edge of an assembled photograph.
+		const image = createRaster(3, 2);
+		expect(image.data).toBeInstanceOf(Uint8ClampedArray);
+		expect(image.data.length).toBe(3 * 2 * 4);
+		expect([...image.data].every((byte) => byte === 0)).toBe(true);
+		expect([image.width, image.height]).toEqual([3, 2]);
+	});
+
+	it('defaults to sRGB without alpha, which is the conservative pair', () => {
+		// Defaulting the other way is silent in both directions. A raster that
+		// claims Display P3 by default tags sRGB numbers as wide gamut and
+		// oversaturates, and one that claims alpha by default makes every encoder
+		// carry a channel that holds nothing.
+		const image = createRaster(1, 1);
+		expect(image.colourSpace).toBe('srgb');
+		expect(image.hasAlpha).toBe(false);
+	});
+
+	it('records the colour space and alpha flag it was given', () => {
+		const image = createRaster(1, 1, 'display-p3', true);
+		expect(image.colourSpace).toBe('display-p3');
+		expect(image.hasAlpha).toBe(true);
+	});
+});
+
 describe('rotation', () => {
 	it('hands back the same raster at zero degrees rather than copying it', () => {
 		// The zero case is on the hot path for every upright photograph, and a
@@ -151,6 +191,44 @@ describe('rotation', () => {
 		expect([turned.width, turned.height]).toEqual([3, 2]);
 		expect([...turned.data]).toEqual([...image.data]);
 	});
+
+	it('carries the colour space and the alpha flag through a quarter turn', () => {
+		// Every photograph taken sideways goes through here, and a photograph off
+		// an iPhone is Display P3. A rotation that rebuilds the raster as sRGB
+		// moves the pixels correctly and relabels them, so the numbers are read
+		// as sRGB from then on and the picture comes out flat. Nothing in the
+		// pixel values says it happened and every geometric assertion above still
+		// passes.
+		const image = createRaster(3, 2, 'display-p3', true);
+		const turned = rotate(image, 90);
+		expect(turned.colourSpace).toBe('display-p3');
+		expect(turned.hasAlpha).toBe(true);
+	});
+
+	it('turns a single column into a single row', () => {
+		// Width one is where a stride mistake stops cancelling itself out. On a
+		// square or near-square raster a rotation that reads with the output's row
+		// length instead of the input's still lands on plausible bytes; with one
+		// column there is nothing for it to land on.
+		const turned = rotate(labelled(1, 3, [10, 20, 30]), 90);
+		expect([turned.width, turned.height]).toEqual([3, 1]);
+		expect(labels(turned)).toEqual([[10, 20, 30]]);
+	});
+
+	it('turns a single row into a single column', () => {
+		const turned = rotate(labelled(3, 1, [10, 20, 30]), 90);
+		expect([turned.width, turned.height]).toEqual([1, 3]);
+		expect(labels(turned)).toEqual([[30], [20], [10]]);
+	});
+
+	it.each([90, 180, 270] as const)('leaves a one pixel raster alone at %s degrees', (angle) => {
+		// The smallest legal raster, through every branch of the switch. Each one
+		// computes a target coordinate from a dimension of one, where every off by
+		// one lands outside the buffer and writes nothing.
+		const turned = rotate(labelled(1, 1, [77]), angle);
+		expect([turned.width, turned.height]).toEqual([1, 1]);
+		expect(pixel(turned, 0, 0)).toEqual([77, 78, 79, 255]);
+	});
 });
 
 describe('mirroring', () => {
@@ -180,6 +258,37 @@ describe('mirroring', () => {
 		const image = asymmetric();
 		const twice = mirror(mirror(image, axis), axis);
 		expect([...twice.data]).toEqual([...image.data]);
+	});
+
+	it.each(['horizontal', 'vertical'] as const)(
+		'carries the colour space and the alpha flag across the %s axis',
+		(axis) => {
+			// Same silent relabelling as a rotation. A mirrored Display P3 photo
+			// that comes back tagged sRGB is pixel for pixel correct and reads flat.
+			const image = createRaster(3, 2, 'display-p3', true);
+			const flipped = mirror(image, axis);
+			expect(flipped.colourSpace).toBe('display-p3');
+			expect(flipped.hasAlpha).toBe(true);
+		},
+	);
+
+	it('carries all four channels across the flip, not only the three colours', () => {
+		// `labels` reads red alone, so on its own it passes a mirror that moves the
+		// colours and writes 255 into every alpha byte. That turns a transparent
+		// logo opaque while leaving the picture correct, which is the same class of
+		// defect as the rotation case above and needs the same check.
+		const image = asymmetric();
+		image.data[3] = 17;
+		expect(pixel(mirror(image, 'horizontal'), 2, 0)).toEqual([10, 11, 12, 17]);
+		expect(pixel(mirror(image, 'vertical'), 0, 1)).toEqual([10, 11, 12, 17]);
+	});
+
+	it('reverses a single row and leaves a single column alone on the horizontal axis', () => {
+		// One row and one column are the two degenerate cases, and they must move
+		// in opposite ways for the same axis. An axis mixup is invisible on a
+		// square raster and total on these.
+		expect(labels(mirror(labelled(3, 1, [10, 20, 30]), 'horizontal'))).toEqual([[30, 20, 10]]);
+		expect(labels(mirror(labelled(1, 3, [10, 20, 30]), 'horizontal'))).toEqual([[10], [20], [30]]);
 	});
 });
 
@@ -256,6 +365,17 @@ describe('cropping', () => {
 		expect(window.colourSpace).toBe('display-p3');
 		expect(window.hasAlpha).toBe(true);
 	});
+
+	it('takes a single pixel out of the bottom right corner', () => {
+		// The smallest legal window at the furthest offset, which is where the
+		// stride arithmetic has the most room to overshoot: the read starts at the
+		// last pixel of the buffer and any excess runs off the end, where
+		// `subarray` clamps and hands back a short row rather than throwing.
+		const image = labelled(4, 3, [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]);
+		const window = crop(image, 3, 2, 1, 1);
+		expect([window.width, window.height]).toEqual([1, 1]);
+		expect(pixel(window, 0, 0)).toEqual([120, 121, 122, 255]);
+	});
 });
 
 describe('blitting a tile', () => {
@@ -314,6 +434,45 @@ describe('blitting a tile', () => {
 		blit(into, tile, 2, 2);
 		expect(pixel(into, 2, 2)).toEqual([10, 11, 12, 64]);
 	});
+
+	it('lands a single pixel tile in the very last position', () => {
+		// The last pixel of the buffer. A clip computed one short drops it and
+		// leaves a single wrong pixel in the bottom right corner of every
+		// assembled image, which is exactly the size of defect nobody reports.
+		const into = target();
+		blit(into, labelled(1, 1, [99]), 3, 2);
+		expect(labels(into)).toEqual([
+			[5, 5, 5, 5],
+			[5, 5, 5, 5],
+			[5, 5, 5, 99],
+		]);
+	});
+
+	it('clips a tile larger than the target in both directions', () => {
+		// The other end of the range from the tile that fits. Here both clips come
+		// from the target rather than from the tile, and the source stride is still
+		// the tile's: reading it as one run gives 10, 20, 30, 40 then 50, 60, 70,
+		// 80 instead of skipping the fifth column each row.
+		const into = target();
+		const big = labelled(
+			5,
+			5,
+			// prettier-ignore
+			[
+				10, 20, 30, 40, 50,
+				60, 70, 80, 90, 100,
+				110, 120, 130, 140, 150,
+				160, 170, 180, 190, 200,
+				210, 220, 230, 240, 250,
+			],
+		);
+		blit(into, big, 0, 0);
+		expect(labels(into)).toEqual([
+			[10, 20, 30, 40],
+			[60, 70, 80, 90],
+			[110, 120, 130, 140],
+		]);
+	});
 });
 
 describe('flattening onto a background', () => {
@@ -364,6 +523,27 @@ describe('flattening onto a background', () => {
 		const image = asymmetric();
 		expect(flatten(image, [0, 0, 0])).toBe(image);
 	});
+
+	it('keeps the colour space of the raster it flattened', () => {
+		// Flattening happens on the way into a format with no alpha channel, which
+		// for a phone photograph means JPEG. Rebuilding the raster as sRGB here
+		// hands Display P3 numbers to the encoder labelled sRGB, and the file is
+		// flat with nothing in it to say why.
+		const image = createRaster(1, 1, 'display-p3', true);
+		image.data.set([200, 40, 40, 128], 0);
+		expect(flatten(image).colourSpace).toBe('display-p3');
+	});
+
+	it('leaves the raster it was handed exactly as it found it', () => {
+		// "In place on a copy" is the contract. Compositing into the caller's own
+		// buffer destroys the original, which the converter still needs whenever
+		// one decode feeds more than one output.
+		const image = translucent();
+		const before = [...image.data];
+		const flat = flatten(image, [0, 0, 255]);
+		expect([...image.data]).toEqual(before);
+		expect(flat.data).not.toBe(image.data);
+	});
 });
 
 describe('detecting alpha', () => {
@@ -383,6 +563,16 @@ describe('detecting alpha', () => {
 	it('is true when a pixel is fully transparent', () => {
 		const image = asymmetric();
 		image.data[3] = 0;
+		expect(detectAlpha(image)).toBe(true);
+	});
+
+	it('finds a translucent pixel that is the last one in the buffer', () => {
+		// The existing cases sit at the front and in the middle, and a scan that
+		// stops one pixel short passes both. The last pixel is the bottom right
+		// corner of the picture, which for a rounded icon or a photograph on a
+		// transparent background is precisely where the translucency is.
+		const image = asymmetric();
+		image.data[image.data.length - 1] = 254;
 		expect(detectAlpha(image)).toBe(true);
 	});
 
@@ -440,6 +630,37 @@ describe('attaching an auxiliary alpha image', () => {
 			11, 22, 202, 203, 204, 205,
 		]);
 	});
+
+	it('stops at the colour image when the alpha image is the larger of the two', () => {
+		// The truncation has to hold in both directions and only the shorter alpha
+		// image was pinned. Overrunning the other way is currently caught by the
+		// output buffer rather than by the `Math.min`, because a typed array drops
+		// an out of range write without complaint, so this is the contract being
+		// asserted rather than the arithmetic: a mismatched auxiliary item leaves a
+		// raster the size of the colour image, carrying its alpha values in order.
+		const image = asymmetric();
+		const attached = attachAlpha(
+			image,
+			labelled(4, 3, [0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176]),
+		);
+		expect(attached.data.length).toBe(3 * 2 * 4);
+		expect([attached.width, attached.height]).toEqual([3, 2]);
+		expect([...attached.data.filter((_value, index) => index % 4 === 3)]).toEqual([
+			0, 16, 32, 48, 64, 80,
+		]);
+	});
+
+	it('leaves the colour raster it was handed exactly as it found it', () => {
+		// The HEIF path attaches an auxiliary alpha item to a raster it has just
+		// assembled from tiles. Writing the alpha back into that raster instead of
+		// into the copy would be invisible here and wrong for any caller that
+		// still holds the original.
+		const image = asymmetric();
+		const before = [...image.data];
+		const attached = attachAlpha(image, labelled(3, 2, [0, 64, 128, 192, 255, 32]));
+		expect([...image.data]).toEqual(before);
+		expect(attached.data).not.toBe(image.data);
+	});
 });
 
 describe('converting between colour spaces', () => {
@@ -483,6 +704,39 @@ describe('converting between colour spaces', () => {
 		const original = solid(1, 1, [120, 140, 160, 255], 'srgb');
 		const back = toColourSpace(toColourSpace(original, 'display-p3'), 'srgb');
 		expectClose(pixel(back, 0, 0), [120, 140, 160, 255], 1);
+	});
+
+	it('pulls pure sRGB red in from the edge of the wider gamut', () => {
+		// The reverse direction, pinned to a number instead of to a round trip.
+		// A round trip passes for any matrix that is the true inverse of the one
+		// going the other way, and passes again for a pair that are inverses of
+		// each other and both wrong. White, black and grey add nothing to that,
+		// because they only test that the rows sum to one.
+		//
+		// 234, 51, 35 is what the BT.709 and Display P3 primaries give. sRGB red
+		// sits well inside the P3 gamut, so describing the same colour in P3
+		// primaries takes less red and a real amount of green and blue. A
+		// conversion left out entirely leaves 255, 0, 0 and the picture
+		// oversaturates.
+		const converted = toColourSpace(solid(1, 1, [255, 0, 0, 255], 'srgb'), 'display-p3');
+		expect(converted.colourSpace).toBe('display-p3');
+		expect(pixel(converted, 0, 0)).toEqual([234, 51, 35, 255]);
+	});
+
+	it('pulls pure sRGB green and blue in as well', () => {
+		// Red on its own pins one row of three. Blue moves least, because the two
+		// spaces share a blue primary and only the white balancing separates them.
+		const green = toColourSpace(solid(1, 1, [0, 255, 0, 255], 'srgb'), 'display-p3');
+		const blue = toColourSpace(solid(1, 1, [0, 0, 255, 255], 'srgb'), 'display-p3');
+		expect(pixel(green, 0, 0)).toEqual([117, 251, 76, 255]);
+		expect(pixel(blue, 0, 0)).toEqual([0, 0, 245, 255]);
+	});
+
+	it('shifts a mid tone by a few levels rather than leaving it alone', () => {
+		// Not a corner of the cube, so it exercises all three rows at once against
+		// a number rather than against a tolerance.
+		const converted = toColourSpace(solid(1, 1, [120, 140, 160, 255], 'srgb'), 'display-p3');
+		expect(pixel(converted, 0, 0)).toEqual([124, 139, 158, 255]);
 	});
 
 	it.each(['srgb', 'display-p3'] as const)('preserves pure white converting from %s', (from) => {
@@ -551,5 +805,57 @@ describe('measuring the sRGB gamut overflow', () => {
 
 	it('counts a fully saturated Display P3 image as entirely outside', () => {
 		expect(outOfSrgbGamut(solid(3, 3, [0, 0, 255, 255], 'display-p3'))).toBe(1);
+	});
+
+	it('counts white and black as inside, since both spaces share them', () => {
+		// The boundary is inclusive at both ends. White comes out of the matrix at
+		// exactly 1.0 in all three components because the rows sum to one, so a
+		// check written with >= rather than > calls the whitest pixel in the
+		// picture wide gamut, and any photograph with a highlight in it then
+		// justifies a P3 asset on its own.
+		expect(outOfSrgbGamut(solid(2, 2, [255, 255, 255, 255], 'display-p3'))).toBe(0);
+		expect(outOfSrgbGamut(solid(2, 2, [0, 0, 0, 255], 'display-p3'))).toBe(0);
+	});
+
+	it('counts a colour that only just falls outside', () => {
+		// P3 200, 40, 40 needs a green of -0.0022 in sRGB. That is outside by a
+		// fifth of one percent, and outside is the whole question: the number is
+		// there to decide whether a wide gamut file carries anything sRGB cannot,
+		// so a tolerance would be answering something else. A tolerance of a
+		// couple of percent still reports the extremes and quietly swallows most
+		// of what a real photograph has out there.
+		expect(outOfSrgbGamut(solid(1, 1, [200, 40, 40, 255], 'display-p3'))).toBe(1);
+		expect(outOfSrgbGamut(solid(1, 1, [30, 30, 34, 255], 'display-p3'))).toBe(0);
+	});
+});
+
+describe('retagging a colour space without converting', () => {
+	it('changes the tag and leaves every byte where it was', () => {
+		// The dangerous twin of `toColourSpace`. This one says the numbers were
+		// always in that space; the other one moves them into it. Using this where
+		// the conversion was meant gives the flat picture, and the conversion
+		// where this was meant gives the oversaturated one, and neither throws.
+		const image = solid(2, 1, [200, 40, 40, 255], 'srgb');
+		const retagged = withColourSpace(image, 'display-p3');
+		expect(retagged.colourSpace).toBe('display-p3');
+		expect([...retagged.data]).toEqual([200, 40, 40, 255, 200, 40, 40, 255]);
+	});
+
+	it('shares the pixel buffer rather than copying it', () => {
+		// Same reason the identity paths above hand back the raster they were
+		// given. Retagging 48 megapixels should cost one object, not 190 megabytes.
+		const image = solid(2, 1, [200, 40, 40, 255], 'srgb');
+		expect(withColourSpace(image, 'display-p3').data).toBe(image.data);
+	});
+
+	it('hands back the same raster when the tag already matches', () => {
+		const image = solid(2, 1, [200, 40, 40, 255], 'display-p3');
+		expect(withColourSpace(image, 'display-p3')).toBe(image);
+	});
+
+	it('carries the dimensions and the alpha flag across', () => {
+		const image = createRaster(3, 2, 'srgb', true);
+		const retagged = withColourSpace(image, 'display-p3');
+		expect([retagged.width, retagged.height, retagged.hasAlpha]).toEqual([3, 2, true]);
 	});
 });
