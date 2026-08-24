@@ -1,0 +1,85 @@
+# Publishes with npm's trusted publishing, using the OIDC token GitHub Actions
+# issues for this repository and this workflow file. There is no NPM_TOKEN and
+# there should never be one.
+#
+# The trusted publisher is configured on the package at npmjs.com and names
+# this repository and this filename. Renaming this file or moving the
+# repository invalidates it, and that is the intended behaviour.
+name: publish-npm
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - '@hexpro/private-image-converter@*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or later. Node 22 ships npm 10.
+      - run: npm install -g npm@^11
+
+      - run: pnpm install --frozen-lockfile
+
+      # Repeated from ci.yml on purpose: a tag ref does not match that
+      # workflow's branch filter, so this is the only gate that runs here.
+      - name: Assert zero runtime dependencies
+        run: |
+          count=$(node -p "Object.keys(require('./package.json').dependencies || {}).length")
+          if [ "$count" != "0" ]; then
+            echo "This package must have no runtime dependencies, found $count."
+            exit 1
+          fi
+
+      - name: Verify the version matches the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          tag="${tag##*@}"
+          version=$(node -p "require('./package.json').version")
+          if [ "$tag" != "$version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $version."
+            exit 1
+          fi
+
+      - run: pnpm run format:check
+      - run: pnpm run lint
+      - run: pnpm run typecheck
+      - run: pnpm run test:coverage
+      - run: pnpm run build:all
+
+      # Recorded so somebody who downloads the offline build can check they got
+      # what this run produced.
+      - name: Record the offline app's hash
+        run: |
+          file=dist/private-image-converter.html
+          {
+            echo '### Offline application'
+            echo ''
+            echo "sha256: $(sha256sum "$file" | cut -d' ' -f1)"
+            echo "bytes: $(stat -c%s "$file")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - run: pnpm pack --dry-run
+
+      - run: npm publish --access public --provenance
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/private-image-converter.html
+          generate_release_notes: true

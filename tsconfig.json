@@ -1,0 +1,37 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		// DOM is types only, no runtime cost. `types` is deliberately left
+		// unset so Node's globals never leak into browser-facing code: this
+		// package runs in a tab, and a stray `Buffer` should fail to compile
+		// rather than fail at 3am in somebody's browser.
+		//
+		// DOM.Iterable is here for the WebCodecs and Streams surfaces, which
+		// this package uses heavily and which TypeScript declares across both
+		// DOM libs.
+		"lib": ["ES2022", "DOM", "DOM.Iterable"],
+		"outDir": "./dist",
+		"rootDir": "./src",
+		"strict": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"resolveJsonModule": true,
+		"declaration": true,
+		"declarationMap": true,
+		"sourceMap": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"noImplicitReturns": true,
+		"noFallthroughCasesInSwitch": true,
+		// hex-web consumes `src/` directly through a tsconfig `paths` entry and
+		// compiles it under `verbatimModuleSyntax`. Turning it on here too means
+		// a type import written as a value import fails in this repository's CI
+		// rather than in the website's build.
+		"verbatimModuleSyntax": true
+	},
+	"include": ["src/**/*"],
+	"exclude": ["node_modules", "dist"]
+}

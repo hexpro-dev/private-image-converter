@@ -1,0 +1,100 @@
+{
+	"name": "@hexpro/private-image-converter",
+	"version": "0.1.0",
+	"description": "Convert images between formats entirely in the browser, including HEIC from an iPhone, with no upload and no runtime dependencies",
+	"keywords": [
+		"image",
+		"convert",
+		"heic",
+		"heif",
+		"png",
+		"jpeg",
+		"webp",
+		"qoi",
+		"webcodecs",
+		"offline",
+		"browser"
+	],
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"sideEffects": false,
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./dom": {
+			"types": "./dist/dom/index.d.ts",
+			"import": "./dist/dom/index.js"
+		},
+		"./heif": {
+			"types": "./dist/heif/index.d.ts",
+			"import": "./dist/heif/index.js"
+		},
+		"./codecs": {
+			"types": "./dist/codecs/index.d.ts",
+			"import": "./dist/codecs/index.js"
+		},
+		"./standalone.html": "./dist/private-image-converter.html"
+	},
+	"files": [
+		"dist",
+		"package.json",
+		"LICENSE",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/hexpro-dev/private-image-converter.git"
+	},
+	"homepage": "https://github.com/hexpro-dev/private-image-converter#readme",
+	"bugs": {
+		"url": "https://github.com/hexpro-dev/private-image-converter/issues"
+	},
+	"packageManager": "pnpm@10.33.0",
+	"scripts": {
+		"build": "tsc",
+		"build:html": "tsx scripts/build-html.ts",
+		"build:all": "pnpm run build && pnpm run build:html",
+		"clean": "rimraf dist coverage",
+		"typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+		"lint": "eslint .",
+		"lint:fix": "eslint . --fix",
+		"format": "prettier --write .",
+		"format:check": "prettier --check .",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"test:coverage": "vitest run --coverage",
+		"fixtures": "tsx scripts/generate-fixtures.ts",
+		"fixtures:verify": "tsx scripts/generate-fixtures.ts --verify",
+		"prepublishOnly": "pnpm run clean && pnpm run build:all && pnpm run typecheck && pnpm run test"
+	},
+	"dependencies": {},
+	"devDependencies": {
+		"@eslint/js": "^9.17.0",
+		"@types/node": "^22.10.2",
+		"@vitest/coverage-v8": "^2.1.8",
+		"esbuild": "^0.24.0",
+		"eslint": "^9.17.0",
+		"prettier": "^3.4.2",
+		"rimraf": "^6.0.1",
+		"tsx": "^4.19.2",
+		"typescript": "^5.7.2",
+		"typescript-eslint": "^8.18.2",
+		"vitest": "^2.1.8"
+	},
+	"engines": {
+		"node": ">=22.0.0"
+	},
+	"license": "MIT",
+	"pnpm": {
+		"onlyBuiltDependencies": [
+			"esbuild"
+		]
+	}
+}

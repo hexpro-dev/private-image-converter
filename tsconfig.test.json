@@ -1,0 +1,12 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"rootDir": ".",
+		"noEmit": true,
+		// Tests and build scripts run under Node and may use its globals. The
+		// library itself must not, which is why this is here and not in the
+		// build config.
+		"types": ["node"]
+	},
+	"include": ["src/**/*", "tests/**/*", "scripts/**/*", "vitest.config.ts", "eslint.config.js"]
+}

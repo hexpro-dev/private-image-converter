@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+pnpm-lock.yaml
+
+# Generated images and their manifest. Reformatting the manifest would change
+# its bytes and break the fixture hash check.
+tests/fixtures/

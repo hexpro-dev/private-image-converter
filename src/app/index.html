@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<!--CSP-->
+		<title>Private Image Converter</title>
+		<style>
+			<!--STYLE-->
+		</style>
+	</head>
+	<body>
+		<main class="shell">
+			<header class="masthead">
+				<p class="eyebrow">Offline image converter</p>
+				<h1>Convert an image without uploading it.</h1>
+				<p class="lede">
+					Everything happens in this page. Nothing is sent anywhere, and you can check that by
+					turning your network off and using it anyway.
+				</p>
+			</header>
+
+			<section class="panel" aria-labelledby="drop-title">
+				<div id="drop" class="drop" tabindex="0" role="button" aria-describedby="drop-hint">
+					<h2 id="drop-title" class="drop__title">Drop an image here</h2>
+					<p id="drop-hint" class="drop__hint">Or paste one, or choose a file.</p>
+					<label class="button button--primary" for="file">Choose a file</label>
+					<input id="file" type="file" class="visually-hidden" accept="image/*" multiple />
+				</div>
+
+				<div class="controls">
+					<div class="field">
+						<label for="target">Convert to</label>
+						<select id="target">
+							<option value="png" selected>PNG</option>
+							<option value="jpeg">JPEG</option>
+							<option value="webp">WebP</option>
+							<option value="qoi">QOI</option>
+							<option value="bmp">BMP</option>
+							<option value="tga">TGA</option>
+							<option value="pnm">PNM</option>
+							<option value="farbfeld">farbfeld</option>
+						</select>
+					</div>
+					<div class="field" id="quality-field">
+						<label for="quality">Quality <span id="quality-value">0.92</span></label>
+						<input id="quality" type="range" min="0.1" max="1" step="0.01" value="0.92" />
+					</div>
+					<div class="field field--check">
+						<input id="keep-metadata" type="checkbox" />
+						<label for="keep-metadata">Keep the camera metadata</label>
+					</div>
+				</div>
+			</section>
+
+			<div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+			<section id="results" class="results" aria-live="polite"></section>
+
+			<section class="facts">
+				<h2>What this does</h2>
+				<dl>
+					<div>
+						<dt>Network</dt>
+						<dd id="fact-network">
+							None. No fetch, XMLHttpRequest, WebSocket, EventSource or sendBeacon anywhere in this
+							file.
+						</dd>
+					</div>
+					<div>
+						<dt>Storage</dt>
+						<dd>None. No cookies, local storage, session storage or database.</dd>
+					</div>
+					<div>
+						<dt>HEIC</dt>
+						<dd id="fact-heic">Checking what this browser can do.</dd>
+					</div>
+					<div>
+						<dt>Colour</dt>
+						<dd id="fact-colour">Checking.</dd>
+					</div>
+				</dl>
+			</section>
+
+			<footer class="footer">
+				<p>
+					Hex Pro. Source at github.com/hexpro-dev/private-image-converter, MIT licensed.
+					<span id="version"></span>
+				</p>
+			</footer>
+		</main>
+		<script>
+			<!--SCRIPT-->
+		</script>
+	</body>
+</html>
