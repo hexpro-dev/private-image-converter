@@ -19,13 +19,25 @@
 export type FormatId =
 	| 'heic'
 	| 'png'
+	| 'apng'
 	| 'jpeg'
+	| 'jxl'
 	| 'webp'
 	| 'avif'
 	| 'gif'
 	| 'bmp'
 	| 'ico'
 	| 'tiff'
+	| 'raw'
+	| 'psd'
+	| 'dds'
+	| 'hdr'
+	| 'exr'
+	| 'pcx'
+	| 'icns'
+	| 'ras'
+	| 'xbm'
+	| 'xpm'
 	| 'qoi'
 	| 'tga'
 	| 'pnm'
@@ -86,6 +98,38 @@ export interface RasterImage {
 	 * a lossy encoder knows whether it needs to flatten first.
 	 */
 	readonly hasAlpha: boolean;
+}
+
+/* ── Animation ──────────────────────────────────────────────── */
+
+/**
+ * One frame of an animation, already composited.
+ *
+ * Every frame is a whole picture at the animation's dimensions, not the small
+ * dirty rectangle the file stored. GIF and APNG both encode frames as patches
+ * with a disposal rule and a blend rule, and reproducing those rules is the
+ * decoder's job precisely once. A converter that received patches would have
+ * to reimplement them for every target format, and the two specifications
+ * disagree about what "restore to background" means, so the disagreement would
+ * arrive in the output rather than being settled in the reader.
+ */
+export interface AnimationFrame {
+	readonly image: RasterImage;
+	/**
+	 * How long this frame is shown, in milliseconds.
+	 *
+	 * Not the raw field. GIF stores hundredths of a second and treats 0 and 1
+	 * as "as fast as possible", which browsers render as 100ms; APNG stores a
+	 * rational that can divide by zero. Both are resolved here, so an encoder
+	 * writing the other format converts a duration rather than a convention.
+	 */
+	readonly delayMs: number;
+}
+
+export interface Animation {
+	readonly frames: readonly AnimationFrame[];
+	/** How many times to play. 0 means forever, which is what most files mean. */
+	readonly loopCount: number;
 }
 
 /** A right-angle rotation, in degrees anticlockwise, as HEIF `irot` records it. */
@@ -185,6 +229,15 @@ export interface DecodeOutput {
 	readonly iccProfile?: Uint8Array;
 	/** Number of separately decoded tiles, for containers that are tiled. */
 	readonly tiles?: number;
+	/**
+	 * Every frame, when the source was animated.
+	 *
+	 * Additive rather than replacing `image`, which stays the first frame. A
+	 * caller that only wants a picture keeps working without knowing this field
+	 * exists, and one converting to a still format gets the frame a person
+	 * would expect to see rather than an error.
+	 */
+	readonly animation?: Animation;
 }
 
 /**
@@ -239,6 +292,23 @@ export interface EncodeOptions {
 	 * hand to another tool is a needless risk for no gain.
 	 */
 	readonly writeColourTag?: boolean;
+	/**
+	 * Reduce to a colour table of at most this many entries.
+	 *
+	 * Only meaningful for encoders that can write one. Left unset, an encoder
+	 * that has the choice still writes a palette when the image happens to have
+	 * few enough colours already, because that is lossless and smaller. Setting
+	 * it asks for quantisation, which is not.
+	 */
+	readonly palette?: number;
+	/**
+	 * The frames to write, for an encoder that can animate.
+	 *
+	 * Ignored by every encoder that cannot, which is most of them, so passing
+	 * it is always safe. An animating encoder handed nothing here writes a
+	 * single frame from the image it was given.
+	 */
+	readonly animation?: Animation;
 }
 
 export interface EncodeContext {
@@ -257,7 +327,14 @@ export interface Encoder {
 
 /* ── Conversion ───────────────────────────────────────────────────────── */
 
-export interface ConvertOptions extends EncodeOptions {
+/**
+ * `animation` is not inherited on purpose.
+ *
+ * `convert` decides what frames the encoder receives, from the source and from
+ * `frames` below. A caller that set it here would be quietly overruled, and an
+ * option that is accepted and ignored is worse than one that does not exist.
+ */
+export interface ConvertOptions extends Omit<EncodeOptions, 'animation'> {
 	readonly to: FormatId;
 	/**
 	 * Whether to carry EXIF through to the output.
@@ -276,6 +353,15 @@ export interface ConvertOptions extends EncodeOptions {
 	 */
 	readonly colour?: 'preserve' | 'srgb';
 	readonly maxPixels?: number;
+	/**
+	 * What to do with an animated source.
+	 *
+	 * `all` keeps every frame when the target can hold them and falls back to
+	 * the first frame when it cannot, which is the answer somebody dropping a
+	 * GIF on a PNG button wants. `first` always takes one frame, which is how
+	 * you get a still out of an animation on purpose. Defaults to `all`.
+	 */
+	readonly frames?: 'all' | 'first';
 	readonly signal?: AbortSignal;
 }
 
@@ -292,6 +378,15 @@ export interface ConvertReport {
 	readonly colourSpace: ColourSpace;
 	readonly orientation: Orientation;
 	readonly tiles?: number;
+	/**
+	 * How many frames were written, when more than one was.
+	 *
+	 * Absent for a still image rather than 1, so an interface can test for the
+	 * field instead of comparing against a number that means "not animated".
+	 */
+	readonly frames?: number;
+	/** True when the source was animated and only its first frame was kept. */
+	readonly droppedFrames?: boolean;
 	/**
 	 * What the source file was carrying, when it carried anything.
 	 *

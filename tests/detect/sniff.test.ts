@@ -133,6 +133,128 @@ const TIFF_LE = concat(Uint8Array.from([0x49, 0x49, 0x2a, 0x00]), u32le(8), new 
 const TIFF_BE = concat(Uint8Array.from([0x4d, 0x4d, 0x00, 0x2a]), u32(8), new Uint8Array(20));
 
 /**
+ * A PNG carrying an animation control chunk, which is the only thing that
+ * distinguishes an APNG from a still one. The chunk lengths have to be right:
+ * the sniffer walks them, so a wrong one would land the reader in the middle
+ * of a chunk and the file would read as a still PNG for the wrong reason.
+ */
+const APNG = concat(
+	Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+	u32(13),
+	ascii('IHDR'),
+	new Uint8Array(13),
+	u32(0),
+	u32(8),
+	ascii('acTL'),
+	new Uint8Array(8),
+	u32(0),
+);
+
+/** A still PNG whose chunk list runs to IDAT without an acTL. */
+const PNG_WITH_CHUNKS = concat(
+	Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+	u32(13),
+	ascii('IHDR'),
+	new Uint8Array(13),
+	u32(0),
+	u32(1),
+	ascii('sRGB'),
+	new Uint8Array(1),
+	u32(0),
+	u32(4),
+	ascii('IDAT'),
+	new Uint8Array(4),
+	u32(0),
+);
+
+const JXL = concat(Uint8Array.from([0xff, 0x0a]), new Uint8Array(30));
+const PSD = concat(
+	ascii('8BPS'),
+	Uint8Array.from([0x00, 0x01]),
+	new Uint8Array(6),
+	Uint8Array.from([0x00, 0x03]),
+	u32(4),
+	u32(4),
+	Uint8Array.from([0x00, 0x08, 0x00, 0x03]),
+	new Uint8Array(16),
+);
+const DDS = concat(ascii('DDS '), u32le(124), new Uint8Array(128));
+const ICNS = concat(ascii('icns'), u32(32), new Uint8Array(32));
+const EXR = concat(Uint8Array.from([0x76, 0x2f, 0x31, 0x01]), u32le(2), new Uint8Array(32));
+const SUN_RAS = concat(
+	Uint8Array.from([0x59, 0xa6, 0x6a, 0x95]),
+	u32(4),
+	u32(4),
+	u32(24),
+	new Uint8Array(20),
+);
+const HDR = ascii('#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 4 +X 4\n');
+const XBM = ascii('#define wheel_width 16\n#define wheel_height 7\nstatic char wheel_bits[] = {\n');
+const XPM = ascii('/* XPM */\nstatic char * x[] = {\n"4 4 2 1",\n". c #000000",\n');
+/** Canon's raw file: a TIFF header with the vendor marker straight after it. */
+const CR2 = concat(
+	Uint8Array.from([0x49, 0x49, 0x2a, 0x00]),
+	u32le(16),
+	ascii('CR'),
+	Uint8Array.from([0x02, 0x00]),
+	new Uint8Array(24),
+);
+
+interface PcxOptions {
+	readonly version?: number;
+	readonly encoding?: number;
+	readonly depth?: number;
+	readonly planes?: number;
+	readonly xMax?: number;
+	readonly yMax?: number;
+}
+
+/**
+ * A PCX header, which is 128 bytes of which four are the signature and the
+ * rest are plausibility. Built field by field because every one of those
+ * fields is what separates it from an uncompressed TGA.
+ */
+function pcxFile(options: PcxOptions = {}): Uint8Array {
+	const { version = 5, encoding = 1, depth = 8, planes = 3, xMax = 15, yMax = 15 } = options;
+	const out = new Uint8Array(256);
+	out[0] = 0x0a;
+	out[1] = version;
+	out[2] = encoding;
+	out[3] = depth;
+	const view = new DataView(out.buffer);
+	view.setUint16(4, 0, true);
+	view.setUint16(6, 0, true);
+	view.setUint16(8, xMax, true);
+	view.setUint16(10, yMax, true);
+	out[65] = planes;
+	return out;
+}
+
+interface TiffTag {
+	readonly tag: number;
+	readonly type: number;
+	readonly count: number;
+	readonly value: number;
+}
+
+/** A little endian TIFF whose first directory holds exactly these tags. */
+function tiffWithTags(tags: readonly TiffTag[]): Uint8Array {
+	const out = new Uint8Array(8 + 2 + tags.length * 12 + 4 + 32);
+	const view = new DataView(out.buffer);
+	out.set(Uint8Array.from([0x49, 0x49, 0x2a, 0x00]), 0);
+	view.setUint32(4, 8, true);
+	view.setUint16(8, tags.length, true);
+	tags.forEach((entry, index) => {
+		const at = 10 + index * 12;
+		view.setUint16(at, entry.tag, true);
+		view.setUint16(at + 2, entry.type, true);
+		view.setUint32(at + 4, entry.count, true);
+		view.setUint32(at + 8, entry.value, true);
+	});
+	return out;
+}
+
+/**
  * How many bytes each signature is, from the format's own specification.
  *
  * Every one of these is the published length: eight for the PNG signature, six
@@ -539,6 +661,162 @@ describe('sniffing TGA', () => {
 	});
 });
 
+/* ── The formats told apart by more than a signature ──────────────────── */
+
+describe('an APNG against a still PNG', () => {
+	it('reads a PNG whose chunk list reaches IDAT as a still image', () => {
+		expect(sniffFormat(PNG_WITH_CHUNKS)).toBe('png');
+	});
+
+	it('reads a PNG carrying an animation control chunk as an APNG', () => {
+		expect(sniffFormat(APNG)).toBe('apng');
+	});
+
+	it('stops at the first IDAT rather than scanning the whole file', () => {
+		// An acTL after the first frame is invalid, and a reader that found it
+		// anyway would call a still PNG animated and then decode one frame of
+		// an animation that does not exist.
+		const late = concat(PNG_WITH_CHUNKS, u32(8), ascii('acTL'), new Uint8Array(8), u32(0));
+		expect(sniffFormat(late)).toBe('png');
+	});
+
+	it('does not walk backwards on a chunk length with the top bit set', () => {
+		const broken = concat(
+			Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+			Uint8Array.from([0xff, 0xff, 0xff, 0xf0]),
+			ascii('IHDR'),
+			new Uint8Array(16),
+		);
+		expect(sniffFormat(broken)).toBe('png');
+	});
+});
+
+describe('a PCX against a TGA', () => {
+	it('is recognised from a full header', () => {
+		expect(sniffFormat(pcxFile())).toBe('pcx');
+	});
+
+	it.each([0, 2, 3, 4, 5])('accepts version %d, which ZSoft shipped', (version) => {
+		expect(sniffFormat(pcxFile({ version }))).toBe('pcx');
+	});
+
+	it.each([1, 6, 7, 255])('refuses version %d, which nothing wrote', (version) => {
+		expect(sniffFormat(pcxFile({ version }))).not.toBe('pcx');
+	});
+
+	it('refuses a window that is inside out', () => {
+		// A PCX stores the window rather than the size, so a maximum below the
+		// minimum is not a small image, it is not a PCX.
+		const inverted = pcxFile();
+		new DataView(inverted.buffer).setUint16(8, 0, true);
+		new DataView(inverted.buffer).setUint16(4, 40, true);
+		expect(sniffFormat(inverted)).not.toBe('pcx');
+	});
+
+	it('refuses a plane count no PCX has', () => {
+		expect(sniffFormat(pcxFile({ planes: 7 }))).not.toBe('pcx');
+	});
+
+	it('does not swallow an uncompressed TGA', () => {
+		// The two disagree on the second byte and nowhere else: a run length
+		// encoded PCX and a colour mapped TGA share their first three.
+		expect(sniffFormat(tgaFile({ imageType: 2, idLength: 10 }))).toBe('tga');
+	});
+});
+
+describe('the text formats', () => {
+	it('reads a Radiance picture from its comment', () => {
+		expect(sniffFormat(HDR)).toBe('hdr');
+	});
+
+	it('accepts the older RGBE spelling', () => {
+		expect(sniffFormat(ascii('#?RGBE\nFORMAT=32-bit_rle_rgbe\n\n-Y 2 +X 2\n'))).toBe('hdr');
+	});
+
+	it('refuses a comment that names no format', () => {
+		// `#?` alone is two characters that occur in plenty of text files.
+		expect(sniffFormat(ascii('#?this is a note about the photographs\n'))).toBeUndefined();
+	});
+
+	it('reads an X BitMap from its width define', () => {
+		expect(sniffFormat(XBM)).toBe('xbm');
+	});
+
+	it('does not claim an ordinary C header', () => {
+		expect(sniffFormat(ascii('#define MAX_TILES 48\n#include <stdio.h>\n'))).toBeUndefined();
+	});
+
+	it('reads an X PixMap from its opening comment', () => {
+		expect(sniffFormat(XPM)).toBe('xpm');
+	});
+});
+
+describe('a camera raw against an ordinary TIFF', () => {
+	it('reads a plain TIFF as a TIFF', () => {
+		expect(sniffFormat(TIFF_LE)).toBe('tiff');
+		expect(sniffFormat(TIFF_BE)).toBe('tiff');
+	});
+
+	it("reads Canon's marker as raw", () => {
+		expect(sniffFormat(CR2)).toBe('raw');
+	});
+
+	it('reads a DNG from its version tag', () => {
+		expect(sniffFormat(tiffWithTags([{ tag: 0xc612, type: 1, count: 4, value: 0x01040000 }]))).toBe(
+			'raw',
+		);
+	});
+
+	it('reads a reduced first directory with sub-directories as raw', () => {
+		// How Nikon, Sony, Pentax and Samsung all lay out a raw file: the first
+		// directory is a small preview and the sensor data hangs off a SubIFD.
+		expect(
+			sniffFormat(
+				tiffWithTags([
+					{ tag: 0x00fe, type: 4, count: 1, value: 1 },
+					{ tag: 0x014a, type: 4, count: 1, value: 200 },
+				]),
+			),
+		).toBe('raw');
+	});
+
+	it('does not call a scan raw for having sub-directories alone', () => {
+		expect(sniffFormat(tiffWithTags([{ tag: 0x014a, type: 4, count: 1, value: 200 }]))).toBe(
+			'tiff',
+		);
+	});
+
+	it('does not call a full-size first directory raw', () => {
+		expect(
+			sniffFormat(
+				tiffWithTags([
+					{ tag: 0x00fe, type: 4, count: 1, value: 0 },
+					{ tag: 0x014a, type: 4, count: 1, value: 200 },
+				]),
+			),
+		).toBe('tiff');
+	});
+
+	it('does not read past the buffer on a truncated directory', () => {
+		const truncated = tiffWithTags([{ tag: 0xc612, type: 1, count: 4, value: 0 }]).subarray(0, 12);
+		expect(sniffFormat(truncated)).toBe('tiff');
+	});
+
+	it("reads Olympus and Panasonic's own headers as raw", () => {
+		expect(sniffFormat(concat(ascii('IIRO'), new Uint8Array(28)))).toBe('raw');
+		expect(sniffFormat(concat(ascii('MMOR'), new Uint8Array(28)))).toBe('raw');
+		expect(sniffFormat(concat(Uint8Array.from([0x49, 0x49, 0x55, 0x00]), new Uint8Array(28)))).toBe(
+			'raw',
+		);
+	});
+
+	it("reads Fujifilm's raw, which is not a TIFF at all", () => {
+		expect(sniffFormat(concat(ascii('FUJIFILMCCD-RAW 0201FF129502'), new Uint8Array(64)))).toBe(
+			'raw',
+		);
+	});
+});
+
 /* ── Every id in the union ────────────────────────────────────────────── */
 
 describe('every format the package names', () => {
@@ -566,6 +844,18 @@ describe('every format the package names', () => {
 		svg: ascii('<svg xmlns="http://www.w3.org/2000/svg"/>'),
 		// The image id length is deliberate. See the TGA section above.
 		tga: tgaFile({ imageType: 2, idLength: 12 }),
+		apng: APNG,
+		jxl: JXL,
+		raw: CR2,
+		psd: PSD,
+		dds: DDS,
+		hdr: HDR,
+		exr: EXR,
+		pcx: pcxFile(),
+		icns: ICNS,
+		ras: SUN_RAS,
+		xbm: XBM,
+		xpm: XPM,
 	};
 
 	it.each(Object.keys(SAMPLE) as FormatId[])('is recognised from bytes: %s', (id) => {
@@ -656,7 +946,7 @@ describe('looking a format up by MIME type', () => {
 
 	it('returns undefined for a type this package does not know', () => {
 		expect(formatForMime('application/octet-stream')).toBeUndefined();
-		expect(formatForMime('image/jxl')).toBeUndefined();
+		expect(formatForMime('image/x-nothing-like-this')).toBeUndefined();
 	});
 
 	it('resolves an alias to the same format as the canonical type', () => {
@@ -704,7 +994,7 @@ describe('looking a format up by file name', () => {
 		['loop.avifs', 'avif'],
 		['from-a-canon.hif', 'heic'],
 		['mask.pbm', 'pnm'],
-		['frame.apng', 'png'],
+		['frame.apng', 'apng'],
 	] as const)('resolves %s, which is the same format under another name', (name, expected) => {
 		// Written out because the loop above reads the same table the lookup
 		// does: it passes whether or not any of these are in it. Each of these
@@ -744,6 +1034,18 @@ describe('the format table', () => {
 		pnm: true,
 		farbfeld: true,
 		svg: true,
+		apng: true,
+		jxl: true,
+		raw: true,
+		psd: true,
+		dds: true,
+		hdr: true,
+		exr: true,
+		pcx: true,
+		icns: true,
+		ras: true,
+		xbm: true,
+		xpm: true,
 	};
 
 	const ids = Object.keys(EVERY_FORMAT) as FormatId[];
@@ -808,6 +1110,50 @@ describe('the format table', () => {
 		},
 		// SVG can carry SMIL animation. Nothing here renders it.
 		svg: { mime: 'image/svg+xml', extension: 'svg', alpha: true, lossy: false, animated: false },
+		// A PNG with an animation control chunk. Same container, same
+		// compression, and lossless in exactly the same sense.
+		apng: { mime: 'image/apng', extension: 'apng', alpha: true, lossy: false, animated: true },
+		// Read only, and only where the browser reads it, which today is Safari.
+		jxl: { mime: 'image/jxl', extension: 'jxl', alpha: true, lossy: true, animated: true },
+		// Read only, and what comes out is the preview the camera rendered
+		// rather than a development of the sensor data. Lossy because that
+		// preview is a JPEG.
+		raw: { mime: 'image/x-dcraw', extension: 'dng', alpha: false, lossy: true, animated: false },
+		psd: {
+			mime: 'image/vnd.adobe.photoshop',
+			extension: 'psd',
+			alpha: true,
+			lossy: false,
+			animated: false,
+		},
+		// Block compression throws away colour detail by design, so a DDS that
+		// went through BC1 cannot be recovered.
+		dds: { mime: 'image/vnd-ms.dds', extension: 'dds', alpha: true, lossy: true, animated: false },
+		// Radiance stores a shared exponent, so it is lossless as a container
+		// even though the encoding is not exact. No alpha channel exists in it.
+		hdr: {
+			mime: 'image/vnd.radiance',
+			extension: 'hdr',
+			alpha: false,
+			lossy: false,
+			animated: false,
+		},
+		exr: { mime: 'image/x-exr', extension: 'exr', alpha: true, lossy: false, animated: false },
+		// PCX has one transparent colour in no version anybody shipped.
+		pcx: { mime: 'image/x-pcx', extension: 'pcx', alpha: false, lossy: false, animated: false },
+		icns: { mime: 'image/icns', extension: 'icns', alpha: true, lossy: false, animated: false },
+		ras: {
+			mime: 'image/x-cmu-raster',
+			extension: 'ras',
+			alpha: true,
+			lossy: false,
+			animated: false,
+		},
+		// One bit per pixel, and the unset bit is treated as transparent so a
+		// converted XBM does not come back as a black rectangle.
+		xbm: { mime: 'image/x-xbitmap', extension: 'xbm', alpha: true, lossy: false, animated: false },
+		// XPM names a colour "None", which is transparency.
+		xpm: { mime: 'image/x-xpixmap', extension: 'xpm', alpha: true, lossy: false, animated: false },
 	};
 
 	it.each(ids)('describes %s the way the format is defined elsewhere', (id) => {
@@ -930,7 +1276,7 @@ describe('signatures that overlap between formats', () => {
 		// window. The brand that decides between AVIF and HEIC is not
 		// guaranteed to be an early one, and truncating the list handed an AV1
 		// bitstream to the HEVC decoder, which then reported a corrupt file.
-		const filler = Array.from({ length: 13 }, (_, i) => `xx${String(i).padStart(2, '0')}`);
+		const filler = Array.from({ length: 30 }, (_, i) => `xx${String(i).padStart(2, '0')}`);
 		const late = ftyp({ major: 'mif1', compatible: [...filler, 'avif'] });
 		expect(late.length).toBeGreaterThan(SNIFF_BYTES);
 		expect(sniffFormat(late)).toBe('avif');

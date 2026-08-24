@@ -25,13 +25,24 @@ export const FORMATS: { readonly [K in FormatId]: FormatInfo } = {
 	png: {
 		id: 'png',
 		mime: 'image/png',
-		mimes: ['image/png', 'image/apng'],
+		mimes: ['image/png'],
 		extension: 'png',
-		extensions: ['png', 'apng'],
+		extensions: ['png'],
 		label: 'PNG',
 		alpha: true,
 		lossy: false,
 		animated: false,
+	},
+	apng: {
+		id: 'apng',
+		mime: 'image/apng',
+		mimes: ['image/apng'],
+		extension: 'apng',
+		extensions: ['apng'],
+		label: 'APNG',
+		alpha: true,
+		lossy: false,
+		animated: true,
 	},
 	jpeg: {
 		id: 'jpeg',
@@ -43,6 +54,17 @@ export const FORMATS: { readonly [K in FormatId]: FormatInfo } = {
 		alpha: false,
 		lossy: true,
 		animated: false,
+	},
+	jxl: {
+		id: 'jxl',
+		mime: 'image/jxl',
+		mimes: ['image/jxl'],
+		extension: 'jxl',
+		extensions: ['jxl'],
+		label: 'JPEG XL',
+		alpha: true,
+		lossy: true,
+		animated: true,
 	},
 	webp: {
 		id: 'webp',
@@ -106,6 +128,140 @@ export const FORMATS: { readonly [K in FormatId]: FormatInfo } = {
 		extension: 'tif',
 		extensions: ['tif', 'tiff'],
 		label: 'TIFF',
+		alpha: true,
+		lossy: false,
+		animated: false,
+	},
+	raw: {
+		id: 'raw',
+		// Camera raw has no media type of its own worth using. Every vendor
+		// invented one, none of them are registered, and a file picker reports
+		// an empty string for all of them anyway.
+		mime: 'image/x-dcraw',
+		mimes: ['image/x-dcraw', 'image/x-canon-cr2', 'image/x-nikon-nef', 'image/x-sony-arw'],
+		extension: 'dng',
+		extensions: [
+			'dng',
+			'cr2',
+			'cr3',
+			'nef',
+			'nrw',
+			'arw',
+			'srf',
+			'sr2',
+			'raf',
+			'orf',
+			'rw2',
+			'pef',
+			'srw',
+			'raw',
+			'3fr',
+			'iiq',
+			'erf',
+			'mos',
+			'dcr',
+			'kdc',
+		],
+		label: 'Camera raw',
+		alpha: false,
+		lossy: true,
+		animated: false,
+	},
+	psd: {
+		id: 'psd',
+		mime: 'image/vnd.adobe.photoshop',
+		mimes: ['image/vnd.adobe.photoshop', 'application/x-photoshop', 'image/psd'],
+		extension: 'psd',
+		extensions: ['psd', 'psb'],
+		label: 'Photoshop',
+		alpha: true,
+		lossy: false,
+		animated: false,
+	},
+	dds: {
+		id: 'dds',
+		mime: 'image/vnd-ms.dds',
+		mimes: ['image/vnd-ms.dds', 'image/x-dds'],
+		extension: 'dds',
+		extensions: ['dds'],
+		label: 'DDS',
+		alpha: true,
+		lossy: true,
+		animated: false,
+	},
+	hdr: {
+		id: 'hdr',
+		mime: 'image/vnd.radiance',
+		mimes: ['image/vnd.radiance', 'image/x-hdr'],
+		extension: 'hdr',
+		extensions: ['hdr', 'pic', 'rgbe'],
+		label: 'Radiance HDR',
+		alpha: false,
+		lossy: false,
+		animated: false,
+	},
+	exr: {
+		id: 'exr',
+		mime: 'image/x-exr',
+		mimes: ['image/x-exr', 'image/aces'],
+		extension: 'exr',
+		extensions: ['exr'],
+		label: 'OpenEXR',
+		alpha: true,
+		lossy: false,
+		animated: false,
+	},
+	pcx: {
+		id: 'pcx',
+		mime: 'image/x-pcx',
+		mimes: ['image/x-pcx', 'image/vnd.zbrush.pcx'],
+		extension: 'pcx',
+		extensions: ['pcx', 'pcc'],
+		label: 'PCX',
+		alpha: false,
+		lossy: false,
+		animated: false,
+	},
+	icns: {
+		id: 'icns',
+		mime: 'image/icns',
+		mimes: ['image/icns', 'image/x-icns'],
+		extension: 'icns',
+		extensions: ['icns'],
+		label: 'Apple icon',
+		alpha: true,
+		lossy: false,
+		animated: false,
+	},
+	ras: {
+		id: 'ras',
+		mime: 'image/x-cmu-raster',
+		mimes: ['image/x-cmu-raster', 'image/x-sun-raster'],
+		extension: 'ras',
+		extensions: ['ras', 'sun', 'im1', 'im8', 'im24', 'im32'],
+		label: 'Sun raster',
+		alpha: true,
+		lossy: false,
+		animated: false,
+	},
+	xbm: {
+		id: 'xbm',
+		mime: 'image/x-xbitmap',
+		mimes: ['image/x-xbitmap', 'image/x-xbm'],
+		extension: 'xbm',
+		extensions: ['xbm'],
+		label: 'XBM',
+		alpha: true,
+		lossy: false,
+		animated: false,
+	},
+	xpm: {
+		id: 'xpm',
+		mime: 'image/x-xpixmap',
+		mimes: ['image/x-xpixmap', 'image/x-xpm'],
+		extension: 'xpm',
+		extensions: ['xpm'],
+		label: 'XPM',
 		alpha: true,
 		lossy: false,
 		animated: false,
@@ -179,14 +335,26 @@ export const FORMAT_IDS: readonly FormatId[] = Object.keys(FORMATS) as FormatId[
 /**
  * Formats a browser will render in an `img` element.
  *
- * Worth knowing before showing a preview of a conversion. QOI, TGA, PNM and
- * farbfeld are perfectly good files that no browser can display, so a preview
- * of one is a broken image icon sitting next to a successful conversion, which
+ * Worth knowing before showing a preview of a conversion. QOI, TGA, PNM,
+ * farbfeld, PCX, Sun raster, XBM, XPM, HDR, EXR, DDS, PSD and the Apple icon
+ * suite are perfectly good files that no browser can display, so a preview of
+ * one is a broken image icon sitting next to a successful conversion, which
  * reads as a failure. AVIF and WebP are here because every current browser
  * decodes them, and a stale one showing a broken thumbnail is a smaller problem
- * than never previewing them at all.
+ * than never previewing them at all. JPEG XL is not, because only Safari reads
+ * it and a broken thumbnail everywhere else is the likelier outcome.
  */
-const DISPLAYABLE = new Set<FormatId>(['png', 'jpeg', 'webp', 'avif', 'gif', 'bmp', 'ico', 'svg']);
+const DISPLAYABLE = new Set<FormatId>([
+	'png',
+	'apng',
+	'jpeg',
+	'webp',
+	'avif',
+	'gif',
+	'bmp',
+	'ico',
+	'svg',
+]);
 
 export function isDisplayable(format: FormatId): boolean {
 	return DISPLAYABLE.has(format);
