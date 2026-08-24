@@ -19,7 +19,14 @@
 export { convert, DEFAULT_MAX_PIXELS } from './convert.js';
 export { installDefaultCodecs, resetDefaultCodecs } from './defaults.js';
 
-export { FORMATS, FORMAT_IDS, formatForExtension, formatForMime, formatInfo } from './formats.js';
+export {
+	FORMATS,
+	FORMAT_IDS,
+	formatForExtension,
+	formatForMime,
+	formatInfo,
+	isDisplayable,
+} from './formats.js';
 
 export {
 	clearRegistry,
