@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 interface Manifest {
+	readonly scripts: Record<string, string>;
 	readonly exports: Record<string, string | Record<string, string>>;
 	readonly files: readonly string[];
 	readonly dependencies: Record<string, string>;
@@ -70,6 +71,22 @@ describe('the exports map', () => {
 		// laptop rather than in a minute on a runner, and because the whole
 		// claim of this package rests on it.
 		expect(Object.keys(manifest.dependencies ?? {})).toEqual([]);
+	});
+
+	it('has no script pointing at a file that is not there', () => {
+		// The sibling package carries two of these, left behind when its fixture
+		// generator was replaced by helpers that build in memory. They fail only
+		// when somebody runs them, which for a script nobody runs is never, and
+		// meanwhile the documentation that mentions them is quietly wrong. This
+		// package had the same pair for the same reason.
+		const missing: string[] = [];
+		for (const [name, command] of Object.entries(manifest.scripts)) {
+			for (const match of command.matchAll(/(scripts\/[\w.-]+\.ts)/g)) {
+				const file = match[1];
+				if (file && !existsSync(resolve(root, file))) missing.push(`${name} -> ${file}`);
+			}
+		}
+		expect(missing).toEqual([]);
 	});
 
 	it('points main and types at the root subpath', () => {

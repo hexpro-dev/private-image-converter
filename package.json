@@ -70,8 +70,6 @@
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"test:coverage": "vitest run --coverage",
-		"fixtures": "tsx scripts/generate-fixtures.ts",
-		"fixtures:verify": "tsx scripts/generate-fixtures.ts --verify",
 		"prepublishOnly": "pnpm run clean && pnpm run build:all && pnpm run typecheck && pnpm run test"
 	},
 	"dependencies": {},
