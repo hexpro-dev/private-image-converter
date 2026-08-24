@@ -817,6 +817,133 @@ describe('a camera raw against an ordinary TIFF', () => {
 	});
 });
 
+describe('the containers that share a header with something else', () => {
+	it('names a BigTIFF a TIFF rather than leaving it unrecognised', () => {
+		// Recognised so the reader can refuse it by name. Reported as unknown it
+		// would send somebody looking for a corrupt download rather than for a
+		// format this package does not implement.
+		const little = concat(Uint8Array.from([0x49, 0x49, 0x2b, 0x00]), u32le(8), new Uint8Array(24));
+		const big = concat(Uint8Array.from([0x4d, 0x4d, 0x00, 0x2b]), u32(8), new Uint8Array(24));
+		expect(sniffFormat(little)).toBe('tiff');
+		expect(sniffFormat(big)).toBe('tiff');
+	});
+
+	it("reads Canon's CR3, which is an ISOBMFF file rather than a TIFF", () => {
+		expect(sniffFormat(ftyp({ major: 'crx ', compatible: ['crx ', 'isom'] }))).toBe('raw');
+	});
+
+	it('reads a JPEG XL in its box container', () => {
+		const boxed = concat(
+			u32(12),
+			ascii('JXL '),
+			Uint8Array.from([0x0d, 0x0a, 0x87, 0x0a]),
+			u32(20),
+			ascii('ftyp'),
+			ascii('jxl '),
+			new Uint8Array(12),
+		);
+		expect(sniffFormat(boxed)).toBe('jxl');
+	});
+
+	it('reads a JPEG XL whose signature box is followed by its own brand', () => {
+		// The other spelling, where the file leads with an ftyp rather than the
+		// signature box. Both occur, and the brand is what settles it.
+		expect(sniffFormat(ftyp({ major: 'jxl ', compatible: ['jxl '] }))).toBe('jxl');
+	});
+});
+
+describe('a raw file that is not one', () => {
+	it('does not read a TIFF whose first directory is out of the buffer', () => {
+		const short = concat(
+			Uint8Array.from([0x49, 0x49, 0x2a, 0x00]),
+			u32le(9000),
+			new Uint8Array(24),
+		);
+		expect(sniffFormat(short)).toBe('tiff');
+	});
+
+	it('does not read a TIFF whose directory offset points into its own header', () => {
+		const inside = concat(Uint8Array.from([0x49, 0x49, 0x2a, 0x00]), u32le(2), new Uint8Array(24));
+		expect(sniffFormat(inside)).toBe('tiff');
+	});
+
+	it('does not read a TIFF with an implausible tag count', () => {
+		// A directory of six hundred entries is not something a camera writes,
+		// and reading one would mean trusting a count that has not been checked
+		// against the buffer yet.
+		const many = concat(Uint8Array.from([0x49, 0x49, 0x2a, 0x00]), u32le(8), new Uint8Array(24));
+		new DataView(many.buffer).setUint16(8, 600, true);
+		expect(sniffFormat(many)).toBe('tiff');
+	});
+
+	it('does not read a TIFF whose directory is truncated', () => {
+		const cut = tiffWithTags([
+			{ tag: 0x00fe, type: 4, count: 1, value: 1 },
+			{ tag: 0x014a, type: 4, count: 1, value: 200 },
+		]).subarray(0, 20);
+		expect(sniffFormat(cut)).toBe('tiff');
+	});
+
+	it('is not fooled by a NewSubfileType of the wrong field type', () => {
+		// The value is only where it is for a LONG. Read from a SHORT it would
+		// land on the count, which is 1, and every ordinary TIFF would suddenly
+		// look like a raw file.
+		expect(
+			sniffFormat(
+				tiffWithTags([
+					{ tag: 0x00fe, type: 3, count: 1, value: 1 },
+					{ tag: 0x014a, type: 4, count: 1, value: 200 },
+				]),
+			),
+		).toBe('tiff');
+	});
+});
+
+describe('the checks that run out of buffer', () => {
+	it('does not read a PNG whose chunk list ends before an acTL', () => {
+		const stops = concat(
+			Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+			u32(13),
+			ascii('IHDR'),
+			new Uint8Array(13),
+			u32(0),
+			u32(9000),
+			ascii('sRGB'),
+		);
+		expect(sniffFormat(stops)).toBe('png');
+	});
+
+	it('treats an IEND before any IDAT as the end of the question', () => {
+		const ended = concat(
+			Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+			u32(13),
+			ascii('IHDR'),
+			new Uint8Array(13),
+			u32(0),
+			u32(0),
+			ascii('IEND'),
+			u32(0),
+			u32(8),
+			ascii('acTL'),
+			new Uint8Array(8),
+			u32(0),
+		);
+		expect(sniffFormat(ended)).toBe('png');
+	});
+
+	it('does not read a Radiance header with no line ending in the window', () => {
+		expect(sniffFormat(ascii('#?' + 'x'.repeat(60)))).toBeUndefined();
+	});
+
+	it('does not read a PCX header shorter than a PCX header', () => {
+		expect(sniffFormat(pcxFile().subarray(0, 100))).toBeUndefined();
+	});
+
+	it('does not read an XBM whose first line is only a define', () => {
+		expect(sniffFormat(ascii('#define '))).toBeUndefined();
+	});
+});
+
 /* ── Every id in the union ────────────────────────────────────────────── */
 
 describe('every format the package names', () => {
@@ -1092,12 +1219,12 @@ describe('the format table', () => {
 		tiff: { mime: 'image/tiff', extension: 'tif', alpha: true, lossy: false, animated: false },
 		qoi: { mime: 'image/qoi', extension: 'qoi', alpha: true, lossy: false, animated: false },
 		tga: { mime: 'image/x-tga', extension: 'tga', alpha: true, lossy: false, animated: false },
-		// PAM can carry an alpha channel; the reader refuses PAM by name and
-		// none of the Netpbm formats it does read have one.
+		// PAM, the seventh member of the family, is the one with an alpha
+		// channel, and it is the one written whenever a picture has one.
 		pnm: {
 			mime: 'image/x-portable-anymap',
 			extension: 'ppm',
-			alpha: false,
+			alpha: true,
 			lossy: false,
 			animated: false,
 		},

@@ -133,6 +133,61 @@ const CODEC_EVIDENCE: readonly CodecEvidence[] = [
 		what: 'the binary P6 header from pnm(5)',
 		forms: ['P6\n'],
 	},
+	{
+		format: 'gif',
+		what: 'the GIF89a signature block',
+		forms: ['GIF89a'],
+	},
+	{
+		format: 'apng',
+		what: "the 'acTL' chunk type, which is the whole difference between an APNG and a PNG",
+		forms: ['acTL'],
+	},
+	{
+		format: 'tiff',
+		what: 'the ICCProfile tag number from the TIFF 6 technical note',
+		forms: wordForms(34675),
+	},
+	{
+		format: 'hdr',
+		what: 'the Radiance identifier from its first line',
+		forms: ['#?RADIANCE'],
+	},
+	{
+		format: 'pcx',
+		what: 'the 769 byte VGA palette block that hangs off the end of a PCX',
+		forms: wordForms(769),
+	},
+	{
+		format: 'ras',
+		what: 'the Sun raster magic',
+		forms: wordForms(0x59a66a95),
+	},
+	{
+		format: 'xbm',
+		what: 'the define an X BitMap opens with',
+		forms: ['#define '],
+	},
+	{
+		format: 'xpm',
+		what: 'the comment an X PixMap opens with',
+		forms: ['/* XPM */'],
+	},
+	{
+		format: 'icns',
+		what: "the 'ic10' entry type, which is the 1024 pixel slot in an Apple icon suite",
+		forms: ['ic10'],
+	},
+	{
+		// The only entry whose constant comes from this package rather than
+		// from a specification, because an ICO has no magic of its own to
+		// check: it opens with two zero bytes. The size ladder is the next best
+		// thing, it is what the writer actually emits, and it is distinctive
+		// enough that nothing else in the bundle produces that run of numbers.
+		format: 'ico',
+		what: 'the ladder of icon sizes this package writes',
+		forms: ['256,128,64,48,32,16'],
+	},
 ];
 
 /**

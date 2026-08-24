@@ -1,21 +1,27 @@
 /**
- * A Netpbm (PNM) reader, covering all six of P1 to P6.
+ * A Netpbm (PNM) reader, covering all seven of P1 to P6 and PAM.
  *
- * The six are one header grammar over two encodings of three pixel types, so
+ * P1 to P6 are one header grammar over two encodings of three pixel types, so
  * they are one reader rather than six: the header parser is shared, and the
- * only real divergence is how a sample is spelled once the header ends.
+ * only real divergence is how a sample is spelled once the header ends. PAM
+ * (P7) is a second header grammar over the same sample encodings, which is why
+ * it is here rather than in a file of its own: its header is named lines rather
+ * than bare numbers, and everything after ENDHDR is read by the code P5 and P6
+ * already use.
  *
- * Two traps are worth naming, because both produce a plausible looking image
- * rather than an error when they are got wrong. In P1 and P4 a set bit means
- * black, which is the reverse of every other member of the family and of every
- * other image format in this package. And a comment may appear anywhere in the
- * header, including between the width and the height, so a header cannot be
- * read by splitting on whitespace.
+ * Three traps are worth naming, because each produces a plausible looking image
+ * rather than an error when it is got wrong. In P1 and P4 a set bit means
+ * black, which is the reverse of every other member of the family, PAM's own
+ * BLACKANDWHITE included, and of every other image format in this package. A
+ * comment may appear anywhere in a P1 to P6 header, including between the width
+ * and the height, so that header cannot be read by splitting on whitespace. And
+ * a PAM comment is a whole line rather than a run to the end of one, so the two
+ * header grammars do not share a comment rule either.
  */
 
 import type { RasterImage } from '../../types.js';
 import { DecodeFailedError } from '../../errors.js';
-import { createRaster } from '../../raster/image.js';
+import { createRaster, detectAlpha } from '../../raster/image.js';
 
 const DECODER_ID = 'pnm-pure';
 
@@ -158,11 +164,41 @@ function scaleSample(value: number, maxval: number): number {
 	return Math.round((clamped * 255) / maxval);
 }
 
-function setPixel(target: Uint8ClampedArray, at: number, r: number, g: number, b: number): void {
+function setPixel(
+	target: Uint8ClampedArray,
+	at: number,
+	r: number,
+	g: number,
+	b: number,
+	a = 255,
+): void {
 	target[at] = r;
 	target[at + 1] = g;
 	target[at + 2] = b;
-	target[at + 3] = 255;
+	target[at + 3] = a;
+}
+
+/**
+ * The two header checks every member of the family shares.
+ *
+ * P1 to P6 spell their dimensions as two bare numbers and PAM spells them as
+ * two named lines, but a zero is malformed and an implausible size is a bomb in
+ * either grammar, so the answers are given in one place rather than twice.
+ */
+function checkDimensions(width: number, height: number): void {
+	if (width < 1 || height < 1) {
+		fail(`the header describes an image ${width} pixels wide and ${height} pixels tall.`);
+	}
+	if (width * height > MAX_PIXELS) {
+		fail('the header describes an image far larger than anything this tool will allocate for.');
+	}
+}
+
+function checkMaxval(maxval: number): void {
+	if (maxval < 1) fail('the header gives a maximum sample value of zero.');
+	if (maxval > 65535) {
+		fail(`the header gives a maximum sample value of ${maxval}, and Netpbm stops at 65535.`);
+	}
 }
 
 /**
@@ -292,8 +328,17 @@ function decodeBinaryBitmap(
 	return image;
 }
 
-/* ── P5 and P6: binary greymap and pixmap ─────────────────────────────── */
+/* ── P5, P6 and PAM: binary samples ───────────────────────────────────── */
 
+/**
+ * Read `channels` binary samples per pixel.
+ *
+ * One to four of them. P5 asks for one and P6 for three; the even counts are
+ * PAM's, where a second sample after a grey one and a fourth after a triple are
+ * both opacity. Straight opacity, not premultiplied: a fully transparent pixel
+ * in a PAM keeps whatever colour was written under it, which is what ImageMagick
+ * writes and what this package's rasters mean by alpha.
+ */
 function decodeBinarySamples(
 	bytes: Uint8Array,
 	cursor: Cursor,
@@ -308,10 +353,14 @@ function decodeBinarySamples(
 	const pixels = width * height;
 	requireRoom(bytes, cursor, pixels * channels * sampleBytes, `${width} by ${height} pixels`);
 
-	const image = createRaster(width, height, 'srgb', false);
+	// An even channel count is the one with opacity on the end of it. Both odd
+	// counts are opaque, and the raster says so rather than carrying an alpha
+	// channel of 255s that a later encoder would take seriously.
+	const carriesAlpha = channels % 2 === 0;
+	const image = createRaster(width, height, 'srgb', carriesAlpha);
 	const target = image.data;
 	let at = cursor.at;
-	const values = [0, 0, 0];
+	const values = [0, 0, 0, 0];
 
 	for (let i = 0; i < pixels; i += 1) {
 		for (let channel = 0; channel < channels; channel += 1) {
@@ -326,38 +375,229 @@ function decodeBinarySamples(
 			values[channel] = scaleSample(raw, maxval);
 		}
 		const first = values[0] as number;
-		if (channels === 1) {
-			setPixel(target, i * 4, first, first, first);
+		if (channels <= 2) {
+			// One luminance sample fills all three colour channels, so a grey
+			// image reaches the raster as grey rather than as red.
+			setPixel(target, i * 4, first, first, first, carriesAlpha ? (values[1] as number) : 255);
 		} else {
-			setPixel(target, i * 4, first, values[1] as number, values[2] as number);
+			const alpha = carriesAlpha ? (values[3] as number) : 255;
+			setPixel(target, i * 4, first, values[1] as number, values[2] as number, alpha);
 		}
 	}
 	cursor.at = at;
-	return image;
+	// A PAM whose alpha channel turned out to be solid is an opaque image. The
+	// flag is a promise about the pixels rather than a record of what the file
+	// spent bytes on, and leaving it set would have every later encoder write an
+	// alpha channel nothing needs.
+	return carriesAlpha ? { ...image, hasAlpha: detectAlpha(image) } : image;
+}
+
+/* ── P7: PAM ──────────────────────────────────────────────────────────── */
+
+/**
+ * The tuple types this reader can turn into pixels, and the DEPTH each one has.
+ *
+ * A PAM may name any tuple type at all, and the ones outside this table are not
+ * pictures in the sense this package means. ImageMagick writes and reads
+ * `TUPLTYPE CMYK` at DEPTH 4, and reading those four samples as red, green,
+ * blue and opacity produces a picture rather than an error: inverted, wrongly
+ * coloured, and perfectly plausible on its own. So an unrecognised tuple type
+ * is refused rather than assumed, and a recognised one has to agree with DEPTH,
+ * because DEPTH is what decides where one pixel ends and the next begins.
+ */
+const PAM_TUPLE_DEPTHS = new Map<string, number>([
+	['BLACKANDWHITE', 1],
+	['GRAYSCALE', 1],
+	['BLACKANDWHITE_ALPHA', 2],
+	['GRAYSCALE_ALPHA', 2],
+	['RGB', 3],
+	['RGB_ALPHA', 4],
+]);
+
+/**
+ * The longest header line this reader will assemble.
+ *
+ * A header line is a keyword, a space and a value, so nothing legitimate comes
+ * within an order of magnitude of this. The bound is here because the line is
+ * built as a string: a file with no newline anywhere in it would otherwise be
+ * copied into one, which is an allocation the size of the file for a file that
+ * has already proved it is not a PAM.
+ */
+const MAX_HEADER_LINE = 1024;
+
+interface PamHeader {
+	readonly width: number;
+	readonly height: number;
+	readonly depth: number;
+	readonly maxval: number;
+}
+
+/**
+ * Read one line of a PAM header, without its terminator.
+ *
+ * None of the token reading above applies here. A newline ends a field in this
+ * grammar rather than merely separating two of them, so `WIDTH 4 HEIGHT 4` on
+ * one line is malformed rather than two fields, and the newline that closes
+ * ENDHDR is the last byte of the header rather than the first byte of anything.
+ *
+ * Carriage returns are dropped rather than kept, so a header written on Windows
+ * does not arrive with a stray byte glued to the end of ENDHDR. Returns
+ * undefined at the end of the file, which is a header that never closed.
+ */
+function readHeaderLine(bytes: Uint8Array, cursor: Cursor): string | undefined {
+	let text = '';
+	while (cursor.at < bytes.length) {
+		const byte = bytes[cursor.at] as number;
+		cursor.at += 1;
+		if (byte === 0x0a) return text;
+		if (byte !== 0x0d) text += String.fromCharCode(byte);
+		if (text.length > MAX_HEADER_LINE) {
+			fail('a line of the header is longer than any header line has cause to be.');
+		}
+	}
+	return undefined;
+}
+
+/** A header value, which the four numeric fields all spell as plain digits. */
+function pamNumber(value: string, what: string): number {
+	for (let i = 0; i < value.length; i += 1) {
+		const byte = value.charCodeAt(i);
+		if (byte < ZERO || byte > NINE) fail(`the ${what} in the header is not a number.`);
+	}
+	const number = Number(value);
+	if (number > MAX_HEADER_NUMBER) fail(`the ${what} in the header is implausibly large.`);
+	return number;
+}
+
+/**
+ * Read the header lines between 'P7' and 'ENDHDR'.
+ *
+ * The keys may arrive in any order and any of them may be missing, so each is
+ * collected and the four that are required are checked for afterwards by name.
+ * A key this reader does not know is skipped rather than refused: it cannot
+ * change how the raster is grouped, since that is DEPTH and MAXVAL, and a
+ * misspelled WIDTH still ends up reported as a missing one.
+ */
+function readPamHeader(bytes: Uint8Array, cursor: Cursor): PamHeader {
+	let width: number | undefined;
+	let height: number | undefined;
+	let depth: number | undefined;
+	let maxval: number | undefined;
+	let tupleType: string | undefined;
+
+	for (;;) {
+		const line = readHeaderLine(bytes, cursor);
+		if (line === undefined) fail('the header has no ENDHDR line, so it never ends.');
+		const trimmed = line.trim();
+		if (trimmed === 'ENDHDR') break;
+		// A comment is a whole line here, so unlike P1 to P6 a '#' cannot follow
+		// a field on the same line. A blank line is ignored rather than refused,
+		// which is what Netpbm's own reader does with one.
+		if (trimmed.length === 0 || trimmed.startsWith('#')) continue;
+
+		const gap = trimmed.search(/\s/);
+		const key = gap === -1 ? trimmed : trimmed.slice(0, gap);
+		const value = gap === -1 ? '' : trimmed.slice(gap + 1).trim();
+		// The key is deliberately not repeated into the message. It is text out
+		// of a stranger's file, and an error message is the one string that gets
+		// screenshot into a bug report.
+		if (value.length === 0) fail('a line of the header carries a keyword with no value.');
+
+		switch (key) {
+			case 'WIDTH':
+				if (width !== undefined) fail('the header has more than one WIDTH line.');
+				width = pamNumber(value, 'width');
+				break;
+			case 'HEIGHT':
+				if (height !== undefined) fail('the header has more than one HEIGHT line.');
+				height = pamNumber(value, 'height');
+				break;
+			case 'DEPTH':
+				if (depth !== undefined) fail('the header has more than one DEPTH line.');
+				depth = pamNumber(value, 'depth');
+				break;
+			case 'MAXVAL':
+				if (maxval !== undefined) fail('the header has more than one MAXVAL line.');
+				maxval = pamNumber(value, 'maximum sample value');
+				break;
+			case 'TUPLTYPE':
+				// Repeats are joined rather than refused, because the format lets
+				// a long tuple type be written across several lines and means the
+				// concatenation of them.
+				tupleType = tupleType === undefined ? value : `${tupleType} ${value}`;
+				break;
+			default:
+				break;
+		}
+	}
+
+	if (width === undefined) fail('the header has no WIDTH line.');
+	if (height === undefined) fail('the header has no HEIGHT line.');
+	if (depth === undefined) fail('the header has no DEPTH line.');
+	if (maxval === undefined) fail('the header has no MAXVAL line.');
+
+	checkDimensions(width, height);
+	checkMaxval(maxval);
+	if (depth < 1) fail('the header gives a DEPTH of zero, so a pixel holds no samples.');
+	if (depth > 4) {
+		fail(
+			`the header gives a DEPTH of ${depth}, which is a tuple of measurements rather than an image, and this reader only reads the greyscale and RGB tuples.`,
+		);
+	}
+
+	if (tupleType !== undefined) {
+		const expected = PAM_TUPLE_DEPTHS.get(tupleType);
+		if (expected === undefined) {
+			fail(
+				'its TUPLTYPE is none of BLACKANDWHITE, GRAYSCALE, RGB or their alpha forms, and this reader has no way to turn a tuple whose channels it does not know into pixels.',
+			);
+		}
+		if (expected !== depth) {
+			// Interpolated because it matched one of our own constants above, so
+			// it is this reader's word rather than the file's.
+			fail(
+				`the header pairs a TUPLTYPE of ${tupleType} with a DEPTH of ${depth}, and the two contradict each other.`,
+			);
+		}
+	}
+
+	return { width, height, depth, maxval };
+}
+
+function decodePam(bytes: Uint8Array, cursor: Cursor): RasterImage {
+	const { width, height, depth, maxval } = readPamHeader(bytes, cursor);
+	// The newline that ends the ENDHDR line is the last byte of the header, and
+	// `readHeaderLine` has already eaten it. There is no separate whitespace
+	// byte to consume the way P4 to P6 have one, so a reader that called
+	// `endBinaryHeader` here would swallow the first sample of the image.
+	//
+	// Nothing below inverts anything, which is the point worth stopping on:
+	// BLACKANDWHITE with MAXVAL 1 reads 1 as white, where P1 and P4 read a set
+	// bit as black. PAM samples are intensities like every other greyscale, so
+	// the ordinary scaling from 0..MAXVAL onto 0..255 already lands 1 on white.
+	// A reader that carried the bitmap polarity across returns a photographic
+	// negative of every black and white PAM, and a negative looks enough like a
+	// picture to survive review.
+	return decodeBinarySamples(bytes, cursor, width, height, maxval, depth);
 }
 
 /* ── Entry point ──────────────────────────────────────────────────────── */
 
 /**
- * Read a Netpbm file of any of the six types P1 to P6.
+ * Read a Netpbm file of any of the seven types P1 to P6 and PAM.
  *
- * The result is always opaque RGBA in sRGB: the format has no alpha channel and
- * no way to record a colour space, and inventing either would be worse than
- * saying plainly that it is sRGB. Bytes after the first image are ignored, so a
- * concatenated multi-image file reads as its first frame rather than as damage.
+ * The result is RGBA in sRGB, opaque unless the file was a PAM carrying an
+ * opacity channel: no member of the family has a way to record a colour space,
+ * and inventing one would be worse than saying plainly that it is sRGB. Bytes
+ * after the first image are ignored, so a concatenated multi-image file reads
+ * as its first frame rather than as damage.
  */
 export function decodePnm(bytes: Uint8Array): RasterImage {
 	if (bytes.length < 3) fail('the file is too short to be a Netpbm image.');
 	if (bytes[0] !== 0x50) fail('the file does not begin with the Netpbm magic number.');
 
 	const kind = (bytes[1] as number) - ZERO;
-	if (kind === 7) {
-		// P7 is PAM, a different header grammar with named fields and an alpha
-		// channel. The sniffer accepts it as PNM, so it is refused by name here
-		// rather than misread as a pixmap.
-		fail('this is a PAM (P7) file, which this reader does not handle.');
-	}
-	if (kind < 1 || kind > 6) fail('the magic number is not one of P1 to P6.');
+	if (kind < 1 || kind > 7) fail('the magic number is not one of P1 to P7.');
 
 	const afterMagic = bytes[2] as number;
 	if (!isWhitespace(afterMagic) && afterMagic !== HASH) {
@@ -365,23 +605,21 @@ export function decodePnm(bytes: Uint8Array): RasterImage {
 	}
 
 	const cursor: Cursor = { at: 2 };
+	// The cursor sits on the newline after 'P7' rather than past it, so the
+	// first line PAM reads is the remainder of the magic number's own line,
+	// which is empty in every file anybody writes. Netpbm reads it the same way,
+	// having consumed two characters of magic and nothing more.
+	if (kind === 7) return decodePam(bytes, cursor);
+
 	const width = readHeaderNumber(bytes, cursor, 'width');
 	const height = readHeaderNumber(bytes, cursor, 'height');
-	if (width < 1 || height < 1) {
-		fail(`the header describes an image ${width} pixels wide and ${height} pixels tall.`);
-	}
-	if (width * height > MAX_PIXELS) {
-		fail('the header describes an image far larger than anything this tool will allocate for.');
-	}
+	checkDimensions(width, height);
 
 	const bitmap = kind === 1 || kind === 4;
 	let maxval = 1;
 	if (!bitmap) {
 		maxval = readHeaderNumber(bytes, cursor, 'maximum sample value');
-		if (maxval < 1) fail('the header gives a maximum sample value of zero.');
-		if (maxval > 65535) {
-			fail(`the header gives a maximum sample value of ${maxval}, and Netpbm stops at 65535.`);
-		}
+		checkMaxval(maxval);
 	}
 	if (kind >= 4) endBinaryHeader(bytes, cursor);
 

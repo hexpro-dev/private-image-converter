@@ -34,8 +34,18 @@ async function pump(bytes: Uint8Array, stream: ByteTransform): Promise<Uint8Arra
 	// `Uint8Array` is declared over `ArrayBufferLike`, which also covers
 	// `SharedArrayBuffer`. The values here are never shared, so the cast states
 	// what is already true rather than hiding a real mismatch.
-	void writer.write(bytes as unknown as BufferSource);
-	void writer.close();
+	//
+	// The rejections have to be claimed, though, and this is not tidiness. A
+	// corrupt deflate stream rejects the write and the close as well as the
+	// read, and the read is the only one anybody is awaiting. The other two
+	// then have no handler, which in Node kills the process and in a browser
+	// fires `unhandledrejection`. So a decoder that correctly reported a
+	// damaged file also took the worker down with it, on about one malformed
+	// input in twenty. Discarding them here is right rather than merely quiet:
+	// whatever went wrong surfaces on the read, which is awaited, and it is
+	// the same failure reported once instead of three times.
+	void writer.write(bytes as unknown as BufferSource).catch(() => {});
+	void writer.close().catch(() => {});
 
 	const chunks: Uint8Array[] = [];
 	let total = 0;

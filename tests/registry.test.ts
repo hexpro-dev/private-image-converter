@@ -100,39 +100,65 @@ function priorityOf(
 	return found.priority;
 }
 
-/** The codecs this package ships, in the order `installDefaultCodecs` adds them. */
-const DEFAULT_DECODER_IDS = [
-	'heic-native',
-	'heic-webcodecs',
-	'png-native',
-	'jpeg-native',
-	'gif-native',
-	'webp-native',
-	'avif-native',
-	'bmp-native',
-	'png-pure',
-	'qoi-pure',
-	'bmp-pure',
-	'tga-pure',
-	'pnm-pure',
-	'farbfeld-pure',
-];
-
 /**
- * The ladder as the package publishes it, keyed on the rung an id names.
+ * Every codec this package ships, in the order `installDefaultCodecs` adds
+ * them, with the priority and the path each one is published as.
  *
- * Priority is a cost rather than a preference: 10 for the platform's own
- * decoder, 20 for our own reader driving the platform's video decoder, 40 for
- * a pure TypeScript implementation, and 50 upwards left free for a host's
- * plugin. A host registers against those numbers, so they are a contract
- * rather than an internal detail, and the path is what `ConvertReport` shows
- * the person waiting to explain why one file took longer than another.
+ * Written out rather than derived, because that is the whole value of it. A
+ * codec that changes rung, loses its availability gate or starts reporting the
+ * wrong path is invisible to every ordering assertion in this file, and all
+ * three are changes somebody has to look at on purpose.
+ *
+ * Priority is a cost rather than a preference, and a host registers against
+ * these numbers, so they are a contract:
+ *
+ *      8  the platform's frame decoder, the only native path that returns an
+ *         animation rather than its first picture
+ *     10  the platform's own decoder
+ *     20  our own reader, where it knows something the platform's does not:
+ *         HEVC tiles, an animation, a picture buried in a container
+ *     30  the platform's own decoder standing in behind one of those
+ *     40  a pure TypeScript implementation
+ *     45  a last resort that pulls a picture out of a file nothing here decodes
+ *     50+ left free for a host application's plugin
  */
-const DOCUMENTED_DECODER_RUNGS = {
-	native: { priority: 10, path: 'native-image' },
-	webcodecs: { priority: 20, path: 'webcodecs' },
-	pure: { priority: 40, path: 'pure' },
-} as const;
+const SHIPPED_DECODERS = [
+	['heic-native', 10, 'native-image'],
+	['heic-webcodecs', 20, 'webcodecs'],
+	['webp-frames', 8, 'native-image'],
+	['avif-frames', 8, 'native-image'],
+	['gif-frames', 8, 'native-image'],
+	['png-native', 10, 'native-image'],
+	['jpeg-native', 10, 'native-image'],
+	['jxl-native', 10, 'native-image'],
+	['webp-native', 10, 'native-image'],
+	['avif-native', 10, 'native-image'],
+	['bmp-native', 10, 'native-image'],
+	['svg-native', 10, 'native-image'],
+	['apng-pure', 20, 'pure'],
+	['apng-fallback', 30, 'native-image'],
+	['gif-pure', 20, 'pure'],
+	['gif-fallback', 30, 'native-image'],
+	['png-pure', 40, 'pure'],
+	['tiff-pure', 40, 'pure'],
+	['raw-preview', 20, 'native-image'],
+	['tiff-preview', 45, 'native-image'],
+	['qoi-pure', 40, 'pure'],
+	['bmp-pure', 40, 'pure'],
+	['tga-pure', 40, 'pure'],
+	['pnm-pure', 40, 'pure'],
+	['farbfeld-pure', 40, 'pure'],
+	['ico-pure', 40, 'pure'],
+	['psd-pure', 40, 'pure'],
+	['dds-pure', 40, 'pure'],
+	['hdr-pure', 40, 'pure'],
+	['exr-pure', 40, 'pure'],
+	['pcx-pure', 40, 'pure'],
+	['icns-pure', 40, 'pure'],
+	['ras-pure', 40, 'pure'],
+	['xbm-pure', 40, 'pure'],
+	['xpm-pure', 40, 'pure'],
+] as const;
 
 /**
  * An encoder is either the browser's canvas or our own code.
@@ -140,32 +166,62 @@ const DOCUMENTED_DECODER_RUNGS = {
  * There is no third entry, because nothing here writes through WebCodecs.
  * Writing HEIC is a refusal rather than a gap: nothing in a browser encodes
  * HEVC, and doing it ourselves carries patent obligations a free tool has no
- * way to meet.
+ * way to meet. The fourth column is whether the encoder writes an animation
+ * rather than ignoring one it is handed, which decides whether `convert`
+ * bothers preparing the frames at all.
  */
-const DOCUMENTED_ENCODER_PATHS = { native: 'canvas', pure: 'pure', webcodecs: undefined } as const;
+const SHIPPED_ENCODERS = [
+	['png-native', 20, 'canvas', false],
+	['jpeg-native', 10, 'canvas', false],
+	['webp-native', 10, 'canvas', false],
+	['avif-native', 10, 'canvas', false],
+	['png-pure', 10, 'pure', false],
+	['apng-pure', 10, 'pure', true],
+	['gif-pure', 10, 'pure', true],
+	['qoi-pure', 10, 'pure', false],
+	['bmp-pure', 10, 'pure', false],
+	['tga-pure', 10, 'pure', false],
+	['pnm-pure', 10, 'pure', false],
+	['farbfeld-pure', 10, 'pure', false],
+	['tiff-pure', 10, 'pure', false],
+	['hdr-pure', 10, 'pure', false],
+	['pcx-pure', 10, 'pure', false],
+	['ras-pure', 10, 'pure', false],
+	['xbm-pure', 10, 'pure', false],
+	['xpm-pure', 10, 'pure', false],
+	['ico-pure', 10, 'pure', false],
+	['icns-pure', 10, 'pure', false],
+] as const;
+
+const DEFAULT_DECODER_IDS = SHIPPED_DECODERS.map(([id]) => id);
+const DEFAULT_ENCODER_IDS = SHIPPED_ENCODERS.map(([id]) => id);
+
+/**
+ * The mechanism each id suffix names, and the path it has to report.
+ *
+ * `ConvertReport.decodePath` reaches the interface and is shown to the person
+ * waiting, because somebody on a software plugin waits several times longer
+ * than somebody on the hardware path and saying so is the difference between a
+ * slow tool and a broken one.
+ */
+const MECHANISM_PATHS = {
+	native: 'native-image',
+	fallback: 'native-image',
+	frames: 'native-image',
+	preview: 'native-image',
+	webcodecs: 'webcodecs',
+	pure: 'pure',
+} as const;
 
 /** The lowest priority left free for a host application's plugin. */
 const PLUGIN_BAND = 50;
 
-/** The rung an id names, which is whatever follows the format it handles. */
-function rungOf(id: string): keyof typeof DOCUMENTED_DECODER_RUNGS {
-	const rung = id.slice(id.indexOf('-') + 1);
-	if (rung === 'native' || rung === 'webcodecs' || rung === 'pure') return rung;
-	throw new Error(`${id} does not name a rung of the documented ladder`);
+/** The mechanism an id names, which is whatever follows the format it handles. */
+function mechanismOf(id: string): keyof typeof MECHANISM_PATHS {
+	const suffix = id.slice(id.indexOf('-') + 1);
+	if (suffix in MECHANISM_PATHS) return suffix as keyof typeof MECHANISM_PATHS;
+	throw new Error(`${id} does not name a mechanism this package publishes`);
 }
-
-const DEFAULT_ENCODER_IDS = [
-	'png-native',
-	'jpeg-native',
-	'webp-native',
-	'avif-native',
-	'png-pure',
-	'qoi-pure',
-	'bmp-pure',
-	'tga-pure',
-	'pnm-pure',
-	'farbfeld-pure',
-];
 
 beforeEach(() => {
 	clearRegistry();
@@ -675,36 +731,69 @@ describe('the default codec set', () => {
 		// silently takes away the band a host was told it could register in, so
 		// its WebAssembly HEIC decoder at 50 starts running ahead of ours.
 		installDefaultCodecs();
-		for (const decoder of registeredDecoders()) {
-			const rung = DOCUMENTED_DECODER_RUNGS[rungOf(decoder.id)];
-			expect(decoder.priority, decoder.id).toBe(rung.priority);
+		const decoders = registeredDecoders();
+		for (const [id, priority] of SHIPPED_DECODERS) {
+			expect(priorityOf(decoders, id), id).toBe(priority);
 		}
-		for (const encoder of registeredEncoders()) {
-			// The canvas is 10 everywhere except PNG, where ours goes first and
-			// the canvas sits behind it at 20. Every pure encoder is 10.
-			expect(encoder.priority, encoder.id).toBe(encoder.id === 'png-native' ? 20 : 10);
+		const encoders = registeredEncoders();
+		for (const [id, priority] of SHIPPED_ENCODERS) {
+			expect(priorityOf(encoders, id), id).toBe(priority);
 		}
-		for (const codec of [...registeredDecoders(), ...registeredEncoders()]) {
+		for (const codec of [...decoders, ...encoders]) {
 			expect(codec.priority, `${codec.id} stays out of the plugin band`).toBeLessThan(PLUGIN_BAND);
 		}
 	});
 
 	it('labels each rung with the path it really runs on', () => {
-		// `ConvertReport.decodePath` reaches the interface and is shown to the
-		// person waiting, because somebody on a software plugin is waiting
-		// several times longer than somebody on the hardware path and saying so
-		// is the difference between a slow tool and a broken one. A rung that
-		// reports the wrong path tells them the wrong story, and every id and
+		// A rung that reports the wrong path tells the person waiting the wrong
+		// story about why their file took as long as it did, and every id and
 		// priority assertion in this file passes while it does.
 		installDefaultCodecs();
-		for (const decoder of registeredDecoders()) {
-			expect(decoder.path, decoder.id).toBe(DOCUMENTED_DECODER_RUNGS[rungOf(decoder.id)].path);
+		const byId = new Map(registeredDecoders().map((decoder) => [decoder.id, decoder]));
+		for (const [id, , path] of SHIPPED_DECODERS) {
+			expect(byId.get(id)?.path, id).toBe(path);
+			// Said twice on purpose: the table above is what somebody reads, and
+			// this is what makes the suffix mean something rather than being a
+			// naming habit.
+			expect(MECHANISM_PATHS[mechanismOf(id)], id).toBe(path);
 		}
-		for (const encoder of registeredEncoders()) {
-			const rung = rungOf(encoder.id);
-			expect(rung, `${encoder.id} does not encode through WebCodecs`).not.toBe('webcodecs');
-			expect(encoder.path, encoder.id).toBe(DOCUMENTED_ENCODER_PATHS[rung]);
+		const encoders = new Map(registeredEncoders().map((encoder) => [encoder.id, encoder]));
+		for (const [id, , path, animates] of SHIPPED_ENCODERS) {
+			expect(encoders.get(id)?.path, id).toBe(path);
+			expect(mechanismOf(id), `${id} does not encode through WebCodecs`).not.toBe('webcodecs');
+			// `animates` decides whether `convert` prepares every frame before
+			// encoding. An encoder that claimed it and then wrote one frame
+			// would report a frame count that is not in the file.
+			expect(encoders.get(id)?.animates === true, `${id} animates`).toBe(animates);
 		}
+	});
+
+	it('tries our own reader before the browser for the formats that animate', () => {
+		// The browser decodes a GIF and an APNG perfectly well and hands back
+		// one picture, silently. Letting it go first would drop the animation
+		// from every conversion on a browser without a frame decoder, and
+		// nothing about the result would say so.
+		installDefaultCodecs();
+		const decoders = registeredDecoders();
+		for (const format of ['gif', 'apng'] as const) {
+			expect(priorityOf(decoders, `${format}-pure`), format).toBeLessThan(
+				priorityOf(decoders, `${format}-fallback`),
+			);
+		}
+		// GIF is the one of the two with a frame decoder in front of it as
+		// well. There is no apng-frames: the platform decoder that returns
+		// frames is asked for a type, and no browser offers image/apng as one.
+		expect(priorityOf(decoders, 'gif-frames')).toBeLessThan(priorityOf(decoders, 'gif-pure'));
+		expect(registeredDecoders().some((decoder) => decoder.id === 'apng-frames')).toBe(false);
+	});
+
+	it('keeps the embedded preview behind the reader that actually decodes a TIFF', () => {
+		// A TIFF with JPEG strips is refused by name by the pure reader, and
+		// this rung is what turns that refusal into a picture. Ahead of it, it
+		// would hand back a thumbnail for every ordinary TIFF that has one.
+		installDefaultCodecs();
+		const decoders = registeredDecoders();
+		expect(priorityOf(decoders, 'tiff-pure')).toBeLessThan(priorityOf(decoders, 'tiff-preview'));
 	});
 
 	it('offers no HEIC decoder to a browser with neither HEIC nor HEVC', async () => {
@@ -786,15 +875,25 @@ describe('the default codec set', () => {
 		});
 		expect(await encodersFor('heic', everything)).toEqual([]);
 		expect([...(await writableFormats(everything))].sort()).toEqual([
+			'apng',
 			'avif',
 			'bmp',
 			'farbfeld',
+			'gif',
+			'hdr',
+			'icns',
+			'ico',
 			'jpeg',
+			'pcx',
 			'png',
 			'pnm',
 			'qoi',
+			'ras',
 			'tga',
+			'tiff',
 			'webp',
+			'xbm',
+			'xpm',
 		]);
 	});
 
@@ -806,14 +905,32 @@ describe('the default codec set', () => {
 		const capabilities = emptyCapabilities();
 		const readable = await readableFormats(capabilities);
 		const writable = await writableFormats(capabilities);
-		for (const format of ['qoi', 'bmp', 'tga', 'pnm', 'farbfeld'] as const) {
+		for (const format of [
+			'qoi',
+			'bmp',
+			'tga',
+			'pnm',
+			'farbfeld',
+			'gif',
+			'pcx',
+			'ras',
+			'xbm',
+			'xpm',
+		] as const) {
 			expect(readable.has(format), `${format} readable`).toBe(true);
 			expect(writable.has(format), `${format} writable`).toBe(true);
 		}
-		for (const format of ['heic', 'jpeg', 'gif', 'webp', 'avif'] as const) {
+		// Read only by design, and every one of them with no browser involved.
+		for (const format of ['psd', 'dds', 'hdr', 'exr', 'icns', 'ico', 'tiff'] as const) {
+			expect(readable.has(format), `${format} readable`).toBe(true);
+		}
+		// Every one of these needs something from the browser and gets nothing.
+		// SVG is here because rendering one is the browser's job by definition,
+		// and raw is because its preview is a JPEG somebody else has to decode.
+		for (const format of ['heic', 'jpeg', 'jxl', 'webp', 'avif', 'svg', 'raw'] as const) {
 			expect(readable.has(format), `${format} readable`).toBe(false);
 		}
-		for (const format of ['jpeg', 'webp', 'avif'] as const) {
+		for (const format of ['jpeg', 'webp', 'avif', 'heic', 'jxl'] as const) {
 			expect(writable.has(format), `${format} writable`).toBe(false);
 		}
 	});

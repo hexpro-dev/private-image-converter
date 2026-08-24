@@ -87,34 +87,62 @@ export async function convert(
 
 	/* ── Correct ────────────────────────────────────────────────────── */
 
-	// Not rotated here. `DecodeOutput.image` is upright by contract, and the
-	// orientation on it says what the decoder already did.
-	let image: RasterImage = {
-		...output.image,
-		hasAlpha: output.image.hasAlpha || detectAlpha(output.image),
-	};
-
-	const target = FORMATS[to];
-	if (!target.alpha && image.hasAlpha) {
-		image = flatten(image, options.background);
-	}
-
-	// Narrow the gamut when asked to, or when the output cannot carry it. The
-	// conversion is deliberate and one way: doing it twice, or doing it to
-	// something already in sRGB, is the failure this whole path exists to
-	// avoid, so it happens exactly here and nowhere else.
-	const wantWide = (options.colour ?? 'preserve') === 'preserve';
-	const canCarryWide = to === 'png' || to === 'jpeg' || to === 'webp' || to === 'avif';
-	if (!wantWide || !canCarryWide) {
-		image = toColourSpace(image, 'srgb');
-	}
-
-	/* ── Encode ─────────────────────────────────────────────────────── */
-
+	// Resolved before the corrections rather than after, because whether any
+	// encoder for this format can animate decides how much correcting there is
+	// to do. Preparing three hundred frames for an encoder that will write one
+	// is a lot of work to throw away.
 	const encoders = await encodersFor(to, caps);
 	if (encoders.length === 0) {
 		throw new EncodeUnsupportedError(to, encodeUnsupportedMessage(to, caps));
 	}
+
+	const target = FORMATS[to];
+	// Narrowing the gamut is deliberate and one way: doing it twice, or doing
+	// it to something already in sRGB, is the failure this whole path exists to
+	// avoid, so it happens exactly here and nowhere else.
+	const wantWide = (options.colour ?? 'preserve') === 'preserve';
+	const canCarryWide =
+		to === 'png' ||
+		to === 'apng' ||
+		to === 'jpeg' ||
+		to === 'webp' ||
+		to === 'avif' ||
+		to === 'tiff';
+	const narrow = !wantWide || !canCarryWide;
+
+	const correct = (source: RasterImage): RasterImage => {
+		// Not rotated here. `DecodeOutput.image` is upright by contract, and
+		// the orientation on it says what the decoder already did.
+		let corrected: RasterImage = {
+			...source,
+			hasAlpha: source.hasAlpha || detectAlpha(source),
+		};
+		if (!target.alpha && corrected.hasAlpha) {
+			corrected = flatten(corrected, options.background);
+		}
+		if (narrow) corrected = toColourSpace(corrected, 'srgb');
+		return corrected;
+	};
+
+	const image = correct(output.image);
+
+	// An animation survives only when the source had one, the caller wants it,
+	// and something registered for this format can actually write it.
+	const sourceAnimation = output.animation;
+	const keepFrames = (options.frames ?? 'all') === 'all';
+	const canAnimate = encoders.some((encoder) => encoder.animates === true);
+	const animation =
+		sourceAnimation && sourceAnimation.frames.length > 1 && keepFrames && canAnimate
+			? {
+					loopCount: sourceAnimation.loopCount,
+					frames: sourceAnimation.frames.map((frame) => ({
+						delayMs: frame.delayMs,
+						image: correct(frame.image),
+					})),
+				}
+			: undefined;
+
+	/* ── Encode ─────────────────────────────────────────────────────── */
 
 	const encodeStarted = now();
 	const keepMetadata = (options.metadata ?? 'strip') === 'preserve';
@@ -128,6 +156,8 @@ export async function convert(
 	const encodeOptions = {
 		quality: options.quality,
 		background: options.background,
+		palette: options.palette,
+		animation,
 		iccProfile: sourceProfile ?? (keepMetadata ? options.iccProfile : undefined),
 		writeColourTag: image.colourSpace === 'display-p3',
 	};
@@ -135,6 +165,7 @@ export async function convert(
 	let bytes: Uint8Array | undefined;
 	let encoderId = '';
 	let encodePath = encoders[0]?.path ?? 'pure';
+	let wroteFrames = false;
 	let encodeError: unknown;
 	for (const encoder of encoders) {
 		try {
@@ -144,6 +175,7 @@ export async function convert(
 			});
 			encoderId = encoder.id;
 			encodePath = encoder.path;
+			wroteFrames = encoder.animates === true && animation !== undefined;
 			break;
 		} catch (error) {
 			encodeError = error;
@@ -171,6 +203,13 @@ export async function convert(
 			colourSpace: image.colourSpace,
 			orientation: output.orientation,
 			tiles: output.tiles,
+			frames: wroteFrames ? animation?.frames.length : undefined,
+			// Said out loud rather than left to be noticed. Somebody who
+			// converted an animation and got one frame is owed the reason,
+			// which is either that they asked for it or that nothing here can
+			// write a moving picture in the format they chose.
+			droppedFrames:
+				sourceAnimation && sourceAnimation.frames.length > 1 && !wroteFrames ? true : undefined,
 			metadata: output.exif ? readExif(output.exif) : undefined,
 			droppedGainMap: output.droppedGainMap,
 			sourceBytes: input.length,

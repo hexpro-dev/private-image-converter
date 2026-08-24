@@ -8,7 +8,7 @@
  */
 
 import type { Capabilities } from '../types.js';
-import { PROBE_AVIF, PROBE_HEIC, PROBE_WEBP, fromBase64 } from './probes.js';
+import { PROBE_AVIF, PROBE_HEIC, PROBE_JXL, PROBE_WEBP, fromBase64 } from './probes.js';
 import { sniffFormat } from './sniff.js';
 
 /**
@@ -157,6 +157,7 @@ async function probe(): Promise<Capabilities> {
 		['image/heic', fromBase64(PROBE_HEIC)],
 		['image/avif', fromBase64(PROBE_AVIF)],
 		['image/webp', fromBase64(PROBE_WEBP)],
+		['image/jxl', fromBase64(PROBE_JXL)],
 	];
 	for (const [mime, bytes] of decodeProbes) {
 		if (await canDecodeNatively(bytes, mime)) nativeDecode.add(mime);

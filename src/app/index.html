@@ -25,21 +25,45 @@
 					<h2 id="drop-title" class="drop__title">Drop an image here</h2>
 					<p id="drop-hint" class="drop__hint">Or paste one, or choose a file.</p>
 					<label class="button button--primary" for="file">Choose a file</label>
-					<input id="file" type="file" class="visually-hidden" accept="image/*" multiple />
+					<input
+						id="file"
+						type="file"
+						class="visually-hidden"
+						accept="image/*,.heic,.heif,.avif,.jxl,.apng,.tif,.tiff,.psd,.psb,.dds,.hdr,.exr,.pcx,.icns,.ras,.xbm,.xpm,.qoi,.tga,.ppm,.pgm,.pbm,.pnm,.pam,.ff,.dng,.cr2,.cr3,.nef,.arw,.raf,.orf,.rw2"
+						multiple
+					/>
 				</div>
 
 				<div class="controls">
 					<div class="field">
 						<label for="target">Convert to</label>
 						<select id="target">
-							<option value="png" selected>PNG</option>
-							<option value="jpeg">JPEG</option>
-							<option value="webp">WebP</option>
-							<option value="qoi">QOI</option>
-							<option value="bmp">BMP</option>
-							<option value="tga">TGA</option>
-							<option value="pnm">PNM</option>
-							<option value="farbfeld">farbfeld</option>
+							<optgroup label="Everyday">
+								<option value="png" selected>PNG</option>
+								<option value="jpeg">JPEG</option>
+								<option value="webp">WebP</option>
+								<option value="tiff">TIFF</option>
+								<option value="bmp">BMP</option>
+							</optgroup>
+							<optgroup label="Animated">
+								<option value="gif">GIF</option>
+								<option value="apng">APNG</option>
+							</optgroup>
+							<optgroup label="Icons">
+								<option value="ico">ICO</option>
+								<option value="icns">Apple icon</option>
+							</optgroup>
+							<optgroup label="Exchange and archival">
+								<option value="qoi">QOI</option>
+								<option value="tga">TGA</option>
+								<option value="pnm">PNM</option>
+								<option value="farbfeld">farbfeld</option>
+								<option value="pcx">PCX</option>
+								<option value="ras">Sun raster</option>
+								<option value="xbm">XBM</option>
+								<option value="xpm">XPM</option>
+								<option value="hdr">Radiance HDR</option>
+							</optgroup>
 						</select>
 					</div>
 					<div class="field" id="quality-field">

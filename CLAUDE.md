@@ -15,10 +15,18 @@ So, without exception:
 - No screenshot that contains one.
 - No "temporary" commit that is reverted later. The reflog keeps it.
 
-Every fixture is synthetic. `tests/helpers/heif.ts` assembles HEIF containers
-byte by byte from two small constants, and the only compressed payload in the
-repository is a 64 by 64 gradient encoded once with `heif-enc`. Nothing under
-`tests/` came out of a camera.
+Every fixture is synthetic. There are no binary fixture files at all: every
+test buffer is built in code from the format's own specification, so the suite
+runs on a clean checkout and a wrong expectation shows up in the diff rather
+than hiding inside a file nobody can read. `tests/helpers/heif.ts` assembles
+HEIF containers byte by byte from two small constants. The only compressed
+payloads in the repository are the four capability probes in
+`src/detect/probes.ts`, each a 16 by 16 gradient encoded once by the reference
+implementation of its format, with the commands recorded above them. Nothing
+under `tests/` came out of a camera.
+
+Checking this package against ImageMagick or ffmpeg is the right thing to do
+and the way most of the codecs here were verified. Do it in `scratch/`.
 
 Real photographs used for measurement belong in `scratch/`, which is
 gitignored, along with `real-*.heic` and friends. Work against a real camera
@@ -126,9 +134,15 @@ result and types modules and `src/raster/`. It is a reader for a published ISO
 standard and has nothing to do with image conversion, so it stays liftable.
 Enforced by ESLint.
 
-**A codec imports no other codec and never the registry.** That is what makes
-"adding a format is adding a file" true rather than aspirational. Also enforced
-by ESLint.
+**A codec never imports the registry, the DOM layer or the app.** That is what
+makes "adding a format is adding a file" true rather than aspirational: a codec
+that reached into the registry would make the dispatcher's import graph cyclic.
+Enforced by ESLint. Importing another codec's pure function is fine and several
+do it: an Apple icon suite and a modern ICO both hold PNG entries and unpack
+them with `../png/decode.js`, and a Deflate compressed TIFF or PSD inflates
+with `../png/deflate.js`. Refusing those imports is what left `decodeIco`
+rejecting every favicon written since Vista, including the ones this package
+writes.
 
 **No Web Worker in this package.** Converting a large image is genuinely CPU
 bound and belongs off the main thread, which is the opposite of what the
@@ -137,6 +151,40 @@ reasons: a worker created inside this package starts with an empty registry and
 would silently lose a host's plugin decoder, which is exactly the browser where
 it was needed; and a blob worker is blocked under `file://` in Chrome, where the
 offline build has to run. Applications wrap the pure functions themselves.
+
+**Claim the rejections from a compression stream.** `pump` in
+`src/codecs/png/deflate.ts` writes, closes and reads three separate promises
+and only awaits the read, which is deliberate: awaiting the write deadlocks on
+anything larger than the stream's queue. A corrupt stream rejects all three,
+and the two nobody holds became unhandled rejections, which in Node ends the
+process and in a browser fires at the page. A decoder that correctly reported a
+damaged file used to take the tab with it, on about one malformed input in
+twenty. Both now carry a `.catch`.
+
+**TIFF's LZW widens its codes one step early.** The switch to ten bits happens
+at 511 rather than 512, unlike every other LZW in this repository. Getting it
+wrong produces plausible garbage rather than an error. GIF's LZW is the other
+convention and is also least-significant-bit first, where TIFF's is most
+significant. Two LZW implementations, deliberately.
+
+**EXR stores its channels in alphabetical order.** A comes before B comes
+before G comes before R, whatever order you wanted them in. Then RLE, ZIPS and
+ZIP all end with the same two step postprocess: undo a byte level delta
+predictor, then undo an interleave where the first half of the buffer holds the
+even output bytes. Both steps, in that order, for all three. These are the two
+most common EXR bugs and neither produces an error.
+
+**A Photoshop composite is already matted onto white.** The flattened image in
+a PSD stores colour that has been composited against the matte, with the alpha
+beside it, so reading those bytes as straight alpha lightens every soft edge.
+`unmatte` in the PSD decoder undoes it. This was found by measuring a real file
+rather than by reading the specification, which does not say so.
+
+**Animation frames are whole pictures, not patches.** GIF and APNG both store a
+dirty rectangle with a disposal rule and a blend rule, and the two disagree
+about what restoring to background means. The disagreement is settled once, in
+each reader, and `Animation.frames` carries composited full frames. An encoder
+that received patches would have to reimplement both rule sets.
 
 **`CompressionStream` is the zlib.** It is what makes a real PNG encoder
 possible with no dependency. It offers no level control, so the output is a few
@@ -147,9 +195,14 @@ manages, because the filters are chosen adaptively. That trade is deliberate.
 
 1. `src/codecs/<name>/encode.ts` and `decode.ts`, importing only `../../types.js`,
    `../../errors.js` and `../../raster/image.js`.
-2. Register it in `src/defaults.ts`. Priority is a cost, not a preference: 10
-   for the platform's own, 20 for our reader driving the platform, 40 for pure
-   TypeScript, 50 and above left free for a host's plugin.
+2. Register it in `src/defaults.ts`. Priority is a cost, not a preference: 8
+   for the platform's frame decoder, 10 for the platform's own decoder, 20 for
+   our reader where it knows something the platform's does not, 30 for the
+   platform standing in behind one of those, 40 for pure TypeScript, 45 for a
+   last resort that pulls a picture out of a container nothing here decodes,
+   and 50 and above left free for a host's plugin. `tests/registry.test.ts`
+   carries the whole inventory written out, so a new codec is a line there too,
+   which is the moment to say what rung it is on and why.
 3. Add it to `FORMATS` in `src/formats.ts` and to the `FormatId` union, which
    will produce compile errors everywhere a decision has to be made about it.
    That is the point.
@@ -166,8 +219,14 @@ Deliberate refusals, which are decisions rather than gaps waiting to be filled:
 - **HDR gain maps.** The standard range base is decoded and the result says the
   gain map was dropped. Silently returning the base of an HDR photograph is
   correct behaviour and the wrong surprise.
-- **Animated output.** Frames are read where the browser reads them; nothing
-  here writes an animation.
+- **Writing PSD, DDS or EXR.** Reading one is a service to somebody who has the
+  file. Writing one badly is a file they discover is wrong a month later.
+- **Developing a camera raw.** The embedded preview is extracted, which is the
+  camera's own rendering. Demosaicing, white balancing and profiling a sensor
+  is a different project and the module comment says so.
+- **BC6H and BC7 in DDS**, JPEG 2000 entries in an Apple icon suite, tiled,
+  deep and multi-part OpenEXR, BigTIFF, YCbCr and Lab TIFF, and the 1, 4 and 8
+  bit indexed entries in an old Apple icon. Each is refused by name.
 
 Widening the scope widens the surface of a tool that reads untrusted files from
 strangers. Make the case before writing the code.

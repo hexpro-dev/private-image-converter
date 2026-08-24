@@ -25,6 +25,23 @@ function pngLike(length: number, filler = 0xab): Uint8Array {
 }
 
 /** Catch the failure a call was expected to produce, and nothing else. */
+/**
+ * The same, for a call that returns a promise.
+ *
+ * `decodeIco` became asynchronous when it started unpacking the embedded PNG
+ * that every icon written since Vista uses for its largest image, so the
+ * refusals have to be awaited even though none of them gets that far.
+ */
+async function failureFrom(fn: () => Promise<unknown>): Promise<ConverterError> {
+	try {
+		await fn();
+	} catch (error) {
+		if (error instanceof ConverterError) return error;
+		throw error;
+	}
+	throw new Error('expected a typed failure, and the call returned normally');
+}
+
 function failureOf(fn: () => unknown): ConverterError {
 	try {
 		fn();
@@ -133,7 +150,7 @@ function pixels(bytes: Uint8ClampedArray): number[] {
 /* ── Writing the directory ────────────────────────────────────────────── */
 
 describe('encodeIco', () => {
-	it('writes the six byte header and the sixteen byte entry the specification defines', () => {
+	it('writes the six byte header and the sixteen byte entry the specification defines', async () => {
 		const png = pngLike(10);
 		const ico = encodeIco([{ width: 16, height: 16, png }]);
 
@@ -165,26 +182,26 @@ describe('encodeIco', () => {
 		expect(Array.from(ico.subarray(22))).toEqual(Array.from(png));
 	});
 
-	it('writes 256 as a zero byte, because a side does not fit in eight bits', () => {
+	it('writes 256 as a zero byte, because a side does not fit in eight bits', async () => {
 		const ico = encodeIco([{ width: 256, height: 256, png: pngLike(8) }]);
 		expect(ico[6]).toBe(0);
 		expect(ico[7]).toBe(0);
 	});
 
-	it('keeps odd sides literal', () => {
+	it('keeps odd sides literal', async () => {
 		const ico = encodeIco([{ width: 17, height: 33, png: pngLike(8) }]);
 		expect(ico[6]).toBe(17);
 		expect(ico[7]).toBe(33);
 	});
 
-	it('writes a single pixel icon', () => {
+	it('writes a single pixel icon', async () => {
 		const ico = encodeIco([{ width: 1, height: 1, png: pngLike(9) }]);
 		expect(ico[6]).toBe(1);
 		expect(ico[7]).toBe(1);
 		expect(ico.length).toBe(6 + 16 + 9);
 	});
 
-	it('lays several images out in the order given, each at its declared offset', () => {
+	it('lays several images out in the order given, each at its declared offset', async () => {
 		const small = pngLike(12, 0x11);
 		const medium = pngLike(20, 0x22);
 		const large = pngLike(31, 0x33);
@@ -217,7 +234,7 @@ describe('encodeIco', () => {
 		});
 	});
 
-	it('refuses a side above 256, which the directory cannot express', () => {
+	it('refuses a side above 256, which the directory cannot express', async () => {
 		const error = failureOf(() => encodeIco([{ width: 257, height: 16, png: pngLike(8) }]));
 		expect(error).toBeInstanceOf(EncodeFailedError);
 		expect(error.code).toBe('encode/failed');
@@ -225,13 +242,13 @@ describe('encodeIco', () => {
 		expect(error.message.endsWith('.')).toBe(true);
 	});
 
-	it('refuses a height above 256 as well as a width', () => {
+	it('refuses a height above 256 as well as a width', async () => {
 		const error = failureOf(() => encodeIco([{ width: 16, height: 512, png: pngLike(8) }]));
 		expect(error).toBeInstanceOf(EncodeFailedError);
 		expect(error.message).toContain('height');
 	});
 
-	it('refuses a side that is zero or not a whole number', () => {
+	it('refuses a side that is zero or not a whole number', async () => {
 		expect(failureOf(() => encodeIco([{ width: 0, height: 16, png: pngLike(8) }]))).toBeInstanceOf(
 			EncodeFailedError,
 		);
@@ -240,20 +257,20 @@ describe('encodeIco', () => {
 		).toBeInstanceOf(EncodeFailedError);
 	});
 
-	it('refuses an icon with no images in it', () => {
+	it('refuses an icon with no images in it', async () => {
 		const error = failureOf(() => encodeIco([]));
 		expect(error).toBeInstanceOf(EncodeFailedError);
 		expect(error.code).toBe('encode/failed');
 	});
 
-	it('refuses a payload that is not a PNG, because it copies rather than encodes', () => {
+	it('refuses a payload that is not a PNG, because it copies rather than encodes', async () => {
 		const notPng = Uint8Array.from([0x42, 0x4d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
 		const error = failureOf(() => encodeIco([{ width: 16, height: 16, png: notPng }]));
 		expect(error).toBeInstanceOf(EncodeFailedError);
 		expect(error.message).toContain('PNG signature');
 	});
 
-	it('refuses a payload too short to hold a signature', () => {
+	it('refuses a payload too short to hold a signature', async () => {
 		const stub = Uint8Array.from([0x89, 0x50, 0x4e]);
 		const error = failureOf(() => encodeIco([{ width: 16, height: 16, png: stub }]));
 		expect(error).toBeInstanceOf(EncodeFailedError);
@@ -264,7 +281,7 @@ describe('encodeIco', () => {
 /* ── Reading the directory back ───────────────────────────────────────── */
 
 describe('readIcoDirectory', () => {
-	it('returns the payloads a written icon went in with, byte for byte', () => {
+	it('returns the payloads a written icon went in with, byte for byte', async () => {
 		const first = pngLike(13, 0x5a);
 		const second = pngLike(27, 0xa5);
 		const directory = readIcoDirectory(
@@ -297,20 +314,20 @@ describe('readIcoDirectory', () => {
 		expect(Array.from(entry?.payload ?? [])).toEqual(Array.from(png));
 	});
 
-	it('reads a zero side byte back as 256', () => {
+	it('reads a zero side byte back as 256', async () => {
 		const directory = readIcoDirectory(encodeIco([{ width: 256, height: 256, png: pngLike(8) }]));
 		expect(directory.entries[0]?.width).toBe(256);
 		expect(directory.entries[0]?.height).toBe(256);
 	});
 
-	it('recognises a cursor, which shares the container', () => {
+	it('recognises a cursor, which shares the container', async () => {
 		const directory = readIcoDirectory(
 			buildIco([{ width: 32, height: 32, payload: pngLike(16) }], 2),
 		);
 		expect(directory.kind).toBe('cursor');
 	});
 
-	it('rejects a file too short to hold the header', () => {
+	it('rejects a file too short to hold the header', async () => {
 		const error = failureOf(() => readIcoDirectory(Uint8Array.from([0, 0, 1])));
 		expect(error).toBeInstanceOf(DecodeFailedError);
 		expect(error.code).toBe('decode/failed');
@@ -318,11 +335,11 @@ describe('readIcoDirectory', () => {
 		expect(error.message.endsWith('.')).toBe(true);
 	});
 
-	it('rejects an empty input rather than returning nothing', () => {
+	it('rejects an empty input rather than returning nothing', async () => {
 		expect(failureOf(() => readIcoDirectory(new Uint8Array(0)))).toBeInstanceOf(DecodeFailedError);
 	});
 
-	it('rejects a non-zero reserved field', () => {
+	it('rejects a non-zero reserved field', async () => {
 		const bytes = encodeIco([{ width: 16, height: 16, png: pngLike(8) }]);
 		bytes[0] = 9;
 		const error = failureOf(() => readIcoDirectory(bytes));
@@ -330,18 +347,18 @@ describe('readIcoDirectory', () => {
 		expect(error.message).toContain('reserved');
 	});
 
-	it('rejects a type that is neither icon nor cursor', () => {
+	it('rejects a type that is neither icon nor cursor', async () => {
 		const bytes = encodeIco([{ width: 16, height: 16, png: pngLike(8) }]);
 		bytes[2] = 7;
 		expect(failureOf(() => readIcoDirectory(bytes))).toBeInstanceOf(DecodeFailedError);
 	});
 
-	it('rejects a directory that claims no images', () => {
+	it('rejects a directory that claims no images', async () => {
 		const bytes = Uint8Array.from([0, 0, 1, 0, 0, 0]);
 		expect(failureOf(() => readIcoDirectory(bytes))).toBeInstanceOf(DecodeFailedError);
 	});
 
-	it('rejects a count larger than the file can hold', () => {
+	it('rejects a count larger than the file can hold', async () => {
 		const bytes = encodeIco([{ width: 16, height: 16, png: pngLike(8) }]);
 		new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint16(4, 500, true);
 		const error = failureOf(() => readIcoDirectory(bytes));
@@ -349,25 +366,25 @@ describe('readIcoDirectory', () => {
 		expect(error.message).toContain('500');
 	});
 
-	it('rejects an entry whose payload runs past the end of the file', () => {
+	it('rejects an entry whose payload runs past the end of the file', async () => {
 		const bytes = encodeIco([{ width: 16, height: 16, png: pngLike(8) }]);
 		new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint32(14, 4096, true);
 		expect(failureOf(() => readIcoDirectory(bytes))).toBeInstanceOf(DecodeFailedError);
 	});
 
-	it('rejects an entry that points back into the directory', () => {
+	it('rejects an entry that points back into the directory', async () => {
 		const bytes = encodeIco([{ width: 16, height: 16, png: pngLike(8) }]);
 		new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint32(18, 4, true);
 		expect(failureOf(() => readIcoDirectory(bytes))).toBeInstanceOf(DecodeFailedError);
 	});
 
-	it('rejects an entry that declares no bytes', () => {
+	it('rejects an entry that declares no bytes', async () => {
 		const bytes = encodeIco([{ width: 16, height: 16, png: pngLike(8) }]);
 		new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint32(14, 0, true);
 		expect(failureOf(() => readIcoDirectory(bytes))).toBeInstanceOf(DecodeFailedError);
 	});
 
-	it('rejects a file truncated part way through a payload', () => {
+	it('rejects a file truncated part way through a payload', async () => {
 		const whole = encodeIco([{ width: 16, height: 16, png: pngLike(64) }]);
 		const cut = whole.subarray(0, whole.length - 5);
 		expect(failureOf(() => readIcoDirectory(cut))).toBeInstanceOf(DecodeFailedError);
@@ -377,7 +394,7 @@ describe('readIcoDirectory', () => {
 /* ── Unpacking the bitmap form ────────────────────────────────────────── */
 
 describe('decodeIco', () => {
-	it('unpacks a 32 bit bitmap bottom up, keeping alpha exactly', () => {
+	it('unpacks a 32 bit bitmap bottom up, keeping alpha exactly', async () => {
 		const dib = buildDib({
 			width: 2,
 			declaredHeight: 4, // doubled, to make room for the mask
@@ -391,7 +408,7 @@ describe('decodeIco', () => {
 				[false, false],
 			],
 		});
-		const image = decodeIco(buildIco([{ width: 2, height: 2, payload: dib }]));
+		const image = await decodeIco(buildIco([{ width: 2, height: 2, payload: dib }]));
 
 		expect(image.width).toBe(2);
 		expect(image.height).toBe(2);
@@ -402,7 +419,7 @@ describe('decodeIco', () => {
 		]);
 	});
 
-	it('unpacks a single pixel', () => {
+	it('unpacks a single pixel', async () => {
 		const dib = buildDib({
 			width: 1,
 			declaredHeight: 2,
@@ -414,7 +431,7 @@ describe('decodeIco', () => {
 			rows: [[0x80]],
 			mask: [[false]],
 		});
-		const image = decodeIco(buildIco([{ width: 1, height: 1, payload: dib, bitCount: 1 }]));
+		const image = await decodeIco(buildIco([{ width: 1, height: 1, payload: dib, bitCount: 1 }]));
 
 		expect(image.width).toBe(1);
 		expect(image.height).toBe(1);
@@ -422,7 +439,7 @@ describe('decodeIco', () => {
 		expect(pixels(image.data)).toEqual([200, 100, 50, 255]);
 	});
 
-	it('pads a 24 bit row out to four bytes at an odd width', () => {
+	it('pads a 24 bit row out to four bytes at an odd width', async () => {
 		const dib = buildDib({
 			width: 3,
 			declaredHeight: 2,
@@ -432,13 +449,13 @@ describe('decodeIco', () => {
 			rows: [[30, 20, 10, 60, 50, 40, 90, 80, 70]],
 			mask: [[false, true, false]],
 		});
-		const image = decodeIco(buildIco([{ width: 3, height: 1, payload: dib, bitCount: 24 }]));
+		const image = await decodeIco(buildIco([{ width: 3, height: 1, payload: dib, bitCount: 24 }]));
 
 		expect(image.hasAlpha).toBe(true);
 		expect(pixels(image.data)).toEqual([10, 20, 30, 255, 40, 50, 60, 0, 70, 80, 90, 255]);
 	});
 
-	it('unpacks an eight bit palette at an odd width and height', () => {
+	it('unpacks an eight bit palette at an odd width and height', async () => {
 		const dib = buildDib({
 			width: 3,
 			declaredHeight: 4,
@@ -458,7 +475,7 @@ describe('decodeIco', () => {
 				[false, false, true],
 			],
 		});
-		const image = decodeIco(buildIco([{ width: 3, height: 2, payload: dib, bitCount: 8 }]));
+		const image = await decodeIco(buildIco([{ width: 3, height: 2, payload: dib, bitCount: 8 }]));
 
 		expect(image.hasAlpha).toBe(true);
 		expect(pixels(image.data)).toEqual([
@@ -466,7 +483,7 @@ describe('decodeIco', () => {
 		]);
 	});
 
-	it('takes the palette size from the depth when the header leaves it at zero', () => {
+	it('takes the palette size from the depth when the header leaves it at zero', async () => {
 		const palette: [number, number, number][] = [];
 		for (let i = 0; i < 16; i += 1) palette.push([i * 10, i * 10 + 1, i * 10 + 2]);
 		const dib = buildDib({
@@ -478,13 +495,13 @@ describe('decodeIco', () => {
 			// High nibble first: indices 1, 2 and 15.
 			rows: [[0x12, 0xf0]],
 		});
-		const image = decodeIco(buildIco([{ width: 3, height: 1, payload: dib, bitCount: 4 }]));
+		const image = await decodeIco(buildIco([{ width: 3, height: 1, payload: dib, bitCount: 4 }]));
 
 		expect(image.hasAlpha).toBe(false);
 		expect(pixels(image.data)).toEqual([10, 11, 12, 255, 20, 21, 22, 255, 150, 151, 152, 255]);
 	});
 
-	it('falls back to the mask when a 32 bit bitmap leaves its alpha channel at zero', () => {
+	it('falls back to the mask when a 32 bit bitmap leaves its alpha channel at zero', async () => {
 		const dib = buildDib({
 			width: 2,
 			declaredHeight: 2,
@@ -492,26 +509,26 @@ describe('decodeIco', () => {
 			rows: [[10, 20, 30, 0, 40, 50, 60, 0]],
 			mask: [[true, false]],
 		});
-		const image = decodeIco(buildIco([{ width: 2, height: 1, payload: dib }]));
+		const image = await decodeIco(buildIco([{ width: 2, height: 1, payload: dib }]));
 
 		expect(image.hasAlpha).toBe(true);
 		expect(pixels(image.data)).toEqual([30, 20, 10, 0, 60, 50, 40, 255]);
 	});
 
-	it('treats a 32 bit bitmap with neither alpha nor mask as opaque, not invisible', () => {
+	it('treats a 32 bit bitmap with neither alpha nor mask as opaque, not invisible', async () => {
 		const dib = buildDib({
 			width: 2,
 			declaredHeight: 1,
 			bitCount: 32,
 			rows: [[10, 20, 30, 0, 40, 50, 60, 0]],
 		});
-		const image = decodeIco(buildIco([{ width: 2, height: 1, payload: dib }]));
+		const image = await decodeIco(buildIco([{ width: 2, height: 1, payload: dib }]));
 
 		expect(image.hasAlpha).toBe(false);
 		expect(pixels(image.data)).toEqual([30, 20, 10, 255, 60, 50, 40, 255]);
 	});
 
-	it('reads a top-down bitmap in the order it is stored', () => {
+	it('reads a top-down bitmap in the order it is stored', async () => {
 		const dib = buildDib({
 			width: 1,
 			declaredHeight: -2,
@@ -522,13 +539,13 @@ describe('decodeIco', () => {
 				[6, 5, 4],
 			],
 		});
-		const image = decodeIco(buildIco([{ width: 1, height: 2, payload: dib, bitCount: 24 }]));
+		const image = await decodeIco(buildIco([{ width: 1, height: 2, payload: dib, bitCount: 24 }]));
 
 		expect(image.height).toBe(2);
 		expect(pixels(image.data)).toEqual([1, 2, 3, 255, 4, 5, 6, 255]);
 	});
 
-	it('picks the largest image in the file', () => {
+	it('picks the largest image in the file', async () => {
 		const small = buildDib({
 			width: 1,
 			declaredHeight: 2,
@@ -549,7 +566,7 @@ describe('decodeIco', () => {
 				[false, false],
 			],
 		});
-		const image = decodeIco(
+		const image = await decodeIco(
 			buildIco([
 				{ width: 1, height: 1, payload: small, bitCount: 24 },
 				{ width: 2, height: 2, payload: large },
@@ -560,28 +577,55 @@ describe('decodeIco', () => {
 		expect(image.height).toBe(2);
 	});
 
-	it('says so rather than guessing when the largest image is an embedded PNG', () => {
-		const error = failureOf(() =>
-			decodeIco(encodeIco([{ width: 32, height: 32, png: pngLike(40) }])),
-		);
-		expect(error).toBeInstanceOf(UnsupportedHereError);
-		expect(error.code).toBe('decode/unsupported-here');
-		expect(error.message).toContain('PNG');
+	it('unpacks an embedded PNG rather than refusing it', async () => {
+		// Every icon written since Vista stores its largest image this way, and
+		// so does this package's own writer, so refusing them would mean
+		// refusing most favicons and every icon this tool produces.
+		const source = createRaster(4, 4, 'srgb', true);
+		for (let i = 0; i < 16; i += 1) {
+			source.data[i * 4] = 10 + i;
+			source.data[i * 4 + 1] = 200;
+			source.data[i * 4 + 2] = 30;
+			source.data[i * 4 + 3] = i < 4 ? 0 : 255;
+		}
+		const file = encodeIco([{ width: 4, height: 4, png: await encodePng(source) }]);
+		const image = await decodeIco(file);
+		expect(image.width).toBe(4);
+		expect(image.height).toBe(4);
+		expect(Array.from(image.data)).toEqual(Array.from(source.data));
 	});
 
-	it('refuses a depth the icon format does not define', () => {
+	it('takes a PNG entry at the size the PNG says, not the size the directory claims', async () => {
+		// The directory records each side in one byte and writers do get it
+		// wrong. The specification says the payload wins, which is what every
+		// icon renderer does.
+		const source = createRaster(6, 6, 'srgb', false);
+		source.data.fill(120);
+		for (let i = 3; i < source.data.length; i += 4) source.data[i] = 255;
+		const png = await encodePng(source);
+		const file = encodeIco([{ width: 6, height: 6, png }]);
+		// Rewrite the directory's first entry to lie about its size.
+		file[6] = 32;
+		file[7] = 32;
+		const image = await decodeIco(file);
+		expect([image.width, image.height]).toEqual([6, 6]);
+	});
+
+	it('refuses a depth the icon format does not define', async () => {
 		const dib = buildDib({
 			width: 2,
 			declaredHeight: 1,
 			bitCount: 16,
 			rows: [[0, 0, 0, 0]],
 		});
-		const error = failureOf(() => decodeIco(buildIco([{ width: 2, height: 1, payload: dib }])));
+		const error = await failureFrom(() =>
+			decodeIco(buildIco([{ width: 2, height: 1, payload: dib }])),
+		);
 		expect(error).toBeInstanceOf(UnsupportedHereError);
 		expect(error.message).toContain('16 bits');
 	});
 
-	it('refuses a run-length compressed bitmap', () => {
+	it('refuses a run-length compressed bitmap', async () => {
 		const dib = buildDib({
 			width: 2,
 			declaredHeight: 1,
@@ -593,19 +637,23 @@ describe('decodeIco', () => {
 			compression: 1,
 			rows: [[0, 1]],
 		});
-		const error = failureOf(() => decodeIco(buildIco([{ width: 2, height: 1, payload: dib }])));
+		const error = await failureFrom(() =>
+			decodeIco(buildIco([{ width: 2, height: 1, payload: dib }])),
+		);
 		expect(error).toBeInstanceOf(UnsupportedHereError);
 		expect(error.message).toContain('compressed');
 	});
 
-	it('rejects a payload too short to hold a bitmap header', () => {
+	it('rejects a payload too short to hold a bitmap header', async () => {
 		const stub = new Uint8Array(12);
-		const error = failureOf(() => decodeIco(buildIco([{ width: 2, height: 2, payload: stub }])));
+		const error = await failureFrom(() =>
+			decodeIco(buildIco([{ width: 2, height: 2, payload: stub }])),
+		);
 		expect(error).toBeInstanceOf(DecodeFailedError);
 		expect(error.message).toContain('40');
 	});
 
-	it('rejects a bitmap whose pixels are truncated', () => {
+	it('rejects a bitmap whose pixels are truncated', async () => {
 		const dib = buildDib({
 			width: 8,
 			declaredHeight: 16,
@@ -614,13 +662,15 @@ describe('decodeIco', () => {
 			mask: Array.from({ length: 8 }, () => new Array<boolean>(8).fill(false)),
 		});
 		const cut = dib.subarray(0, 60);
-		const error = failureOf(() => decodeIco(buildIco([{ width: 8, height: 8, payload: cut }])));
+		const error = await failureFrom(() =>
+			decodeIco(buildIco([{ width: 8, height: 8, payload: cut }])),
+		);
 		expect(error).toBeInstanceOf(DecodeFailedError);
 		expect(error.message).toContain('stop short');
 		expect(error.message.endsWith('.')).toBe(true);
 	});
 
-	it('rejects a bitmap header that claims an impossible length', () => {
+	it('rejects a bitmap header that claims an impossible length', async () => {
 		const dib = buildDib({
 			width: 2,
 			declaredHeight: 1,
@@ -629,11 +679,11 @@ describe('decodeIco', () => {
 		});
 		new DataView(dib.buffer, dib.byteOffset, dib.byteLength).setUint32(0, 12, true);
 		expect(
-			failureOf(() => decodeIco(buildIco([{ width: 2, height: 1, payload: dib }]))),
+			await failureFrom(() => decodeIco(buildIco([{ width: 2, height: 1, payload: dib }]))),
 		).toBeInstanceOf(DecodeFailedError);
 	});
 
-	it('rejects a pixel that indexes past the end of the palette', () => {
+	it('rejects a pixel that indexes past the end of the palette', async () => {
 		const dib = buildDib({
 			width: 1,
 			declaredHeight: 2,
@@ -645,12 +695,14 @@ describe('decodeIco', () => {
 			rows: [[5]],
 			mask: [[false]],
 		});
-		const error = failureOf(() => decodeIco(buildIco([{ width: 1, height: 1, payload: dib }])));
+		const error = await failureFrom(() =>
+			decodeIco(buildIco([{ width: 1, height: 1, payload: dib }])),
+		);
 		expect(error).toBeInstanceOf(DecodeFailedError);
 		expect(error.message).toContain('palette colour 5');
 	});
 
-	it('rejects a bitmap with no pixels in it', () => {
+	it('rejects a bitmap with no pixels in it', async () => {
 		const dib = buildDib({
 			width: 2,
 			declaredHeight: 1,
@@ -659,11 +711,11 @@ describe('decodeIco', () => {
 		});
 		new DataView(dib.buffer, dib.byteOffset, dib.byteLength).setInt32(4, 0, true);
 		expect(
-			failureOf(() => decodeIco(buildIco([{ width: 2, height: 1, payload: dib }]))),
+			await failureFrom(() => decodeIco(buildIco([{ width: 2, height: 1, payload: dib }]))),
 		).toBeInstanceOf(DecodeFailedError);
 	});
 
-	it('refuses a header that asks for an allocation far larger than any icon', () => {
+	it('refuses a header that asks for an allocation far larger than any icon', async () => {
 		// One bit per pixel expands thirty-two fold on the way to RGBA, so this
 		// is the shape of input that turns a small file into a huge buffer.
 		const width = 16_777_217;
@@ -677,7 +729,9 @@ describe('decodeIco', () => {
 		view.setUint16(14, 1, true);
 		view.setUint32(32, 2, true);
 
-		const error = failureOf(() => decodeIco(buildIco([{ width: 256, height: 1, payload }])));
+		const error = await failureFrom(() =>
+			decodeIco(buildIco([{ width: 256, height: 1, payload }])),
+		);
 		expect(error).toBeInstanceOf(ImageTooLargeError);
 		expect(error.code).toBe('input/too-large');
 	});
@@ -828,7 +882,7 @@ const FIXTURES: readonly Fixture[] = [
 ];
 
 describe('conformance', () => {
-	it('writes the directory another implementation writes, byte for byte', () => {
+	it('writes the directory another implementation writes, byte for byte', async () => {
 		const ico = encodeIco([
 			{ width: 256, height: 256, png: pngLike(FOREIGN_PAYLOAD_BYTES[0]) },
 			{ width: 64, height: 64, png: pngLike(FOREIGN_PAYLOAD_BYTES[1]) },
@@ -839,8 +893,8 @@ describe('conformance', () => {
 	});
 
 	for (const fixture of FIXTURES) {
-		it(`decodes ${fixture.what} to the pixels another implementation reads`, () => {
-			const image = decodeIco(fromHex(fixture.bytes));
+		it(`decodes ${fixture.what} to the pixels another implementation reads`, async () => {
+			const image = await decodeIco(fromHex(fixture.bytes));
 			expect(image.width).toBe(fixture.width);
 			expect(image.height).toBe(fixture.height);
 			expect(image.colourSpace).toBe('srgb');
@@ -880,15 +934,15 @@ describe('conformance', () => {
 	];
 
 	for (const fixture of TABLE_ABOVE_EIGHT_BITS) {
-		it(`starts the pixels after the colour table in ${fixture.what}`, () => {
-			const image = decodeIco(fromHex(fixture.bytes));
+		it(`starts the pixels after the colour table in ${fixture.what}`, async () => {
+			const image = await decodeIco(fromHex(fixture.bytes));
 			expect(image.width).toBe(4);
 			expect(image.height).toBe(2);
 			expect(pixels(image.data)).toEqual(TABLE_ABOVE_EIGHT_BITS_RGBA);
 		});
 	}
 
-	it('refuses a colour table larger than the bitmap it sits in', () => {
+	it('refuses a colour table larger than the bitmap it sits in', async () => {
 		const bytes = fromHex(TABLE_ABOVE_EIGHT_BITS[0].bytes);
 		// Four billion colour table entries, which is where ignoring the count
 		// used to hand back the table itself as the picture.
@@ -897,13 +951,13 @@ describe('conformance', () => {
 			0xffffffff,
 			true,
 		);
-		const error = failureOf(() => decodeIco(bytes));
+		const error = await failureFrom(() => decodeIco(bytes));
 		expect(error).toBeInstanceOf(DecodeFailedError);
 		expect(error.message).toContain('colour table');
 		expect(error.message.endsWith('.')).toBe(true);
 	});
 
-	it('reads every entry of a foreign icon out of its directory intact', () => {
+	it('reads every entry of a foreign icon out of its directory intact', async () => {
 		const bytes = fromHex(FIXTURES[4]?.bytes ?? '');
 		const directory = readIcoDirectory(bytes);
 		expect(directory.kind).toBe('icon');
@@ -916,12 +970,11 @@ describe('conformance', () => {
 		expect(directory.entries[0]?.payload.length).toBe(bytes.length - 22);
 	});
 
-	it('refuses the whole icon when the largest image is a PNG, bitmaps or not', () => {
-		// The standard modern Windows icon is small sizes as bitmaps with 256
-		// as an embedded PNG. Reading the largest is the documented contract,
-		// so this file has to be taken apart with `readIcoDirectory` rather
-		// than handed to `decodeIco`, and that is worth pinning rather than
-		// discovering.
+	it('reads the PNG when a mixed icon keeps its largest image in that form', async () => {
+		// The standard modern Windows icon is the small sizes as bitmaps with
+		// 256 as an embedded PNG. Reading the largest is the documented
+		// contract, so the PNG is what comes back, and the directory is still
+		// there for a caller that wanted a particular size instead.
 		const small = buildDib({
 			width: 2,
 			declaredHeight: 4,
@@ -935,13 +988,28 @@ describe('conformance', () => {
 				[false, false],
 			],
 		});
+		const big = createRaster(8, 8, 'srgb', false);
+		big.data.fill(77);
+		for (let i = 3; i < big.data.length; i += 4) big.data[i] = 255;
 		const file = buildIco([
 			{ width: 2, height: 2, payload: small, bitCount: 24 },
-			{ width: 256, height: 256, payload: pngLike(64) },
+			{ width: 8, height: 8, payload: await encodePng(big) },
 		]);
-		expect(failureOf(() => decodeIco(file))).toBeInstanceOf(UnsupportedHereError);
+		const image = await decodeIco(file);
+		expect([image.width, image.height]).toEqual([8, 8]);
 
 		const directory = readIcoDirectory(file);
 		expect(directory.entries.map((entry) => entry.payloadKind)).toEqual(['dib', 'png']);
+	});
+
+	it('refuses an entry whose PNG payload is not a PNG after all', async () => {
+		// `pngLike` is a signature and then nothing, which is what a truncated
+		// download looks like. The directory still reports it as a PNG entry,
+		// because that is what the bytes say, and the failure belongs to the
+		// PNG reader rather than to this one.
+		const error = await failureFrom(() =>
+			decodeIco(encodeIco([{ width: 32, height: 32, png: pngLike(40) }])),
+		);
+		expect(error.code).toBe('decode/failed');
 	});
 });

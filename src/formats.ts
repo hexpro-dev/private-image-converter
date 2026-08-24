@@ -298,11 +298,16 @@ export const FORMATS: { readonly [K in FormatId]: FormatInfo } = {
 			'image/x-portable-pixmap',
 			'image/x-portable-graymap',
 			'image/x-portable-bitmap',
+			'image/x-portable-arbitrarymap',
 		],
 		extension: 'ppm',
-		extensions: ['pnm', 'ppm', 'pgm', 'pbm'],
+		extensions: ['pnm', 'ppm', 'pgm', 'pbm', 'pam'],
 		label: 'PNM',
-		alpha: false,
+		// PAM, the seventh member of the family, is the one with an alpha
+		// channel, and it is written whenever the picture has one. Saying no
+		// here would make the converter flatten every translucent image before
+		// handing it to an encoder that could have kept it.
+		alpha: true,
 		lossy: false,
 		animated: false,
 	},

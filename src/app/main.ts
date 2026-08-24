@@ -70,6 +70,7 @@ function describe(result: ConvertResult): string {
 		`${Math.round(report.decodeMs + report.encodeMs)} ms`,
 	];
 	if (report.tiles && report.tiles > 1) parts.push(`${report.tiles} tiles`);
+	if (report.frames) parts.push(`${report.frames} frames`);
 	if (report.colourSpace === 'display-p3') parts.push('Display P3 kept');
 	return parts.join(', ');
 }
@@ -138,6 +139,15 @@ function render(result: ConvertResult, filename: string, blob: Blob): void {
 		const line = document.createElement('p');
 		line.className = 'result__meta';
 		line.textContent = 'This was an HDR photograph. The result is the standard range version.';
+		body.append(line);
+	}
+
+	if (result.report.droppedFrames) {
+		// Said out loud, because a moving picture that comes back still is the
+		// one result somebody is most likely to think went wrong.
+		const line = document.createElement('p');
+		line.className = 'result__meta';
+		line.textContent = `This was an animation. ${FORMATS[result.report.to].label} holds one picture, so this is the first frame. GIF and APNG keep all of them.`;
 		body.append(line);
 	}
 

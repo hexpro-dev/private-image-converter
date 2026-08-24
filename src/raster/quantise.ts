@@ -70,16 +70,21 @@ class ColourTable {
 	private mask: number;
 	private used = 0;
 
-	constructor(capacity = 1024) {
+	/**
+	 * Starts small and grows.
+	 *
+	 * The caller knows its own ceiling and could hand it over, but almost
+	 * every image that reaches this has a handful of colours rather than the
+	 * full 256, and allocating for the worst case would mean two kilobytes of
+	 * zeroes per call for a four colour logo. Growing costs one rehash of at
+	 * most a few hundred entries.
+	 */
+	constructor(capacity = 32) {
 		let size = 16;
 		while (size < capacity * 2) size *= 2;
 		this.keys = new Int32Array(size).fill(-1);
 		this.values = new Int32Array(size);
 		this.mask = size - 1;
-	}
-
-	get size(): number {
-		return this.used;
 	}
 
 	private slot(key: number): number {
@@ -145,7 +150,7 @@ export function exactPalette(
 ): IndexedImage | undefined {
 	const { data, width, height } = image;
 	const pixels = width * height;
-	const table = new ColourTable(maxColours + 2);
+	const table = new ColourTable();
 	const found: number[] = [];
 	let transparent = false;
 

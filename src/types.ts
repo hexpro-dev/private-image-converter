@@ -321,6 +321,16 @@ export interface Encoder {
 	readonly format: FormatId;
 	readonly path: EncodePath;
 	readonly priority: number;
+	/**
+	 * Whether this encoder writes `EncodeOptions.animation` rather than ignoring it.
+	 *
+	 * Declared rather than inferred from the format, because the two are not
+	 * the same question. WebP is an animated format and no browser will write
+	 * an animated one, so a converter that read the format table would prepare
+	 * every frame, hand them over, and then report an animation that is not in
+	 * the file.
+	 */
+	readonly animates?: boolean;
 	available(capabilities: Capabilities): Promise<boolean>;
 	encode(image: RasterImage, options: EncodeOptions, context: EncodeContext): Promise<Uint8Array>;
 }

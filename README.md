@@ -1,7 +1,9 @@
 # private-image-converter
 
 Convert images in the browser, including HEIC from an iPhone, without uploading
-them anywhere.
+them anywhere. Twenty-six formats, including the awkward ones: TIFF, Photoshop,
+DDS, OpenEXR, Radiance HDR, Apple icon suites and the preview inside a camera
+raw file.
 
 Zero runtime dependencies. There is no server, no upload, and no network call
 of any kind. The conversion happens in the tab, and the file the browser saves
@@ -124,26 +126,76 @@ photograph twice.
 
 ## What it supports
 
-Reading: HEIC, PNG, JPEG, WebP, AVIF, GIF, BMP, ICO, QOI, TGA, PNM, farbfeld.
+|                       | Reads                                                      | Writes                          |
+| --------------------- | ---------------------------------------------------------- | ------------------------------- |
+| Everyday              | PNG, JPEG, WebP, AVIF, GIF, BMP, TIFF                      | PNG, JPEG, WebP, GIF, BMP, TIFF |
+| Phone and camera      | HEIC, JPEG XL, camera raw                                  |                                 |
+| Animated              | GIF, APNG, animated WebP and AVIF                          | GIF, APNG                       |
+| Icons                 | ICO, CUR, Apple icon suites                                | ICO, Apple icon suites          |
+| Design and games      | Photoshop PSD and PSB, DDS                                 |                                 |
+| High dynamic range    | Radiance HDR, OpenEXR                                      | Radiance HDR                    |
+| Exchange and archival | QOI, TGA, PNM and PAM, farbfeld, PCX, Sun raster, XBM, XPM | the same list                   |
+| Vector                | SVG, rasterised by the browser                             |                                 |
 
-Writing: PNG, JPEG, WebP, QOI, BMP, TGA, PNM, farbfeld. AVIF where a browser
-can, which today is none of them.
+Most of that is pure TypeScript over bytes and runs with no browser at all. The
+exceptions are the ones that have to be: JPEG, WebP, AVIF and JPEG XL are the
+browser's own decoders, SVG is the browser's renderer, and HEIC is the device's
+video decoder driven by a container parser here.
 
 PNG is written by this package rather than by a canvas, which means 24 bit
-output when there is no alpha to carry, the source ICC profile embedded so a
-wide gamut photograph survives, and no canvas size ceiling. On a phone
+output when there is no alpha to carry, an indexed palette when the picture has
+few enough colours for that to be lossless, the source ICC profile embedded so
+a wide gamut photograph survives, and no canvas size ceiling. On a phone
 photograph it comes out smaller than the canvas manages.
+
+### Animation
+
+An animated GIF converted to APNG keeps every frame, and so does the reverse.
+Frames arrive already composited, so the disposal and blend rules the two
+formats disagree about are settled once in the reader rather than in every
+encoder.
+
+```ts
+const result = await convert(gifBytes, { to: 'apng' });
+result.report.frames; // 12
+```
+
+Converting to a format that cannot animate keeps the first frame and says so
+with `report.droppedFrames`, rather than dropping eleven frames in silence.
+Pass `frames: 'first'` to ask for a still on purpose.
+
+### Camera raw
+
+A raw file holds sensor data that has to be demosaiced, white balanced and tone
+mapped before it is a photograph, and none of that happens here. What this does
+is find the full size JPEG the camera itself embedded and hand it over, which
+is what somebody asking to turn a CR2 into a JPEG actually wants. It covers
+DNG, CR2, CR3, NEF, ARW, RAF, ORF, RW2, PEF and SRW, and it falls back to
+scanning for the largest complete JPEG in the file, so an unusual one still
+works.
+
+### High dynamic range
+
+Radiance and OpenEXR both store linear light with no ceiling. Clipping that at
+white turns every window into a flat shape and scaling by the maximum turns the
+picture black, so the exposure is metered off the image the way a camera meters
+one and the highlights roll off rather than clipping. The result is a
+photograph rather than a measurement, which is the honest thing to hand
+somebody converting an EXR to a PNG.
 
 Deliberately not supported, as decisions rather than gaps:
 
 - **Writing HEIC.** No browser can, and encoding HEVC carries patent
   obligations a free tool cannot meet.
+- **Writing PSD, DDS or EXR.** Reading one is a service. Writing one badly is
+  a file somebody discovers is wrong a month later.
 - **HDR gain maps.** An HDR photograph decodes to its standard range base and
   the report says the gain map was dropped.
+- **BC6H and BC7 in DDS**, JPEG 2000 entries in an Apple icon, tiled and deep
+  OpenEXR, BigTIFF, YCbCr and Lab TIFF, and the 1, 4 and 8 bit indexed entries
+  in an old Apple icon. Each is refused by name rather than approximated.
 - **Interlaced PNG**, HEIF overlays and identity derivations, RLE compressed
   BMP. Each is refused by name.
-- **Animation.** Frames are read where a browser reads them. Nothing here
-  writes an animated file.
 
 ## Colour
 

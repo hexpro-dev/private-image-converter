@@ -8,14 +8,16 @@
  * which is a BMP with its file header removed and its height doubled to make
  * room for a one bit transparency mask underneath the pixels.
  *
- * An entry whose payload is a PNG is refused rather than decoded here. A codec
- * in this package is a leaf and may not call another codec, and inflating a
- * PNG is asynchronous besides, so the honest answer is to name the situation
- * and let the caller hand those bytes to the PNG decoder.
+ * An entry whose payload is a PNG is unpacked with this package's own PNG
+ * reader. Every icon written since Vista stores its 256 pixel image that way,
+ * including the ones this package writes, so refusing them would mean refusing
+ * most favicons and every icon produced by this tool. That is why `decodeIco`
+ * is asynchronous while `readIcoDirectory` is not: inflating is.
  */
 
 import { DecodeFailedError, ImageTooLargeError, UnsupportedHereError } from '../../errors.js';
 import { createRaster, detectAlpha } from '../../raster/image.js';
+import { decodePng } from '../png/decode.js';
 import type { RasterImage } from '../../types.js';
 
 const DECODER_ID = 'ico-pure';
@@ -359,7 +361,7 @@ function decodeDib(payload: Uint8Array, declaredHeight: number): RasterImage {
  * the tool that wrote it felt like, and because the caller who wants a
  * specific size can read the directory and pick one.
  */
-export function decodeIco(bytes: Uint8Array): RasterImage {
+export async function decodeIco(bytes: Uint8Array): Promise<RasterImage> {
 	const directory = readIcoDirectory(bytes);
 	const entries = directory.entries;
 	let best = entries[0] as IcoDirectoryEntry;
@@ -374,11 +376,11 @@ export function decodeIco(bytes: Uint8Array): RasterImage {
 	}
 
 	if (best.payloadKind === 'png') {
-		throw new UnsupportedHereError(
-			'ico',
-			['pure'],
-			'This icon stores its largest image as an embedded PNG. This reader unpacks only the bitmap form of an icon, so that image has to be read as a PNG on its own.',
-		);
+		// The directory's own width and height are advisory for a PNG entry:
+		// the specification says a reader takes the size from the PNG, and
+		// writers do disagree with themselves here. Following the payload is
+		// what every icon renderer does.
+		return decodePng(best.payload);
 	}
 	return decodeDib(best.payload, best.height);
 }

@@ -8,24 +8,55 @@
  *
  * The HEIC decoders are not here. They are `Decoder` objects rather than
  * functions because which one can run is a question about the browser, and
- * answering it is the registry's job. Import them from the root instead.
+ * answering it is the registry's job. Import them from the root instead. The
+ * same goes for anything else whose answer depends on the platform: the SVG
+ * rasteriser and the frame decoder both need a browser, and both are exported
+ * from the root for a caller that has one.
  */
 
 export { decodeBmp } from './bmp/decode.js';
 export { encodeBmp } from './bmp/encode.js';
+export { decodeDds } from './dds/decode.js';
+export { decodeExr } from './exr/decode.js';
 export { decodeFarbfeld } from './farbfeld/decode.js';
 export { encodeFarbfeld } from './farbfeld/encode.js';
+export { decodeGif, decodeGifAnimation } from './gif/decode.js';
+export type { GifResult } from './gif/decode.js';
+export { encodeGif } from './gif/encode.js';
+export { decodeHdr, decodeHdrFloat } from './hdr/decode.js';
+export type { HdrFloatImage } from './hdr/decode.js';
+export { encodeHdr } from './hdr/encode.js';
+export { decodeIcns, readIcnsDirectory } from './icns/decode.js';
+export type { IcnsDirectory, IcnsEntry, IcnsEntryKind } from './icns/decode.js';
+export { encodeIcns } from './icns/encode.js';
 export { decodeIco, readIcoDirectory } from './ico/decode.js';
 export { encodeIco } from './ico/encode.js';
+export type { IcoEntry } from './ico/encode.js';
 export { decodeNative, nativeDecodeAvailable } from './native/decode.js';
 export { encodeNative } from './native/encode.js';
 export { adler32, crc32 } from './png/crc.js';
+export { decodeApng } from './png/apng.js';
+export type { ApngDecode } from './png/apng.js';
+export { encodeApng } from './png/apngEncode.js';
 export { decodePng } from './png/decode.js';
 export { deflate, hasCompressionStream, inflate } from './png/deflate.js';
 export { encodePng } from './png/encode.js';
+export { decodePcx } from './pcx/decode.js';
+export { encodePcx } from './pcx/encode.js';
 export { decodePnm } from './pnm/decode.js';
 export { encodePnm } from './pnm/encode.js';
+export { decodePsd } from './psd/decode.js';
 export { decodeQoi } from './qoi/decode.js';
 export { encodeQoi } from './qoi/encode.js';
+export { decodeRas } from './ras/decode.js';
+export { encodeRas } from './ras/encode.js';
+export { findRawPreview, jpegDimensions } from './raw/preview.js';
+export type { RawPreview } from './raw/preview.js';
 export { decodeTga } from './tga/decode.js';
 export { encodeTga } from './tga/encode.js';
+export { decodeTiff, readTiffIccProfile } from './tiff/decode.js';
+export { encodeTiff } from './tiff/encode.js';
+export { decodeXbm } from './xbm/decode.js';
+export { encodeXbm } from './xbm/encode.js';
+export { decodeXpm } from './xpm/decode.js';
+export { encodeXpm } from './xpm/encode.js';

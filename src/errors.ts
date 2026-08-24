@@ -14,6 +14,7 @@
  * and pasted into a bug report.
  */
 
+import { FORMATS, FORMAT_IDS } from './formats.js';
 import type { DecodePath, FormatId } from './types.js';
 
 export type ConverterErrorCode =
@@ -52,6 +53,21 @@ export class EmptyInputError extends ConverterError {
 	}
 }
 
+/**
+ * The list of formats in the message, built from the table rather than typed.
+ *
+ * Every format this package names can be read; the read-only ones are read
+ * only because there is no honest way to write them. So the readable list is
+ * the whole table, and building it here means the sentence cannot fall behind
+ * the code, which is exactly what a hand-written list of twenty-six names
+ * would do on the first Tuesday somebody added a twenty-seventh.
+ */
+function readableList(): string {
+	const labels = FORMAT_IDS.map((id) => FORMATS[id].label);
+	const last = labels[labels.length - 1];
+	return `${labels.slice(0, -1).join(', ')} and ${last}`;
+}
+
 export class UnknownFormatError extends ConverterError {
 	/** The first bytes, for a caller that wants to report them. Never in the message. */
 	readonly head: Uint8Array;
@@ -59,7 +75,7 @@ export class UnknownFormatError extends ConverterError {
 	constructor(head: Uint8Array) {
 		super(
 			'input/unknown-format',
-			'That does not look like an image this tool recognises. It reads HEIC, PNG, JPEG, WebP, AVIF, GIF, BMP, ICO, TIFF, QOI, TGA, PNM and farbfeld.',
+			`That does not look like an image this tool recognises. It reads ${readableList()}.`,
 		);
 		this.head = head;
 	}

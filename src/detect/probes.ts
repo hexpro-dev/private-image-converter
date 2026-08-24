@@ -15,6 +15,17 @@
  *   PROBE_AVIF   heif-enc -A -q 50 -o probe.avif probe16.png  (libheif)
  *   PROBE_WEBP   cwebp -q 50 probe16.png -o probe.webp        (libwebp)
  *
+ * The JPEG XL one came later and from a different gradient, because the
+ * original probe16.png was not kept:
+ *
+ *   ramp16.png   magick -size 16x16 gradient:'#ff0000'-'#0000ff' \
+ *                  -define png:color-type=2 ramp16.png
+ *   PROBE_JXL    cjxl -d 0 -e 7 ramp16.png probe.jxl           (libjxl)
+ *
+ * What the probe contains does not matter to any of them. What matters is
+ * that it is a real file of its format, small, and encoded by the reference
+ * implementation rather than by this package.
+ *
  * Base64 rather than byte arrays because it is a third of the size in the
  * bundle, and these ship inside a single file offline build where every
  * kilobyte is one the reader has to download.
@@ -25,6 +36,17 @@ export const PROBE_HEIC =
 
 export const PROBE_AVIF =
 	'AAAAHGZ0eXBhdmlmAAAAAG1pZjFhdmlmbWlhZgAAAOptZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAAAAAAACJpbG9jAAAAAERAAAEAAQAAAAABDgABAAAAAAAAADQAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABhdjAxAAAAAA5waXRtAAAAAAABAAAAamlwcnAAAABLaXBjbwAAAAxhdjFDgQAMAAAAABNjb2xybmNseAABAA0ABoAAAAAUaXNwZQAAAAAAAAAQAAAAEAAAABBwaXhpAAAAAAMICAgAAAAXaXBtYQAAAAAAAAABAAEEgQIDBAAAADxtZGF0EgAKCRgM/9ogIaDQgDIlGUeHhiGHnnnmhQAAdX+ieVEiyjZPfg/+9YYt+lcTcJo+P+56MA==';
+
+/**
+ * A 16 by 16 lossless JPEG XL, in the box container rather than the bare
+ * codestream, which is the form a file on disk takes.
+ *
+ * Safari 17 is the only browser that decodes this today. There is no feature
+ * query for it: `ImageDecoder.isTypeSupported` would answer, and Safari is the
+ * one browser without `ImageDecoder`. So the probe is the file.
+ */
+export const PROBE_JXL =
+	'AAAADEpYTCANCocKAAAAFGZ0eXBqeGwgAAAAAGp4bCAAAAAJanhsbAoAAAB7anhsY/8KQ/ADCQgEAQCcAUs4ahjS08MrKAgp0AGiYwzuQgxeeIGAAP7wPwP8////EIUoRCEK0aR/iEIUohCFKERt/iEKUYhC9Lnf/4tIRP//IhKRiEQkIhF1+YtIRCISkYgmPkUkIndJdr2w/e9t4CCeQ9h4kCM=';
 
 export const PROBE_WEBP =
 	'UklGRkoAAABXRUJQVlA4ID4AAAAQAgCdASoQABAAAsBMJbACdH8AGBwAWlbYAP724pGseY2xGEUnWctf9yZPWdx6HWBAG+L/pivz/tml5a6AAA==';
