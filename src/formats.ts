@@ -2,6 +2,14 @@
  * Static facts about each format, as reviewable data rather than scattered
  * conditionals.
  *
+ * Published on its own subpath, `@hexpro/private-image-converter/formats`, as
+ * well as through the root. An interface needs this table to label a picker
+ * and to decide whether a result can be previewed, and it needs that long
+ * before anybody converts anything. Reaching it through the root barrel drags
+ * every codec into the same chunk, which on a page that loads the converter
+ * lazily is two hundred kilobytes downloaded for a dropdown. This file imports
+ * nothing but the type definitions.
+ *
  * `mimes` lists every type string seen in the wild, canonical first, because
  * browsers and operating systems disagree: an iPhone HEIC arrives as
  * `image/heic` from a file picker on macOS and as an empty string from some
