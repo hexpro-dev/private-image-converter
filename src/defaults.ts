@@ -24,7 +24,16 @@ import { ImageTooLargeError } from './errors.js';
 import { FORMATS } from './formats.js';
 import { declaresWideGamut, findIccProfile } from './metadata/icc.js';
 import { registerDecoder, registerEncoder } from './registry.js';
-import type { Animation, Decoder, EncodeOptions, Encoder, FormatId, RasterImage } from './types.js';
+import type {
+	Animation,
+	DecodeContext,
+	Decoder,
+	EncodeOptions,
+	Encoder,
+	FloatImage,
+	FormatId,
+	RasterImage,
+} from './types.js';
 import { fitSquare } from './raster/resize.js';
 
 import { heicNativeDecoder, heicWebCodecsDecoder } from './codecs/heic/index.js';
@@ -54,9 +63,11 @@ import { decodeGifAnimation } from './codecs/gif/decode.js';
 import { encodeGif } from './codecs/gif/encode.js';
 import { decodePsd } from './codecs/psd/decode.js';
 import { decodeDds } from './codecs/dds/decode.js';
-import { decodeHdr } from './codecs/hdr/decode.js';
-import { encodeHdr } from './codecs/hdr/encode.js';
-import { decodeExr } from './codecs/exr/decode.js';
+import { decodeHdr, decodeHdrFloat } from './codecs/hdr/decode.js';
+import { encodeHdr, encodeHdrFloat } from './codecs/hdr/encode.js';
+import { decodeExr, decodeExrFloat } from './codecs/exr/decode.js';
+import { encodeExr, encodeExrFloat } from './codecs/exr/encode.js';
+import { avifEncoder } from './codecs/avif/index.js';
 import { decodePcx } from './codecs/pcx/decode.js';
 import { encodePcx } from './codecs/pcx/encode.js';
 import { decodeIcns } from './codecs/icns/decode.js';
@@ -75,6 +86,9 @@ const NATIVE_DECODABLE: readonly FormatId[] = ['png', 'jpeg', 'jxl', 'webp', 'av
 
 /** Formats a canvas can be asked to write. Whether it will is probed, not assumed. */
 const NATIVE_ENCODABLE: readonly FormatId[] = ['png', 'jpeg', 'webp', 'avif'];
+
+/** Formats where our own encoder outranks the browser's. See `nativeEncoder`. */
+const OURS_FIRST: ReadonlySet<FormatId> = new Set<FormatId>(['png', 'avif']);
 
 /**
  * Formats whose frames the platform's own frame decoder can read.
@@ -166,10 +180,18 @@ function nativeEncoder(format: FormatId): Encoder {
 		id: `${format}-native`,
 		format,
 		path: 'canvas',
-		// PNG is the one format where our own encoder is better than the
-		// canvas, so this sits behind it. For everything else it is the only
-		// option and the number does not matter.
-		priority: format === 'png' ? 20 : 10,
+		// Two formats where our own encoder is the better one, so the canvas
+		// sits behind them. PNG because ours writes indexed and 24 bit output a
+		// canvas cannot, and AVIF because ours can carry a gain map, which is
+		// the difference between an HDR photograph surviving the conversion and
+		// arriving as its standard range base. For everything else the canvas
+		// is the only option and the number does not matter.
+		//
+		// No browser writes AVIF from a canvas today, so the AVIF entry is a
+		// placeholder for one that might. It is ordered now rather than left to
+		// be noticed later, because the day it starts working is the day it
+		// would silently start dropping gain maps.
+		priority: OURS_FIRST.has(format) ? 20 : 10,
 		async available(capabilities) {
 			return capabilities.canvasEncode.has(info.mime);
 		},
@@ -185,6 +207,7 @@ function pureDecoder(
 	format: FormatId,
 	decode: PureDecode,
 	available: () => boolean = () => true,
+	readLight?: (bytes: Uint8Array) => Promise<FloatImage> | FloatImage,
 ): Decoder {
 	return {
 		id: `${format}-pure`,
@@ -210,6 +233,24 @@ function pureDecoder(
 				orientation: { rotation: 0, mirror: 'none', source: 'none' },
 			};
 		},
+		...(readLight
+			? {
+					async decodeFloat(bytes: Uint8Array, context: DecodeContext) {
+						const image = await readLight(bytes);
+						// The same ceiling, and it bites sooner here: a pixel of
+						// light is sixteen bytes against four, so the buffer
+						// this refuses to allocate is four times the size.
+						const pixels = image.width * image.height;
+						if (pixels > context.maxPixels) {
+							throw new ImageTooLargeError(pixels, context.maxPixels);
+						}
+						return {
+							image,
+							orientation: { rotation: 0, mirror: 'none', source: 'none' } as const,
+						};
+					},
+				}
+			: {}),
 	};
 }
 
@@ -260,6 +301,8 @@ function pureAnimatedDecoder(
 
 interface PureEncoderOptions {
 	readonly priority?: number;
+	/** Writes light directly, which makes this encoder a destination for it. */
+	readonly floats?: (image: FloatImage, options: EncodeOptions) => Promise<Uint8Array> | Uint8Array;
 	readonly available?: () => boolean;
 	readonly animates?: boolean;
 }
@@ -281,6 +324,14 @@ function pureEncoder(
 		async encode(image, encodeOptions) {
 			return encode(image, encodeOptions);
 		},
+		...(options.floats
+			? {
+					floats: true,
+					async encodeFloat(image: FloatImage, encodeOptions: EncodeOptions) {
+						return options.floats!(image, encodeOptions);
+					},
+				}
+			: {}),
 	};
 }
 
@@ -453,8 +504,10 @@ export function installDefaultCodecs(): void {
 	registerDecoder(pureDecoder('ico', decodeIco));
 	registerDecoder(pureDecoder('psd', decodePsd));
 	registerDecoder(pureDecoder('dds', decodeDds));
-	registerDecoder(pureDecoder('hdr', decodeHdr));
-	registerDecoder(pureDecoder('exr', decodeExr));
+	// Both of these read light as well as bytes, and which one runs is decided
+	// by where the picture is going rather than here.
+	registerDecoder(pureDecoder('hdr', decodeHdr, () => true, decodeHdrFloat));
+	registerDecoder(pureDecoder('exr', decodeExr, () => true, decodeExrFloat));
 	registerDecoder(pureDecoder('pcx', decodePcx));
 	registerDecoder(pureDecoder('icns', decodeIcns, hasCompressionStream));
 	registerDecoder(pureDecoder('ras', decodeRas));
@@ -482,7 +535,12 @@ export function installDefaultCodecs(): void {
 	registerEncoder(pureEncoder('pnm', encodePnm));
 	registerEncoder(pureEncoder('farbfeld', encodeFarbfeld));
 	registerEncoder(pureEncoder('tiff', encodeTiff));
-	registerEncoder(pureEncoder('hdr', encodeHdr));
+	registerEncoder(pureEncoder('hdr', encodeHdr, { floats: encodeHdrFloat }));
+	// No availability check. An uncompressed OpenEXR is always legal, so this
+	// is the one encoder here with no platform requirement at all: it prefers
+	// deflate and writes the file either way.
+	registerEncoder(pureEncoder('exr', encodeExr, { floats: encodeExrFloat }));
+	registerEncoder(avifEncoder);
 	registerEncoder(pureEncoder('pcx', encodePcx));
 	registerEncoder(pureEncoder('ras', encodeRas));
 	registerEncoder(pureEncoder('xbm', encodeXbm));

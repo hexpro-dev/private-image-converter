@@ -191,6 +191,46 @@ possible with no dependency. It offers no level control, so the output is a few
 percent larger than zopfli would manage and still smaller than the canvas
 manages, because the filters are chosen adaptively. That trade is deliberate.
 
+**Tone mapping belongs to the encoder, never the decoder.** Radiance and
+OpenEXR readers hand back `FloatImage`, and `convert` reduces it only when the
+destination cannot hold it. This was the other way round once, and the cost was
+that an EXR going to a Radiance file went through eight bits in the middle,
+losing the range both formats exist for, while `tone` had nothing to act on
+because the exposure had already been chosen inside the reader. A decoder that
+calls `toneMap` is reintroducing that bug.
+
+**A gain map's parameter block is bytes, never fields.** `GainMap.metadata` is
+the ISO 21496-1 block exactly as the source stored it, and it is copied into
+the output without being parsed. Every value that defines how the photograph
+displays lives in there, so carrying it unchanged reproduces it exactly, and
+reading it in order to write it back could only introduce error. Do not add a
+parser for it. If a future format needs different fields, transcode at that
+boundary and leave this one alone.
+
+**Ten bit AV1 is refused by every browser tested.** `av01.0.04M.10` reports
+unsupported under `no-preference`, `prefer-software` and `prefer-hardware`
+alike, so the AVIF written here is eight bit and there is no PQ or HLG output.
+Probe for eight bit only: asking for ten concludes AVIF cannot be written at
+all, when it can. A gain map does not need more than eight bits, which is why
+an HDR photograph still survives.
+
+**The gain map goes out as three channels.** `VideoEncoder` has no way to ask
+for monochrome AV1, so a gain map is encoded as a grey 4:2:0 picture while its
+parameter block still says single channel. Chroma subsampling is lossless on a
+grey image, so the luma plane is the gain map exactly, and a reader taking the
+first channel gets what it expects. It costs some bytes and no accuracy.
+
+**An OpenEXR dataWindow is inclusive at both ends.** A 4 by 3 image has
+`xMax` 3 and `yMax` 2. Writing the width there produces a file every reader
+rejects, and it is the first thing to check when one does.
+
+**Verifying a float format against ffmpeg needs care.** ffmpeg's swscale
+clamps to 0 to 1 when it converts between float pixel formats, so reading a
+half float EXR out as `gbrpf32le` shows every value above white pinned at 1
+and looks exactly like an encoder bug. Ask for `gbrpf16le`, which is the
+decoder's native output and involves no conversion. The Radiance path decodes
+straight to `gbrpf32le` and is not affected.
+
 ## Adding a format
 
 1. `src/codecs/<name>/encode.ts` and `decode.ts`, importing only `../../types.js`,

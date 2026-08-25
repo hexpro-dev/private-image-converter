@@ -12,20 +12,33 @@
  * same goes for anything else whose answer depends on the platform: the SVG
  * rasteriser and the frame decoder both need a browser, and both are exported
  * from the root for a caller that has one.
+ *
+ * `encodeAvif` is here despite needing a browser, because unlike those it is
+ * still a function of its arguments: the container is written in full here and
+ * only the AV1 frame inside comes from the platform, which the caller can
+ * supply itself through the encoder seam.
  */
 
+export { encodeAvif, muxAvif, webCodecsAv1Encoder } from './avif/index.js';
+export type {
+	Av1FrameEncoder,
+	Av1FrameRequest,
+	AvifCodedImage,
+	AvifGainMapSpec,
+	AvifMuxSpec,
+} from './avif/index.js';
 export { decodeBmp } from './bmp/decode.js';
 export { encodeBmp } from './bmp/encode.js';
 export { decodeDds } from './dds/decode.js';
-export { decodeExr } from './exr/decode.js';
+export { decodeExr, decodeExrFloat } from './exr/decode.js';
+export { encodeExr, encodeExrFloat, floatToHalf } from './exr/encode.js';
 export { decodeFarbfeld } from './farbfeld/decode.js';
 export { encodeFarbfeld } from './farbfeld/encode.js';
 export { decodeGif, decodeGifAnimation } from './gif/decode.js';
 export type { GifResult } from './gif/decode.js';
 export { encodeGif } from './gif/encode.js';
 export { decodeHdr, decodeHdrFloat } from './hdr/decode.js';
-export type { HdrFloatImage } from './hdr/decode.js';
-export { encodeHdr } from './hdr/encode.js';
+export { encodeHdr, encodeHdrFloat } from './hdr/encode.js';
 export { decodeIcns, readIcnsDirectory } from './icns/decode.js';
 export type { IcnsDirectory, IcnsEntry, IcnsEntryKind } from './icns/decode.js';
 export { encodeIcns } from './icns/encode.js';

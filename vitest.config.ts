@@ -24,6 +24,11 @@ export default defineConfig({
 				// RELEASING.md instead, which is honest about being manual.
 				'src/codecs/native/**',
 				'src/codecs/heic/webcodecs.ts',
+				// The same seam in the other direction: a `VideoEncoder` driving
+				// one still frame. The muxer and the sequence header parse above
+				// it are pure and are covered against real captured bitstreams;
+				// this file is the two dozen lines that talk to the browser.
+				'src/codecs/avif/webcodecs.ts',
 				// The SVG path is the browser's own renderer behind an `img`
 				// element, which is the whole point of it: nothing else can
 				// lay out text or resolve a filter, and nothing in Node can

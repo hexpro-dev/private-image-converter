@@ -5,6 +5,10 @@ them anywhere. Twenty-six formats, including the awkward ones: TIFF, Photoshop,
 DDS, OpenEXR, Radiance HDR, Apple icon suites and the preview inside a camera
 raw file.
 
+An HDR photograph off a phone stays an HDR photograph when it becomes an AVIF,
+and an OpenEXR keeps its full range when it becomes a Radiance file. Both are
+usually the first thing a converter throws away.
+
 Zero runtime dependencies. There is no server, no upload, and no network call
 of any kind. The conversion happens in the tab, and the file the browser saves
 was built there.
@@ -126,21 +130,27 @@ photograph twice.
 
 ## What it supports
 
-|                       | Reads                                                      | Writes                          |
-| --------------------- | ---------------------------------------------------------- | ------------------------------- |
-| Everyday              | PNG, JPEG, WebP, AVIF, GIF, BMP, TIFF                      | PNG, JPEG, WebP, GIF, BMP, TIFF |
-| Phone and camera      | HEIC, JPEG XL, camera raw                                  |                                 |
-| Animated              | GIF, APNG, animated WebP and AVIF                          | GIF, APNG                       |
-| Icons                 | ICO, CUR, Apple icon suites                                | ICO, Apple icon suites          |
-| Design and games      | Photoshop PSD and PSB, DDS                                 |                                 |
-| High dynamic range    | Radiance HDR, OpenEXR                                      | Radiance HDR                    |
-| Exchange and archival | QOI, TGA, PNM and PAM, farbfeld, PCX, Sun raster, XBM, XPM | the same list                   |
-| Vector                | SVG, rasterised by the browser                             |                                 |
+|                       | Reads                                                      | Writes                                |
+| --------------------- | ---------------------------------------------------------- | ------------------------------------- |
+| Everyday              | PNG, JPEG, WebP, AVIF, GIF, BMP, TIFF                      | PNG, JPEG, WebP, AVIF, GIF, BMP, TIFF |
+| Phone and camera      | HEIC, JPEG XL, camera raw                                  |                                       |
+| Animated              | GIF, APNG, animated WebP and AVIF                          | GIF, APNG                             |
+| Icons                 | ICO, CUR, Apple icon suites                                | ICO, Apple icon suites                |
+| Design and games      | Photoshop PSD and PSB, DDS                                 |                                       |
+| High dynamic range    | Radiance HDR, OpenEXR                                      | Radiance HDR, OpenEXR                 |
+| Exchange and archival | QOI, TGA, PNM and PAM, farbfeld, PCX, Sun raster, XBM, XPM | the same list                         |
+| Vector                | SVG, rasterised by the browser                             |                                       |
 
 Most of that is pure TypeScript over bytes and runs with no browser at all. The
 exceptions are the ones that have to be: JPEG, WebP, AVIF and JPEG XL are the
 browser's own decoders, SVG is the browser's renderer, and HEIC is the device's
 video decoder driven by a container parser here.
+
+Writing AVIF is the same arrangement in reverse. An AVIF is one AV1 keyframe in
+a HEIF container, so the container is written here and the frame comes from the
+browser's `VideoEncoder`. It needs a browser with an AV1 encoder, which Chrome
+and Edge have and Safari and Firefox do not yet, and `report.encodePath` says
+`webcodecs` when it ran.
 
 PNG is written by this package rather than by a canvas, which means 24 bit
 output when there is no alpha to carry, an indexed palette when the picture has
@@ -176,21 +186,60 @@ works.
 
 ### High dynamic range
 
-Radiance and OpenEXR both store linear light with no ceiling. Clipping that at
-white turns every window into a flat shape and scaling by the maximum turns the
+There are two unrelated things called HDR here and they are kept apart.
+
+**Radiance and OpenEXR** store linear light with no ceiling, and that light is
+carried as light for as long as anything downstream can use it. Converting an
+EXR to a Radiance file, or the reverse, keeps the range: a sample at 12000 is
+still 12000 at the other end, within what the destination's own precision can
+hold.
+
+```ts
+const radiance = await convert(exrBytes, { to: 'hdr' });
+radiance.report.highDynamicRange; // true
+radiance.report.toneMapped; // undefined, nothing was reduced
+```
+
+Reducing it only happens when the destination cannot hold it. Clipping at white
+turns every window into a flat shape and scaling by the maximum turns the
 picture black, so the exposure is metered off the image the way a camera meters
-one and the highlights roll off rather than clipping. The result is a
-photograph rather than a measurement, which is the honest thing to hand
-somebody converting an EXR to a PNG.
+one and the highlights roll off rather than clipping. Because that now happens
+at the encoder rather than inside the reader, the exposure is yours to set:
+
+```ts
+const png = await convert(exrBytes, { to: 'png', tone: { stops: -2 } });
+png.report.toneMapped; // true
+png.report.exposureStops; // -2
+```
+
+**An HDR photograph from a phone** is a different thing: an ordinary picture
+plus a second, smaller one saying how much brighter each part of it should get,
+and a short parameter block saying how to read the second against the headroom
+of whatever screen is showing it. Converting one to AVIF keeps all three, so
+the photograph still displays as HDR:
+
+```ts
+const avif = await convert(heicBytes, { to: 'avif' });
+avif.report.gainMap; // 'kept'
+```
+
+The parameter block is copied across unread. Every value that defines the
+photograph lives in it, so carrying the bytes unchanged reproduces the picture
+exactly, while parsing them in order to write them back could only introduce
+error. Converting the same file to PNG reports `gainMap: 'dropped'` and hands
+back the standard range base, which is a complete photograph rather than a
+broken one.
 
 Deliberately not supported, as decisions rather than gaps:
 
 - **Writing HEIC.** No browser can, and encoding HEVC carries patent
   obligations a free tool cannot meet.
-- **Writing PSD, DDS or EXR.** Reading one is a service. Writing one badly is
-  a file somebody discovers is wrong a month later.
-- **HDR gain maps.** An HDR photograph decodes to its standard range base and
-  the report says the gain map was dropped.
+- **Writing PSD or DDS.** Reading one is a service. Writing one badly is a
+  file somebody discovers is wrong a month later.
+- **Ten bit AVIF**, and so PQ and HLG output. Every Chromium tested refuses a
+  ten bit AV1 configuration under all three acceleration preferences, so the
+  AVIF written here is eight bit. A gain map does not need more than that,
+  which is why the photograph above survives anyway.
 - **BC6H and BC7 in DDS**, JPEG 2000 entries in an Apple icon, tiled and deep
   OpenEXR, BigTIFF, YCbCr and Lab TIFF, and the 1, 4 and 8 bit indexed entries
   in an old Apple icon. Each is refused by name rather than approximated.

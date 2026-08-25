@@ -72,6 +72,7 @@ function describe(result: ConvertResult): string {
 	if (report.tiles && report.tiles > 1) parts.push(`${report.tiles} tiles`);
 	if (report.frames) parts.push(`${report.frames} frames`);
 	if (report.colourSpace === 'display-p3') parts.push('Display P3 kept');
+	if (report.highDynamicRange) parts.push('high dynamic range kept');
 	return parts.join(', ');
 }
 
@@ -138,7 +139,30 @@ function render(result: ConvertResult, filename: string, blob: Blob): void {
 	if (result.report.gainMap === 'dropped') {
 		const line = document.createElement('p');
 		line.className = 'result__meta';
-		line.textContent = 'This was an HDR photograph. The result is the standard range version.';
+		line.textContent =
+			'This was an HDR photograph. The result is the standard range version. AVIF keeps the HDR.';
+		body.append(line);
+	}
+
+	if (result.report.gainMap === 'kept') {
+		const line = document.createElement('p');
+		line.className = 'result__meta';
+		line.textContent =
+			'This was an HDR photograph and it still is. The brightness map came across unchanged.';
+		body.append(line);
+	}
+
+	if (result.report.toneMapped) {
+		// The exposure is worth saying because it was chosen rather than given.
+		// Somebody who disagrees with it can only argue with a number they can
+		// see, and there is a setting behind this that takes one.
+		const stops = result.report.exposureStops ?? 0;
+		const line = document.createElement('p');
+		line.className = 'result__meta';
+		line.textContent =
+			stops === 0
+				? 'This held more brightness than the result can. The exposure was metered off the picture.'
+				: `This held more brightness than the result can. The exposure was set ${stops} stops from the metered one.`;
 		body.append(line);
 	}
 

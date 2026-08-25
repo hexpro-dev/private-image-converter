@@ -174,7 +174,7 @@ const SHIPPED_ENCODERS = [
 	['png-native', 20, 'canvas', false],
 	['jpeg-native', 10, 'canvas', false],
 	['webp-native', 10, 'canvas', false],
-	['avif-native', 10, 'canvas', false],
+	['avif-native', 20, 'canvas', false],
 	['png-pure', 10, 'pure', false],
 	['apng-pure', 10, 'pure', true],
 	['gif-pure', 10, 'pure', true],
@@ -185,6 +185,8 @@ const SHIPPED_ENCODERS = [
 	['farbfeld-pure', 10, 'pure', false],
 	['tiff-pure', 10, 'pure', false],
 	['hdr-pure', 10, 'pure', false],
+	['exr-pure', 10, 'pure', false],
+	['avif-webcodecs', 10, 'webcodecs', false],
 	['pcx-pure', 10, 'pure', false],
 	['ras-pure', 10, 'pure', false],
 	['xbm-pure', 10, 'pure', false],
@@ -204,6 +206,12 @@ const DEFAULT_ENCODER_IDS = SHIPPED_ENCODERS.map(([id]) => id);
  * than somebody on the hardware path and saying so is the difference between a
  * slow tool and a broken one.
  */
+const ENCODE_MECHANISM_PATHS = {
+	native: 'canvas',
+	webcodecs: 'webcodecs',
+	pure: 'pure',
+} as const;
+
 const MECHANISM_PATHS = {
 	native: 'native-image',
 	fallback: 'native-image',
@@ -221,6 +229,12 @@ function mechanismOf(id: string): keyof typeof MECHANISM_PATHS {
 	const suffix = id.slice(id.indexOf('-') + 1);
 	if (suffix in MECHANISM_PATHS) return suffix as keyof typeof MECHANISM_PATHS;
 	throw new Error(`${id} does not name a mechanism this package publishes`);
+}
+
+function encodeMechanismOf(id: string): keyof typeof ENCODE_MECHANISM_PATHS {
+	const suffix = id.slice(id.indexOf('-') + 1);
+	if (suffix in ENCODE_MECHANISM_PATHS) return suffix as keyof typeof ENCODE_MECHANISM_PATHS;
+	throw new Error(`${id} does not name a mechanism this package writes with`);
 }
 
 beforeEach(() => {
@@ -760,7 +774,11 @@ describe('the default codec set', () => {
 		const encoders = new Map(registeredEncoders().map((encoder) => [encoder.id, encoder]));
 		for (const [id, , path, animates] of SHIPPED_ENCODERS) {
 			expect(encoders.get(id)?.path, id).toBe(path);
-			expect(mechanismOf(id), `${id} does not encode through WebCodecs`).not.toBe('webcodecs');
+			// The same rule the decoders are held to: the suffix on the id has
+			// to name the mechanism that really runs. An encoder saying `pure`
+			// while the picture came out of the browser's video encoder would
+			// promise a file that is the same everywhere, and it is not.
+			expect(ENCODE_MECHANISM_PATHS[encodeMechanismOf(id)], id).toBe(path);
 			// `animates` decides whether `convert` prepares every frame before
 			// encoding. An encoder that claimed it and then wrote one frame
 			// would report a frame count that is not in the file.
@@ -878,6 +896,7 @@ describe('the default codec set', () => {
 			'apng',
 			'avif',
 			'bmp',
+			'exr',
 			'farbfeld',
 			'gif',
 			'hdr',

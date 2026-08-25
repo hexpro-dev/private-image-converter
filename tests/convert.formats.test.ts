@@ -394,6 +394,7 @@ describe('what the package offers without a browser', () => {
 			'icns',
 			'tiff',
 			'hdr',
+			'exr',
 			'pcx',
 			'ras',
 			'xbm',
@@ -405,12 +406,13 @@ describe('what the package offers without a browser', () => {
 		] as const) {
 			expect(writable.has(format), `${format} writable`).toBe(true);
 		}
-		// Read only, every one of them for a different reason: no encoder is a
-		// browser away, these are formats this package deliberately does not
-		// write. PSD and DDS and EXR because writing one badly is worse than
-		// not writing it, raw because there is nothing to write back into, SVG
-		// because pixels do not become a drawing.
-		for (const format of ['psd', 'dds', 'exr', 'raw', 'svg', 'heic', 'jxl'] as const) {
+		// Read only, every one of them for a different reason. PSD and DDS
+		// because writing one badly is worse than not writing it, raw because
+		// there is nothing to write back into, SVG because pixels do not become
+		// a drawing, HEIC and JPEG XL because nothing in a browser will encode
+		// either. AVIF is absent from both lists on purpose: it is writable,
+		// but only where there is an AV1 encoder, and there is none here.
+		for (const format of ['psd', 'dds', 'raw', 'svg', 'heic', 'jxl'] as const) {
 			expect(writable.has(format), `${format} writable`).toBe(false);
 		}
 	});

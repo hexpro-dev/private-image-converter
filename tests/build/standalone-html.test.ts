@@ -149,6 +149,16 @@ const CODEC_EVIDENCE: readonly CodecEvidence[] = [
 		forms: wordForms(34675),
 	},
 	{
+		format: 'avif',
+		what: "the 'ftyp' major brand this writer stamps on every AVIF",
+		forms: ['avif'],
+	},
+	{
+		format: 'exr',
+		what: 'the four bytes that spell 20000630 little endian, which open every OpenEXR',
+		forms: byteForms([0x76, 0x2f, 0x31, 0x01]),
+	},
+	{
 		format: 'hdr',
 		what: 'the Radiance identifier from its first line',
 		forms: ['#?RADIANCE'],

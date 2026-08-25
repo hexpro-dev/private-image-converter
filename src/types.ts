@@ -294,8 +294,16 @@ export interface Capabilities {
  */
 export type DecodePath = 'native-image' | 'webcodecs' | 'pure' | 'plugin';
 
-/** How an encode was performed. */
-export type EncodePath = 'pure' | 'canvas' | 'plugin';
+/**
+ * How an encode was performed.
+ *
+ * `webcodecs` is the mirror of the decode path of the same name and means a
+ * video encoder wrote a single still frame. That is not a workaround: an AVIF
+ * is one AV1 keyframe in a HEIF container, so a video encoder is the only
+ * thing in a browser that can produce one, and every AVIF encoder anywhere
+ * does the same thing with a different copy of the same codec.
+ */
+export type EncodePath = 'pure' | 'canvas' | 'webcodecs' | 'plugin';
 
 export interface DecodeContext {
 	readonly capabilities: Capabilities;

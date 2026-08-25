@@ -69,8 +69,14 @@ export { MAX_CANVAS_AREA, MAX_CANVAS_SIDE, canvasCanHold } from './raster/canvas
 export { exactPalette, indexedToRaster, quantise } from './raster/quantise.js';
 export type { IndexedImage, Palette, QuantiseOptions } from './raster/quantise.js';
 export { fitSquare, resizeRaster } from './raster/resize.js';
-export { halfToFloat, toneMap } from './raster/tonemap.js';
-export type { ToneMapOptions } from './raster/tonemap.js';
+export { halfToFloat, toneMap, toneMapImage } from './raster/tonemap.js';
+export type { ToneMapOptions, ToneMapResult } from './raster/tonemap.js';
+export {
+	createFloat,
+	detectFloatAlpha,
+	floatFromRaster,
+	toFloatColourSpace,
+} from './raster/float.js';
 
 export { ByteWriter, LsbBitReader, LsbBitWriter, MsbBitReader, MsbBitWriter } from './bits.js';
 
