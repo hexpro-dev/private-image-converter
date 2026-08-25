@@ -16,12 +16,16 @@ import { readExif } from './metadata/exif.js';
 import { decodersFor, encodersFor } from './registry.js';
 import { detectAlpha, flatten } from './raster/image.js';
 import { toColourSpace } from './raster/colour.js';
+import { toFloatColourSpace } from './raster/float.js';
+import { toneMapImage } from './raster/tonemap.js';
 import type {
 	Capabilities,
 	ConvertOptions,
 	ConvertResult,
 	DecodeOutput,
 	DecodePath,
+	FloatDecodeOutput,
+	FloatImage,
 	RasterImage,
 } from './types.js';
 
@@ -56,45 +60,71 @@ export async function convert(
 		throw new UnsupportedHereError(from, [], unsupportedMessage(from, caps));
 	}
 
+	// Resolved before the decode rather than after it, because two things about
+	// the destination change what the decode should do. Whether any encoder for
+	// this format can animate decides how many frames are worth correcting, and
+	// whether any of them takes light decides whether the decode should produce
+	// light at all. Asked afterwards, the second question is already too late.
+	//
+	// Decoders are still resolved first, so a file that cannot be read here
+	// says so rather than complaining about where it was going.
+	const encoders = await encodersFor(to, caps);
+	if (encoders.length === 0) {
+		throw new EncodeUnsupportedError(to, encodeUnsupportedMessage(to, caps));
+	}
+
 	const context = { capabilities: caps, signal: options.signal, maxPixels };
 	const decodeStarted = now();
 	let output: DecodeOutput | undefined;
+	let light: FloatDecodeOutput | undefined;
 	let decoderId = '';
 	let decodePath: DecodePath = 'pure';
 	const tried: DecodePath[] = [];
 	let lastError: unknown;
 
+	// The light ladder runs first wherever there is one. A decoder that hands
+	// back bytes has already chosen an exposure, and that choice is what the
+	// tone option exists to take away from it, so reading light and reducing it
+	// later is right even when the destination is an ordinary eight bit format.
 	for (const decoder of decoders) {
+		if (!decoder.decodeFloat) continue;
 		tried.push(decoder.path);
 		try {
-			output = await decoder.decode(input, context);
+			light = await decoder.decodeFloat(input, context);
 			decoderId = decoder.id;
 			decodePath = decoder.path;
 			break;
 		} catch (error) {
-			// An image that is simply too big will be too big for the next rung
-			// as well, so that one stops the ladder rather than walking it.
 			if (error instanceof ImageTooLargeError) throw error;
 			lastError = error;
 		}
 	}
 
-	if (!output) {
+	if (!light) {
+		for (const decoder of decoders) {
+			tried.push(decoder.path);
+			try {
+				output = await decoder.decode(input, context);
+				decoderId = decoder.id;
+				decodePath = decoder.path;
+				break;
+			} catch (error) {
+				// An image that is simply too big will be too big for the next
+				// rung as well, so that one stops the ladder rather than
+				// walking it.
+				if (error instanceof ImageTooLargeError) throw error;
+				lastError = error;
+			}
+		}
+	}
+
+	if (!output && !light) {
 		if (lastError) throw lastError;
 		throw new UnsupportedHereError(from, tried, unsupportedMessage(from, caps));
 	}
 	const decodeMs = now() - decodeStarted;
 
 	/* ── Correct ────────────────────────────────────────────────────── */
-
-	// Resolved before the corrections rather than after, because whether any
-	// encoder for this format can animate decides how much correcting there is
-	// to do. Preparing three hundred frames for an encoder that will write one
-	// is a lot of work to throw away.
-	const encoders = await encodersFor(to, caps);
-	if (encoders.length === 0) {
-		throw new EncodeUnsupportedError(to, encodeUnsupportedMessage(to, caps));
-	}
 
 	const target = FORMATS[to];
 	// Narrowing the gamut is deliberate and one way: doing it twice, or doing
@@ -107,7 +137,12 @@ export async function convert(
 		to === 'jpeg' ||
 		to === 'webp' ||
 		to === 'avif' ||
-		to === 'tiff';
+		to === 'tiff' ||
+		// Both light formats carry their own primaries, Radiance in a header
+		// line and OpenEXR in a chromaticities attribute, so narrowing on the
+		// way into either would be throwing away gamut for no reason.
+		to === 'hdr' ||
+		to === 'exr';
 	const narrow = !wantWide || !canCarryWide;
 
 	const correct = (source: RasterImage): RasterImage => {
@@ -124,11 +159,42 @@ export async function convert(
 		return corrected;
 	};
 
-	const image = correct(output.image);
+	/* ── Light ──────────────────────────────────────────────────────── */
+
+	const floatEncoders = encoders.filter(
+		(encoder) => encoder.floats === true && typeof encoder.encodeFloat === 'function',
+	);
+	let toneMapped = false;
+	let exposureStops: number | undefined;
+
+	/**
+	 * Reduce the decoded light to a picture, once, recording what it took.
+	 *
+	 * A closure rather than a value because it may not be needed at all: an
+	 * OpenEXR going to a Radiance file never reduces, and metering a
+	 * hundred megapixel render to throw the answer away is not free.
+	 */
+	const reduce = (source: FloatDecodeOutput): RasterImage => {
+		const placed = narrow ? toFloatColourSpace(source.image, 'srgb') : source.image;
+		const mapped = toneMapImage(placed, options.tone);
+		toneMapped = true;
+		exposureStops = mapped.stops;
+		return correct(mapped.image);
+	};
+
+	let image = output ? correct(output.image) : undefined;
+	let floatImage: FloatImage | undefined;
+	if (light) {
+		if (floatEncoders.length > 0) {
+			floatImage = narrow ? toFloatColourSpace(light.image, 'srgb') : light.image;
+		} else {
+			image = reduce(light);
+		}
+	}
 
 	// An animation survives only when the source had one, the caller wants it,
 	// and something registered for this format can actually write it.
-	const sourceAnimation = output.animation;
+	const sourceAnimation = output?.animation;
 	const keepFrames = (options.frames ?? 'all') === 'all';
 	const canAnimate = encoders.some((encoder) => encoder.animates === true);
 	const animation =
@@ -152,33 +218,83 @@ export async function convert(
 	// whenever the image is still wide gamut, regardless of the metadata
 	// setting, because a colour profile is not personal information and
 	// dropping it would silently change how the picture looks.
-	const sourceProfile = image.colourSpace === 'display-p3' ? output.iccProfile : undefined;
+	// One of the two ladders produced something, which the guard above the
+	// decode timer already proved; the assertion is only saying so to the
+	// compiler, which does not track the relationship between two variables.
+	const decoded = (output ?? light) as DecodeOutput | FloatDecodeOutput;
+	const geometry = image ?? floatImage;
+	const wide = (geometry?.colourSpace ?? 'srgb') === 'display-p3';
+	const sourceProfile = wide ? decoded?.iccProfile : undefined;
+
+	// A gain map is a set of coefficients, not a picture, so it is carried
+	// exactly as it arrived: correcting it would be editing the parameters of
+	// the photograph rather than converting it. The one thing that does
+	// invalidate it is the base image moving colour space underneath it, since
+	// the parameters were written against the primaries the source had, so
+	// that is the case where it is let go of rather than written wrongly.
+	const sourceGainMap = output?.gainMap;
+	const baseColourMoved =
+		image !== undefined && output !== undefined && image.colourSpace !== output.image.colourSpace;
+	const gainMapToWrite = sourceGainMap && !baseColourMoved ? sourceGainMap : undefined;
+
 	const encodeOptions = {
 		quality: options.quality,
 		background: options.background,
 		palette: options.palette,
 		animation,
+		gainMap: gainMapToWrite,
 		iccProfile: sourceProfile ?? (keepMetadata ? options.iccProfile : undefined),
-		writeColourTag: image.colourSpace === 'display-p3',
+		writeColourTag: wide,
 	};
 
 	let bytes: Uint8Array | undefined;
 	let encoderId = '';
 	let encodePath = encoders[0]?.path ?? 'pure';
 	let wroteFrames = false;
+	let wroteGainMap = false;
+	let wroteLight = false;
 	let encodeError: unknown;
-	for (const encoder of encoders) {
-		try {
-			bytes = await encoder.encode(image, encodeOptions, {
-				capabilities: caps,
-				signal: options.signal,
-			});
-			encoderId = encoder.id;
-			encodePath = encoder.path;
-			wroteFrames = encoder.animates === true && animation !== undefined;
-			break;
-		} catch (error) {
-			encodeError = error;
+
+	if (floatImage) {
+		for (const encoder of floatEncoders) {
+			try {
+				bytes = await encoder.encodeFloat!(floatImage, encodeOptions, {
+					capabilities: caps,
+					signal: options.signal,
+				});
+				encoderId = encoder.id;
+				encodePath = encoder.path;
+				wroteLight = true;
+				break;
+			} catch (error) {
+				encodeError = error;
+			}
+		}
+		// Nothing that takes light could write it, so the light is reduced and
+		// the ordinary ladder gets its turn. A worse result than the one that
+		// was asked for, and still a file, which beats refusing over a rung
+		// that was only ever the preferred one.
+		if (!bytes && light) {
+			image = reduce(light);
+			floatImage = undefined;
+		}
+	}
+
+	if (!bytes && image) {
+		for (const encoder of encoders) {
+			try {
+				bytes = await encoder.encode(image, encodeOptions, {
+					capabilities: caps,
+					signal: options.signal,
+				});
+				encoderId = encoder.id;
+				encodePath = encoder.path;
+				wroteFrames = encoder.animates === true && animation !== undefined;
+				wroteGainMap = encoder.gainMaps === true && gainMapToWrite !== undefined;
+				break;
+			} catch (error) {
+				encodeError = error;
+			}
 		}
 	}
 	if (!bytes) {
@@ -186,6 +302,10 @@ export async function convert(
 		throw new EncodeUnsupportedError(to);
 	}
 	const encodeMs = now() - encodeStarted;
+
+	// Whichever of the two actually reached the encoder. They agree on
+	// dimensions and colour space, which is all the report wants from it.
+	const written = (image ?? floatImage) as RasterImage | FloatImage;
 
 	return {
 		bytes,
@@ -198,11 +318,11 @@ export async function convert(
 			decoderId,
 			encodePath,
 			encoderId,
-			width: image.width,
-			height: image.height,
-			colourSpace: image.colourSpace,
-			orientation: output.orientation,
-			tiles: output.tiles,
+			width: written.width,
+			height: written.height,
+			colourSpace: written.colourSpace,
+			orientation: decoded.orientation,
+			tiles: output?.tiles,
 			frames: wroteFrames ? animation?.frames.length : undefined,
 			// Said out loud rather than left to be noticed. Somebody who
 			// converted an animation and got one frame is owed the reason,
@@ -210,8 +330,18 @@ export async function convert(
 			// write a moving picture in the format they chose.
 			droppedFrames:
 				sourceAnimation && sourceAnimation.frames.length > 1 && !wroteFrames ? true : undefined,
-			metadata: output.exif ? readExif(output.exif) : undefined,
-			gainMap: output.droppedGainMap ? 'dropped' : undefined,
+			metadata: decoded.exif ? readExif(decoded.exif) : undefined,
+			// Three outcomes, and the difference between the last two is the
+			// difference between a photograph that will still look right and
+			// one that has quietly lost half of what it was.
+			gainMap: wroteGainMap
+				? 'kept'
+				: sourceGainMap || output?.droppedGainMap
+					? 'dropped'
+					: undefined,
+			toneMapped: toneMapped || undefined,
+			exposureStops: toneMapped ? exposureStops : undefined,
+			highDynamicRange: wroteLight || wroteGainMap || undefined,
 			sourceBytes: input.length,
 			outputBytes: bytes.length,
 			decodeMs,

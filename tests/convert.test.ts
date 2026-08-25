@@ -46,7 +46,9 @@ import type {
 	EncodeOptions,
 	EncodePath,
 	Encoder,
+	FloatImage,
 	FormatId,
+	GainMap,
 	Orientation,
 	RasterImage,
 } from '../src/types.js';
@@ -312,6 +314,11 @@ interface Encoded {
 
 let lastEncode: Encoded | undefined;
 let lastContext: DecodeContext | undefined;
+/** Ids of the decoders asked for light, in order. */
+let floatDecodeCalls: string[] = [];
+/** Ids of the encoders asked to write light, in order. */
+let floatEncodeCalls: string[] = [];
+let lastFloatEncode: { image: FloatImage; options: EncodeOptions } | undefined;
 
 interface DecoderSpec {
 	readonly id: string;
@@ -327,6 +334,11 @@ interface DecoderSpec {
 	readonly orientation?: Orientation;
 	readonly tiles?: number;
 	readonly droppedGainMap?: boolean;
+	readonly gainMap?: GainMap;
+	/** Light this rung can read. Present makes it a `decodeFloat` rung. */
+	readonly light?: FloatImage;
+	/** Thrown instead of reading light, for a float rung that fails. */
+	readonly lightFails?: Error;
 }
 
 function decoder(spec: DecoderSpec): Decoder {
@@ -349,8 +361,24 @@ function decoder(spec: DecoderSpec): Decoder {
 				iccProfile: spec.iccProfile,
 				tiles: spec.tiles,
 				droppedGainMap: spec.droppedGainMap,
+				gainMap: spec.gainMap,
 			};
 		},
+		...(spec.light || spec.lightFails
+			? {
+					async decodeFloat(_bytes: Uint8Array, context: DecodeContext) {
+						floatDecodeCalls.push(spec.id);
+						lastContext = context;
+						if (spec.lightFails) throw spec.lightFails;
+						return {
+							image: spec.light as FloatImage,
+							orientation: spec.orientation ?? UPRIGHT,
+							exif: spec.exif,
+							iccProfile: spec.iccProfile,
+						};
+					},
+				}
+			: {}),
 	};
 }
 
@@ -362,6 +390,10 @@ interface EncoderSpec {
 	readonly available?: boolean;
 	readonly fails?: Error;
 	readonly bytes?: Uint8Array;
+	/** Declares `floats` and implements `encodeFloat`. */
+	readonly floats?: boolean;
+	readonly floatFails?: Error;
+	readonly gainMaps?: boolean;
 }
 
 function encoder(spec: EncoderSpec): Encoder {
@@ -383,6 +415,18 @@ function encoder(spec: EncoderSpec): Encoder {
 			if (spec.fails) throw spec.fails;
 			return spec.bytes ?? new Uint8Array(12);
 		},
+		...(spec.gainMaps ? { gainMaps: true } : {}),
+		...(spec.floats
+			? {
+					floats: true,
+					async encodeFloat(image: FloatImage, options: EncodeOptions) {
+						floatEncodeCalls.push(spec.id);
+						lastFloatEncode = { image, options };
+						if (spec.floatFails) throw spec.floatFails;
+						return spec.bytes ?? new Uint8Array(12);
+					},
+				}
+			: {}),
 	};
 }
 
@@ -438,7 +482,10 @@ beforeEach(() => {
 	clearRegistry();
 	decodeCalls = [];
 	encodeCalls = [];
+	floatDecodeCalls = [];
+	floatEncodeCalls = [];
 	lastEncode = undefined;
+	lastFloatEncode = undefined;
 	lastContext = undefined;
 });
 
@@ -1111,8 +1158,24 @@ describe('the encode ladder', () => {
 
 		expect(error.code).toBe('encode/unsupported');
 		expect(error.message.length).toBeGreaterThan(0);
-		expect(decodeCalls).toEqual(['png-pure']);
+		// Nothing was decoded, because the destination is settled before the
+		// source is read. Decoding a forty megapixel photograph and then
+		// discovering there was never anywhere to put it is a minute of
+		// somebody's time spent on an answer that was available immediately.
+		expect(decodeCalls).toEqual([]);
 		expect(encodeCalls).toEqual([]);
+	});
+
+	it('still blames the source when neither end can be served', async () => {
+		// Order matters here and only shows up in this case: both ladders are
+		// empty, and the useful thing to say is that this file cannot be read,
+		// not that the format it was going to cannot be written.
+		registerDecoder(decoder({ id: 'png-pure', available: false }));
+		registerEncoder(encoder({ id: 'png-fake', available: false }));
+
+		const error = await failure(pngInput(), { to: 'png' });
+
+		expect(error.code).toBe('decode/unsupported-here');
 	});
 });
 
@@ -1207,5 +1270,206 @@ describe('a conversion through the codecs this package actually ships', () => {
 
 		expect(error.code).toBe('decode/failed');
 		expect(error).toBeInstanceOf(DecodeFailedError);
+	});
+});
+
+/* ── Light ────────────────────────────────────────────────────────────── */
+
+/**
+ * A patch of linear light with a highlight well above white in it.
+ *
+ * 40 is roughly a lamp against a sheet of paper, which is the situation these
+ * formats exist for and the one where reducing the range early is visible.
+ */
+function light(overrides: Partial<FloatImage> = {}): FloatImage {
+	const width = overrides.width ?? 4;
+	const height = overrides.height ?? 2;
+	const data = new Float32Array(width * height * 4);
+	for (let i = 0; i < width * height; i += 1) {
+		const at = i * 4;
+		data[at] = 0.18;
+		data[at + 1] = 0.18;
+		data[at + 2] = 0.18;
+		data[at + 3] = 1;
+	}
+	data[0] = 40;
+	data[1] = 40;
+	data[2] = 40;
+	return { data, width, height, colourSpace: 'srgb', hasAlpha: false, ...overrides };
+}
+
+function gainMap(): GainMap {
+	return {
+		image: raster({ width: 2, height: 1 }),
+		metadata: Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]),
+		standard: 'iso-21496-1',
+	};
+}
+
+describe('a source that carries light', () => {
+	it('reads light rather than bytes when anything downstream can write it', async () => {
+		registerDecoder(decoder({ id: 'exr-pure', formats: ['png'], light: light() }));
+		registerEncoder(encoder({ id: 'hdr-pure', format: 'png', floats: true }));
+
+		const result = await convert(pngInput(), { to: 'png' }, CAPABILITIES);
+
+		expect(floatDecodeCalls).toEqual(['exr-pure']);
+		expect(decodeCalls).toEqual([]);
+		expect(floatEncodeCalls).toEqual(['hdr-pure']);
+		expect(encodeCalls).toEqual([]);
+		// Nothing was reduced, so there is no exposure to report and the file
+		// carries more than eight bits a channel.
+		expect(result.report.toneMapped).toBeUndefined();
+		expect(result.report.exposureStops).toBeUndefined();
+		expect(result.report.highDynamicRange).toBe(true);
+	});
+
+	it('hands the encoder the light untouched, highlight and all', async () => {
+		registerDecoder(decoder({ id: 'exr-pure', light: light() }));
+		registerEncoder(encoder({ id: 'hdr-pure', floats: true }));
+
+		await convert(pngInput(), { to: 'png' }, CAPABILITIES);
+
+		// The whole point: 40 is still 40 at the encoder. A pipeline that went
+		// through bytes in the middle would hand over 1.
+		expect(lastFloatEncode?.image.data[0]).toBe(40);
+	});
+
+	it('reduces to bytes when nothing downstream takes light, and says what it cost', async () => {
+		registerDecoder(decoder({ id: 'exr-pure', light: light() }));
+		registerEncoder(encoder({ id: 'png-pure' }));
+
+		const result = await convert(pngInput(), { to: 'png' }, CAPABILITIES);
+
+		expect(floatDecodeCalls).toEqual(['exr-pure']);
+		expect(encodeCalls).toEqual(['png-pure']);
+		expect(result.report.toneMapped).toBe(true);
+		expect(result.report.exposureStops).toBe(0);
+		expect(result.report.highDynamicRange).toBeUndefined();
+		expect(seenByEncoder().image.width).toBe(4);
+	});
+
+	it('applies the exposure the caller asked for', async () => {
+		registerDecoder(decoder({ id: 'exr-pure', light: light() }));
+		registerEncoder(encoder({ id: 'png-pure' }));
+
+		const dark = await convert(pngInput(), { to: 'png', tone: { stops: -2 } }, CAPABILITIES);
+		const darker = seenByEncoder().image.data[4] as number;
+
+		clearRegistry();
+		registerDecoder(decoder({ id: 'exr-pure', light: light() }));
+		registerEncoder(encoder({ id: 'png-pure' }));
+		await convert(pngInput(), { to: 'png' }, CAPABILITIES);
+		const metered = seenByEncoder().image.data[4] as number;
+
+		// Two stops down is a real reduction, not a rounding difference, and
+		// the report says which of the two happened.
+		expect(darker).toBeLessThan(metered);
+		expect(dark.report.exposureStops).toBe(-2);
+	});
+
+	it('falls back to bytes when the light encoder refuses, rather than failing', async () => {
+		registerDecoder(decoder({ id: 'exr-pure', light: light() }));
+		registerEncoder(
+			encoder({
+				id: 'hdr-pure',
+				floats: true,
+				floatFails: new Error('no compression stream here'),
+			}),
+		);
+
+		const result = await convert(pngInput(), { to: 'png' }, CAPABILITIES);
+
+		expect(floatEncodeCalls).toEqual(['hdr-pure']);
+		expect(encodeCalls).toEqual(['hdr-pure']);
+		expect(result.report.toneMapped).toBe(true);
+	});
+
+	it('walks to the byte ladder when the light rung cannot read this file', async () => {
+		registerDecoder(
+			decoder({
+				id: 'exr-pure',
+				light: light(),
+				lightFails: new Error('not an EXR at all'),
+				fails: new Error('not an EXR at all'),
+			}),
+		);
+		registerDecoder(decoder({ id: 'png-pure', priority: 20 }));
+		registerEncoder(encoder({ id: 'png-out' }));
+
+		await convert(pngInput(), { to: 'png' }, CAPABILITIES);
+
+		// Both ladders, in that order, and the rung that could not read light
+		// is still offered its ordinary turn before the next one gets a look.
+		expect(floatDecodeCalls).toEqual(['exr-pure']);
+		expect(decodeCalls).toEqual(['exr-pure', 'png-pure']);
+	});
+
+	it('lets a rung answer with bytes after it declined to answer with light', async () => {
+		registerDecoder(
+			decoder({ id: 'tiff-pure', light: light(), lightFails: new Error('not a float TIFF') }),
+		);
+		registerEncoder(encoder({ id: 'png-out' }));
+
+		const result = await convert(pngInput(), { to: 'png' }, CAPABILITIES);
+
+		// A 32 bit float TIFF and an ordinary one are the same decoder, and
+		// only the file says which it is, so declining the first question is
+		// not a reason to stop asking this rung the second one.
+		expect(decodeCalls).toEqual(['tiff-pure']);
+		expect(result.report.toneMapped).toBeUndefined();
+	});
+});
+
+describe('a source that carries a gain map', () => {
+	it('carries it through to an encoder that writes one', async () => {
+		registerDecoder(decoder({ id: 'heic-webcodecs', gainMap: gainMap() }));
+		registerEncoder(encoder({ id: 'avif-native', gainMaps: true }));
+
+		const result = await convert(pngInput(), { to: 'png' }, CAPABILITIES);
+
+		expect(result.report.gainMap).toBe('kept');
+		expect(result.report.highDynamicRange).toBe(true);
+		expect(Array.from(seenByEncoder().options.gainMap?.metadata ?? [])).toEqual([
+			1, 2, 3, 4, 5, 6, 7, 8,
+		]);
+	});
+
+	it('reports it dropped when the encoder cannot write one', async () => {
+		registerDecoder(decoder({ id: 'heic-webcodecs', gainMap: gainMap() }));
+		registerEncoder(encoder({ id: 'png-pure' }));
+
+		const result = await convert(pngInput(), { to: 'png' }, CAPABILITIES);
+
+		expect(result.report.gainMap).toBe('dropped');
+		expect(result.report.highDynamicRange).toBeUndefined();
+	});
+
+	it('lets it go rather than writing it wrongly when the base changes colour space', async () => {
+		// The parameters were written against Display P3 primaries. Narrowing
+		// the base to sRGB and keeping them would produce a file that claims a
+		// brightness relationship it no longer has.
+		registerDecoder(
+			decoder({
+				id: 'heic-webcodecs',
+				image: raster({ colourSpace: 'display-p3' }),
+				gainMap: gainMap(),
+			}),
+		);
+		registerEncoder(encoder({ id: 'avif-native', gainMaps: true }));
+
+		const result = await convert(pngInput(), { to: 'png', colour: 'srgb' }, CAPABILITIES);
+
+		expect(result.report.gainMap).toBe('dropped');
+		expect(seenByEncoder().options.gainMap).toBeUndefined();
+	});
+
+	it('still reports a rung that could not reach one at all', async () => {
+		registerDecoder(decoder({ id: 'heic-native', droppedGainMap: true }));
+		registerEncoder(encoder({ id: 'avif-native', gainMaps: true }));
+
+		const result = await convert(pngInput(), { to: 'png' }, CAPABILITIES);
+
+		expect(result.report.gainMap).toBe('dropped');
 	});
 });
