@@ -1165,7 +1165,7 @@ function floatRaster(samples: Float32Array, page: Page): RasterImage {
 		}
 	}
 	if (bounded) return displayRaster(source, width, height, channels);
-	return toneMap(source, width, height, channels === 4 ? 4 : 3);
+	return toneMap(source, width, height, channels === 4 ? 4 : 3).image;
 }
 
 /* ── Orientation ──────────────────────────────────────────────────────── */

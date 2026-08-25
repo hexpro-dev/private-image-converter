@@ -753,7 +753,7 @@ describe('the report', () => {
 			tiles: 6,
 			// An HDR photograph that came out standard range says so, rather
 			// than the interface having to guess why it looks different.
-			droppedGainMap: true,
+			gainMap: 'dropped',
 			sourceBytes: 64,
 			outputBytes: 31,
 		});

@@ -104,14 +104,14 @@ describe('tone mapping linear light', () => {
 		// 0.18 is diffuse white's eighteen percent grey card. The metering puts
 		// the log average there, so a picture that is already there comes back
 		// unchanged, and the sRGB curve turns it into 118.
-		expect(pixel(toneMap(uniform(0.18, 16), 4, 4, 3), 0, 0)).toEqual([118, 118, 118, 255]);
+		expect(pixel(toneMap(uniform(0.18, 16), 4, 4, 3).image, 0, 0)).toEqual([118, 118, 118, 255]);
 	});
 
 	it.each([0.001, 4, 1000])('meters a picture around %d onto the same mid grey', (value) => {
 		// The exposure comes from the picture, the way a camera chooses one. A
 		// fixed exposure would leave the first of these black and the last of them
 		// solid white, and both are ordinary contents for a file with no ceiling.
-		expect(pixel(toneMap(uniform(value, 16), 4, 4, 3), 0, 0)).toEqual([118, 118, 118, 255]);
+		expect(pixel(toneMap(uniform(value, 16), 4, 4, 3).image, 0, 0)).toEqual([118, 118, 118, 255]);
 	});
 
 	it('brightens by a stop and darkens by a stop in the right directions', () => {
@@ -119,9 +119,9 @@ describe('tone mapping linear light', () => {
 		// down still looks like a plausible photograph. Both directions from the
 		// same source are what pin it.
 		const source = uniform(0.18, 16);
-		const darker = pixel(toneMap(source, 4, 4, 3, { stops: -1 }), 0, 0)[0] as number;
-		const middle = pixel(toneMap(source, 4, 4, 3), 0, 0)[0] as number;
-		const brighter = pixel(toneMap(source, 4, 4, 3, { stops: 1 }), 0, 0)[0] as number;
+		const darker = pixel(toneMap(source, 4, 4, 3, { stops: -1 }).image, 0, 0)[0] as number;
+		const middle = pixel(toneMap(source, 4, 4, 3).image, 0, 0)[0] as number;
+		const brighter = pixel(toneMap(source, 4, 4, 3, { stops: 1 }).image, 0, 0)[0] as number;
 		expect(darker).toBeLessThan(middle);
 		expect(middle).toBeLessThan(brighter);
 		// A stop is a factor of two in linear light, so 0.18 becomes 0.09 and
@@ -138,7 +138,7 @@ describe('tone mapping linear light', () => {
 		source[0] = 1000;
 		source[1] = 1000;
 		source[2] = 1000;
-		const mapped = toneMap(source, 8, 8, 3);
+		const mapped = toneMap(source, 8, 8, 3).image;
 		expect(pixel(mapped, 0, 0)).toEqual([255, 255, 255, 255]);
 		expect(levels(mapped)[1] as number).toBeGreaterThan(80);
 	});
@@ -151,7 +151,7 @@ describe('tone mapping linear light', () => {
 		source[0] = 50;
 		source[1] = 50;
 		source[2] = 50;
-		expect(pixel(toneMap(source, 4, 4, 3), 0, 0)).toEqual([255, 255, 255, 255]);
+		expect(pixel(toneMap(source, 4, 4, 3).image, 0, 0)).toEqual([255, 255, 255, 255]);
 	});
 
 	it('clips two separate highlights to the same white when asked to clip', () => {
@@ -162,7 +162,7 @@ describe('tone mapping linear light', () => {
 		const source = uniform(0.18, 4);
 		source.set([100, 100, 100], 3);
 		source.set([1000, 1000, 1000], 6);
-		const clipped = levels(toneMap(source, 4, 1, 3, { clip: true }));
+		const clipped = levels(toneMap(source, 4, 1, 3, { clip: true }).image);
 		expect(clipped[1]).toBe(255);
 		expect(clipped[2]).toBe(255);
 	});
@@ -171,7 +171,7 @@ describe('tone mapping linear light', () => {
 		const source = uniform(0.18, 4);
 		source.set([100, 100, 100], 3);
 		source.set([1000, 1000, 1000], 6);
-		const rolled = levels(toneMap(source, 4, 1, 3));
+		const rolled = levels(toneMap(source, 4, 1, 3).image);
 		expect(rolled[1]).toBeLessThan(255);
 		expect(rolled[1] as number).toBeGreaterThan(150);
 		expect(rolled[2]).toBe(255);
@@ -184,8 +184,8 @@ describe('tone mapping linear light', () => {
 		// down, which reads as a picture that is merely a bit dark.
 		const source = uniform(0.18, 16);
 		for (let i = 0; i < 8; i += 1) source[i * 3] = source[i * 3 + 1] = source[i * 3 + 2] = i + 1;
-		const rolled = levels(toneMap(source, 4, 4, 3));
-		const clipped = levels(toneMap(source, 4, 4, 3, { clip: true }));
+		const rolled = levels(toneMap(source, 4, 4, 3).image);
+		const clipped = levels(toneMap(source, 4, 4, 3, { clip: true }).image);
 		rolled.forEach((value, index) =>
 			expect(clipped[index] as number).toBeGreaterThanOrEqual(value),
 		);
@@ -196,7 +196,7 @@ describe('tone mapping linear light', () => {
 		// the curve would make every soft edge harder or softer depending on how
 		// bright the picture happened to be.
 		const source = new Float32Array([0.18, 0.18, 0.18, 0.5, 0.18, 0.18, 0.18, 1]);
-		const mapped = toneMap(source, 2, 1, 4);
+		const mapped = toneMap(source, 2, 1, 4).image;
 		expect(pixel(mapped, 0, 0)[3]).toBe(128);
 		expect(pixel(mapped, 1, 0)[3]).toBe(255);
 		expect(mapped.hasAlpha).toBe(true);
@@ -206,7 +206,7 @@ describe('tone mapping linear light', () => {
 		// A NaN turns up in an alpha channel more often than anybody would like,
 		// and so do values a compositor left outside zero to one. Neither may wrap.
 		const source = new Float32Array([0.18, 0.18, 0.18, -0.25, 0.18, 0.18, 0.18, 2]);
-		const mapped = toneMap(source, 2, 1, 4);
+		const mapped = toneMap(source, 2, 1, 4).image;
 		expect(pixel(mapped, 0, 0)[3]).toBe(0);
 		expect(pixel(mapped, 1, 0)[3]).toBe(255);
 	});
@@ -216,12 +216,12 @@ describe('tone mapping linear light', () => {
 		// alpha would come out different in the two.
 		const dark = new Float32Array([0.001, 0.001, 0.001, 0.5]);
 		const bright = new Float32Array([1000, 1000, 1000, 0.5]);
-		expect(pixel(toneMap(dark, 1, 1, 4), 0, 0)[3]).toBe(128);
-		expect(pixel(toneMap(bright, 1, 1, 4), 0, 0)[3]).toBe(128);
+		expect(pixel(toneMap(dark, 1, 1, 4).image, 0, 0)[3]).toBe(128);
+		expect(pixel(toneMap(bright, 1, 1, 4).image, 0, 0)[3]).toBe(128);
 	});
 
 	it('makes a three channel picture opaque and says it carries no alpha', () => {
-		const mapped = toneMap(uniform(0.18, 4), 2, 2, 3);
+		const mapped = toneMap(uniform(0.18, 4), 2, 2, 3).image;
 		expect(mapped.hasAlpha).toBe(false);
 		expect([...mapped.data.filter((_value, index) => index % 4 === 3)]).toEqual([
 			255, 255, 255, 255,
@@ -238,10 +238,10 @@ describe('tone mapping linear light', () => {
 			four.set([0.18, 0.36, 0.09, 0.25], i * 4);
 			three.set([0.18, 0.36, 0.09], i * 3);
 		}
-		expect(pixel(toneMap(four, 4, 1, 4), 0, 0).slice(0, 3)).toEqual(
-			pixel(toneMap(three, 4, 1, 3), 0, 0).slice(0, 3),
+		expect(pixel(toneMap(four, 4, 1, 4).image, 0, 0).slice(0, 3)).toEqual(
+			pixel(toneMap(three, 4, 1, 3).image, 0, 0).slice(0, 3),
 		);
-		expect(pixel(toneMap(four, 4, 1, 4), 0, 0)[3]).toBe(64);
+		expect(pixel(toneMap(four, 4, 1, 4).image, 0, 0)[3]).toBe(64);
 	});
 
 	it('returns a black picture rather than a buffer of NaN when nothing is lit', () => {
@@ -249,7 +249,7 @@ describe('tone mapping linear light', () => {
 		// metering has a floor. NaN written into a clamped byte array is zero, so
 		// the failure would only show as an alpha channel of nothing on the paths
 		// that carry one.
-		const mapped = toneMap(new Float32Array(4 * 4), 2, 2, 4);
+		const mapped = toneMap(new Float32Array(4 * 4), 2, 2, 4).image;
 		expect([...mapped.data.subarray(0, 4)]).toEqual([0, 0, 0, 0]);
 		expect([...mapped.data].some((value) => Number.isNaN(value))).toBe(false);
 	});
@@ -261,7 +261,7 @@ describe('tone mapping linear light', () => {
 		source[0] = -0.5;
 		source[1] = -0.5;
 		source[2] = -0.5;
-		expect(pixel(toneMap(source, 4, 1, 3), 0, 0)).toEqual([0, 0, 0, 255]);
+		expect(pixel(toneMap(source, 4, 1, 3).image, 0, 0)).toEqual([0, 0, 0, 255]);
 	});
 
 	it('uses the linear foot of the sRGB curve deep in the shadows', () => {
@@ -273,7 +273,7 @@ describe('tone mapping linear light', () => {
 		source[0] = 0.0006;
 		source[1] = 0.0006;
 		source[2] = 0.0006;
-		expect(pixel(toneMap(source, 8, 8, 3), 0, 0)).toEqual([2, 2, 2, 255]);
+		expect(pixel(toneMap(source, 8, 8, 3).image, 0, 0)).toEqual([2, 2, 2, 255]);
 	});
 
 	it('keeps the colours apart rather than driving everything to white', () => {
@@ -281,21 +281,21 @@ describe('tone mapping linear light', () => {
 		// The extended one lets the chosen white reach exactly one and leaves the
 		// rest where the exposure put them, so a saturated colour stays saturated.
 		const source = new Float32Array([0.4, 0.1, 0.05, 0.18, 0.18, 0.18]);
-		const mapped = toneMap(source, 2, 1, 3);
+		const mapped = toneMap(source, 2, 1, 3).image;
 		const [r, g, b] = pixel(mapped, 0, 0);
 		expect(r as number).toBeGreaterThan(g as number);
 		expect(g as number).toBeGreaterThan(b as number);
 	});
 
 	it('carries the colour space it was given and defaults to sRGB', () => {
-		expect(toneMap(uniform(0.18, 4), 2, 2, 3).colourSpace).toBe('srgb');
-		expect(toneMap(uniform(0.18, 4), 2, 2, 3, { colourSpace: 'display-p3' }).colourSpace).toBe(
-			'display-p3',
-		);
+		expect(toneMap(uniform(0.18, 4), 2, 2, 3).image.colourSpace).toBe('srgb');
+		expect(
+			toneMap(uniform(0.18, 4), 2, 2, 3, { colourSpace: 'display-p3' }).image.colourSpace,
+		).toBe('display-p3');
 	});
 
 	it('produces a raster of the size it was told, four bytes a pixel', () => {
-		const mapped = toneMap(uniform(0.18, 6), 3, 2, 3);
+		const mapped = toneMap(uniform(0.18, 6), 3, 2, 3).image;
 		expect([mapped.width, mapped.height]).toEqual([3, 2]);
 		expect(mapped.data.length).toBe(3 * 2 * 4);
 	});
@@ -303,7 +303,7 @@ describe('tone mapping linear light', () => {
 	it('maps a single pixel picture', () => {
 		// One pixel is the whole histogram, so the log average is that pixel and
 		// the exposure puts it on mid grey whatever it holds.
-		expect(pixel(toneMap(new Float32Array([7, 7, 7]), 1, 1, 3), 0, 0)).toEqual([
+		expect(pixel(toneMap(new Float32Array([7, 7, 7]), 1, 1, 3).image, 0, 0)).toEqual([
 			118, 118, 118, 255,
 		]);
 	});

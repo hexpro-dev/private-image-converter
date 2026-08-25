@@ -100,6 +100,99 @@ export interface RasterImage {
 	readonly hasAlpha: boolean;
 }
 
+/* ── Light ────────────────────────────────────────────────────────────── */
+
+/**
+ * A decoded image as light rather than as a picture of one.
+ *
+ * `RasterImage` is display referred: its numbers have already been through a
+ * transfer curve and 255 means "as bright as this screen goes". A `FloatImage`
+ * is scene referred and linear, so 1 is a diffuse white surface and there is no
+ * ceiling above it. Radiance and OpenEXR both store that, and reducing it to
+ * bytes is a decision about how a picture should look rather than a decoding
+ * step, which is why it now happens on the way out instead of on the way in.
+ *
+ * Always four channels, matching `RasterImage`, so the two are interchangeable
+ * everywhere except in what a sample means. Alpha is straight coverage in 0 to
+ * 1 and is not light: nothing tone maps it.
+ *
+ * Sixteen bytes a pixel, against four. That is the reason a decoder only
+ * produces one when something downstream has said it can use it.
+ */
+export interface FloatImage {
+	readonly data: Float32Array;
+	readonly width: number;
+	readonly height: number;
+	readonly colourSpace: ColourSpace;
+	readonly hasAlpha: boolean;
+}
+
+/**
+ * How to reduce unbounded light to eight bits.
+ *
+ * Lives here rather than beside the implementation because it is now a
+ * conversion option: the caller chooses the exposure, and until this existed
+ * the choice was made inside the decoder where nothing could reach it.
+ */
+export interface ToneMapOptions {
+	/**
+	 * Exposure in stops, relative to the automatic choice.
+	 *
+	 * Left unset, the picture is metered: the log-average luminance is placed
+	 * at middle grey, which is the same rule a camera's average metering uses
+	 * and lands within a stop of right on almost everything.
+	 */
+	readonly stops?: number;
+	/**
+	 * Skip the roll-off and clip at white instead.
+	 *
+	 * Correct when the file is already display referred, which happens with
+	 * EXRs written out of a compositor as a final frame. Wrong for anything
+	 * scene referred, where it flattens every highlight to white.
+	 */
+	readonly clip?: boolean;
+	readonly colourSpace?: ColourSpace;
+}
+
+/**
+ * An HDR gain map, as the file stored it.
+ *
+ * A modern HDR photograph is not one picture with more bits in it. It is an
+ * ordinary SDR picture plus a second, usually smaller, monochrome picture
+ * saying how much brighter each part of it should get, and a short block of
+ * parameters saying how to read that second picture against the headroom of
+ * whatever screen is showing it. At zero headroom the gain map contributes
+ * nothing, which is why the same file looks correct on a display that cannot
+ * show any of it.
+ *
+ * `metadata` is carried as bytes and never parsed. Every value that defines
+ * what the picture should look like lives in there, so copying the block
+ * unchanged into a container that uses the same specification reproduces the
+ * photograph exactly, while reading it in order to write it back out again
+ * could only introduce error. The one thing worth knowing about it is which
+ * specification wrote it, and that is recorded separately.
+ */
+export interface GainMap {
+	readonly image: RasterImage;
+	readonly metadata: Uint8Array;
+	/** Which specification's parameter block `metadata` holds. */
+	readonly standard: 'iso-21496-1';
+	/** The gain map's own colour tag, when it carried one. */
+	readonly iccProfile?: Uint8Array;
+}
+
+/** What tone mapping did, so the report can say it rather than imply it. */
+export interface ToneMapResult {
+	readonly image: RasterImage;
+	/**
+	 * The exposure that was applied, in stops away from a meter reading of
+	 * middle grey. Zero means the metering was taken as it came.
+	 */
+	readonly stops: number;
+	/** The luminance mapped to white, before the roll-off. 1 when clipping. */
+	readonly white: number;
+}
+
 /* ── Animation ──────────────────────────────────────────────── */
 
 /**
@@ -171,6 +264,16 @@ export interface Capabilities {
 	readonly canvasEncode: ReadonlySet<string>;
 	/** `VideoDecoder` exists and reported a supported HEVC configuration. */
 	readonly hevcVideoDecoder: boolean;
+	/**
+	 * `VideoEncoder` exists and reported a supported AV1 configuration.
+	 *
+	 * What makes writing AVIF possible at all. Eight bit only, and deliberately
+	 * probed as such: every Chromium tested refuses a ten bit AV1 configuration
+	 * under all three acceleration preferences, so a probe that asked for ten
+	 * would report no AVIF support at all rather than the eight bit support
+	 * that is really there.
+	 */
+	readonly av1VideoEncoder: boolean;
 	/** A 2D context accepted `colorSpace: 'display-p3'` and reported it back. */
 	readonly displayP3Canvas: boolean;
 	/** `CompressionStream('deflate')` exists. Required by the PNG encoder. */
@@ -215,6 +318,15 @@ export interface DecodeOutput {
 	readonly image: RasterImage;
 	/** What was applied to get there. Reported, never re-applied. */
 	readonly orientation: Orientation;
+	/**
+	 * The HDR gain map, when the container had one and this decoder read it.
+	 *
+	 * Present means it can be carried to an output format that understands one.
+	 * Absent with `hasGainMap` set on the plan means the file had one and this
+	 * rung could not reach it, which is the difference between "there was no
+	 * HDR here" and "there was, and it is gone".
+	 */
+	readonly gainMap?: GainMap;
 	/** True when the container carried an HDR gain map this decoder discarded. */
 	readonly droppedGainMap?: boolean;
 	/** Raw EXIF payload (TIFF header onwards), if the container carried one. */
@@ -263,9 +375,45 @@ export interface Decoder {
 	/** Whether this decoder can run at all here. Memoised by the registry. */
 	available(capabilities: Capabilities): Promise<boolean>;
 	decode(bytes: Uint8Array, context: DecodeContext): Promise<DecodeOutput>;
+	/**
+	 * Decode to unbounded linear light, for the formats that store it.
+	 *
+	 * A second entry point rather than an extra field on `DecodeOutput`,
+	 * because the two answers cost very different amounts and only the caller
+	 * knows which it needs. A decoder that offered both would either tone map
+	 * every EXR on the way to an EXR, throwing the work away, or return
+	 * sixteen bytes a pixel to a caller writing a GIF.
+	 *
+	 * When this is present `convert` calls it in preference to `decode` and
+	 * tone maps at the encoder instead, which is what makes the exposure
+	 * setting mean anything.
+	 */
+	decodeFloat?(bytes: Uint8Array, context: DecodeContext): Promise<FloatDecodeOutput>;
+}
+
+/**
+ * What a float decode returns.
+ *
+ * Deliberately smaller than `DecodeOutput`. The formats that carry light do
+ * not carry animation, tiles or gain maps, and a shape that promised those
+ * fields would be promising something no implementation can fill.
+ */
+export interface FloatDecodeOutput {
+	readonly image: FloatImage;
+	readonly orientation: Orientation;
+	readonly exif?: Uint8Array;
+	readonly iccProfile?: Uint8Array;
 }
 
 export interface EncodeOptions {
+	/**
+	 * An HDR gain map to write alongside the picture.
+	 *
+	 * Only an encoder that declares `gainMaps` looks at this. Everything else
+	 * ignores it, and `convert` reports that it was dropped rather than letting
+	 * it disappear quietly.
+	 */
+	readonly gainMap?: GainMap;
 	/** 0 to 1, for lossy formats. Ignored by lossless ones. */
 	readonly quality?: number;
 	/**
@@ -331,8 +479,33 @@ export interface Encoder {
 	 * the file.
 	 */
 	readonly animates?: boolean;
+	/**
+	 * Whether this encoder writes light rather than a picture of it.
+	 *
+	 * Declared rather than inferred from `encodeFloat` being present, for the
+	 * same reason `animates` is declared: an encoder may be able to take floats
+	 * and still be the wrong place to send them.
+	 */
+	readonly floats?: boolean;
+	/**
+	 * Whether this encoder writes `EncodeOptions.gainMap` rather than dropping it.
+	 */
+	readonly gainMaps?: boolean;
 	available(capabilities: Capabilities): Promise<boolean>;
 	encode(image: RasterImage, options: EncodeOptions, context: EncodeContext): Promise<Uint8Array>;
+	/**
+	 * Write unbounded linear light without reducing it first.
+	 *
+	 * Called only when `floats` is set and the decode produced light. An
+	 * encoder that implements this is the reason an EXR can reach a Radiance
+	 * file with its range intact instead of going through eight bits on the
+	 * way.
+	 */
+	encodeFloat?(
+		image: FloatImage,
+		options: EncodeOptions,
+		context: EncodeContext,
+	): Promise<Uint8Array>;
 }
 
 /* ── Conversion ───────────────────────────────────────────────────────── */
@@ -372,6 +545,16 @@ export interface ConvertOptions extends Omit<EncodeOptions, 'animation'> {
 	 * you get a still out of an animation on purpose. Defaults to `all`.
 	 */
 	readonly frames?: 'all' | 'first';
+	/**
+	 * How to reduce a high dynamic range source when the target cannot hold it.
+	 *
+	 * Ignored for every ordinary format, because an eight bit source has
+	 * nothing to reduce. It applies when the source was Radiance or OpenEXR and
+	 * the target is anything that is not, which is where a person converting a
+	 * render wants to say "one stop darker" and, until the tone map moved to
+	 * the encoder, had nowhere to say it.
+	 */
+	readonly tone?: ToneMapOptions;
 	readonly signal?: AbortSignal;
 }
 
@@ -405,8 +588,26 @@ export interface ConvertReport {
 	 * differently from "metadata".
 	 */
 	readonly metadata?: import('./metadata/exif.js').ExifSummary;
-	/** True when an HDR gain map was present and discarded. */
-	readonly droppedGainMap?: boolean;
+	/**
+	 * What happened to the source's HDR gain map.
+	 *
+	 * Absent when there was none. `kept` means the output carries the same
+	 * parameters the source did and will display as HDR wherever the source
+	 * would have. `dropped` means the output is the SDR base picture, which is
+	 * a complete photograph rather than a broken one, but not the bright one.
+	 */
+	readonly gainMap?: 'kept' | 'dropped';
+	/**
+	 * True when unbounded light was reduced to eight bits to write this file.
+	 *
+	 * Set for Radiance and OpenEXR sources going anywhere that is not Radiance
+	 * or OpenEXR. `exposureStops` says what exposure the reduction used.
+	 */
+	readonly toneMapped?: boolean;
+	/** The exposure tone mapping applied, in stops. Only set when it ran. */
+	readonly exposureStops?: number;
+	/** True when the output carries more range than eight bits a channel. */
+	readonly highDynamicRange?: boolean;
 	readonly sourceBytes: number;
 	readonly outputBytes: number;
 	readonly decodeMs: number;

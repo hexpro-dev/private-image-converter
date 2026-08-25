@@ -21,6 +21,20 @@ import { sniffFormat } from './sniff.js';
  */
 const HEVC_PROBE_CODECS = ['hvc1.3.E.L90.B0', 'hvc1.1.6.L93.B0'] as const;
 
+/**
+ * AV1 configurations representative of a still photograph.
+ *
+ * Eight bit, and only eight bit. Every Chromium tested refuses `av01.0.04M.10`
+ * under `no-preference`, `prefer-software` and `prefer-hardware` alike, so a
+ * probe that asked for ten bits would conclude AVIF cannot be written here at
+ * all, when in fact it can, just not with more range than a JPEG.
+ *
+ * Two levels because the level is part of the string and a decoder that
+ * accepts 4.0 does not necessarily advertise 3.0. The encoder picks its own
+ * level from the picture; this only asks whether an AV1 encoder exists.
+ */
+const AV1_PROBE_CODECS = ['av01.0.08M.08', 'av01.0.04M.08'] as const;
+
 async function canDecodeNatively(bytes: Uint8Array, mime: string): Promise<boolean> {
 	if (typeof createImageBitmap !== 'function' || typeof Blob === 'undefined') return false;
 	try {
@@ -107,6 +121,35 @@ async function hasHevcVideoDecoder(): Promise<boolean> {
 	return false;
 }
 
+/**
+ * Whether this browser will encode AV1, which is what writing AVIF needs.
+ *
+ * The interesting half of the answer is that it is a video encoder being asked
+ * for a single still frame. That is not a workaround: it is what every AVIF
+ * encoder does, because an AVIF is one AV1 keyframe in a HEIF container, and
+ * it is the same trick the HEIC reader here already plays in the other
+ * direction.
+ */
+async function hasAv1VideoEncoder(): Promise<boolean> {
+	const encoder = (globalThis as { VideoEncoder?: typeof VideoEncoder }).VideoEncoder;
+	if (typeof encoder?.isConfigSupported !== 'function') return false;
+	for (const codec of AV1_PROBE_CODECS) {
+		try {
+			const support = await encoder.isConfigSupported({
+				codec,
+				width: 256,
+				height: 256,
+				bitrate: 1_000_000,
+				framerate: 1,
+			});
+			if (support.supported === true) return true;
+		} catch {
+			continue;
+		}
+	}
+	return false;
+}
+
 function hasDisplayP3Canvas(): boolean {
 	try {
 		const canvas = makeCanvas(1, 1);
@@ -176,6 +219,7 @@ async function probe(): Promise<Capabilities> {
 		nativeDecode,
 		canvasEncode,
 		hevcVideoDecoder: await hasHevcVideoDecoder(),
+		av1VideoEncoder: await hasAv1VideoEncoder(),
 		displayP3Canvas: hasDisplayP3Canvas(),
 		compressionStream: typeof CompressionStream === 'function',
 		offscreenCanvas: typeof OffscreenCanvas === 'function',
@@ -194,6 +238,7 @@ export function emptyCapabilities(overrides: Partial<Capabilities> = {}): Capabi
 		nativeDecode: new Set(),
 		canvasEncode: new Set(),
 		hevcVideoDecoder: false,
+		av1VideoEncoder: false,
 		displayP3Canvas: false,
 		compressionStream: false,
 		offscreenCanvas: false,

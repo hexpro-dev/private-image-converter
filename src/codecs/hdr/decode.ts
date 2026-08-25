@@ -543,5 +543,5 @@ export function decodeHdrFloat(bytes: Uint8Array): HdrFloatImage {
  */
 export function decodeHdr(bytes: Uint8Array): RasterImage {
 	const light = decodeHdrFloat(bytes);
-	return toneMap(light.data, light.width, light.height, 3, { colourSpace: light.colourSpace });
+	return toneMap(light.data, light.width, light.height, 3, { colourSpace: light.colourSpace }).image;
 }

@@ -958,7 +958,7 @@ export async function decodeExr(bytes: Uint8Array): Promise<RasterImage> {
 	// and clipping that turns every window and every highlight into a flat white
 	// shape. Both mistakes look like a bad photograph rather than like an error.
 	const clip = sanitise(samples, outChannels);
-	const pixels = toneMap(samples, width, height, outChannels, { clip, colourSpace });
+	const pixels = toneMap(samples, width, height, outChannels, { clip, colourSpace }).image;
 	const image = place(pixels, dataWindow, displayWindow, alpha);
 
 	// An alpha channel that is 1 everywhere is an opaque image, whatever the

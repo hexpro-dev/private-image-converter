@@ -15,28 +15,10 @@
  * they lose is said plainly in the report rather than left to be discovered.
  */
 
-import type { RasterImage } from '../types.js';
+import type { FloatImage, ToneMapOptions, ToneMapResult } from '../types.js';
 import { createRaster } from './image.js';
 
-export interface ToneMapOptions {
-	/**
-	 * Exposure in stops, relative to the automatic choice.
-	 *
-	 * Left unset, the picture is metered: the log-average luminance is placed
-	 * at middle grey, which is the same rule a camera's average metering uses
-	 * and lands within a stop of right on almost everything.
-	 */
-	readonly stops?: number;
-	/**
-	 * Skip the roll-off and clip at white instead.
-	 *
-	 * Correct when the file is already display-referred, which happens with
-	 * EXRs written out of a compositor as a final frame. Wrong for anything
-	 * scene-referred, where it is exactly the flat-white failure above.
-	 */
-	readonly clip?: boolean;
-	readonly colourSpace?: RasterImage['colourSpace'];
-}
+export type { ToneMapOptions, ToneMapResult };
 
 /** Rec. 709 luminance, which both formats' primaries agree on. */
 function luminance(r: number, g: number, b: number): number {
@@ -57,6 +39,11 @@ function encodeSrgb(linear: number): number {
  * present, is passed through untouched: it is coverage rather than light and
  * tone mapping it would make every soft edge harder or softer depending on how
  * bright the picture happened to be.
+ *
+ * The exposure and the white point come back with the picture rather than
+ * being kept private, because they are the two numbers that explain why the
+ * result looks the way it does, and a person who disagrees with the automatic
+ * choice can only argue with a number they can see.
  */
 export function toneMap(
 	source: Float32Array,
@@ -64,7 +51,7 @@ export function toneMap(
 	height: number,
 	channels: 3 | 4,
 	options: ToneMapOptions = {},
-): RasterImage {
+): ToneMapResult {
 	const pixels = width * height;
 	const out = createRaster(width, height, options.colourSpace ?? 'srgb', channels === 4);
 	const target = out.data;
@@ -92,8 +79,9 @@ export function toneMap(
 	// pixel keeps the highlight that is actually in the picture just short of
 	// clipping; taking it from a constant would clip a bright picture and
 	// leave a dim one looking washed out.
-	let white = 0;
+	let white = 1;
 	if (!options.clip) {
+		white = 0;
 		for (let i = 0; i < pixels; i += 1) {
 			const at = i * channels;
 			const l =
@@ -133,7 +121,21 @@ export function toneMap(
 				: 255;
 	}
 
-	return out;
+	return { image: out, stops: options.stops ?? 0, white };
+}
+
+/**
+ * Tone map a `FloatImage`, which is always four channels.
+ *
+ * What `convert` calls. The four-argument form above stays for the decoders,
+ * which have their samples as a bare buffer and know their own channel count
+ * before they have anywhere to put it.
+ */
+export function toneMapImage(image: FloatImage, options: ToneMapOptions = {}): ToneMapResult {
+	return toneMap(image.data, image.width, image.height, 4, {
+		colourSpace: image.colourSpace,
+		...options,
+	});
 }
 
 /**

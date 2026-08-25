@@ -135,7 +135,7 @@ function render(result: ConvertResult, filename: string, blob: Blob): void {
 		body.append(line);
 	}
 
-	if (result.report.droppedGainMap) {
+	if (result.report.gainMap === 'dropped') {
 		const line = document.createElement('p');
 		line.className = 'result__meta';
 		line.textContent = 'This was an HDR photograph. The result is the standard range version.';

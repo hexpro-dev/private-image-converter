@@ -782,7 +782,7 @@ function assembleFloat(header: PsdHeader, planes: Uint8Array): RasterImage {
 		}
 	}
 
-	return toneMap(source, width, height, outChannels);
+	return toneMap(source, width, height, outChannels).image;
 }
 
 function assemble(

@@ -349,7 +349,9 @@ function toned(
 	channels: 3 | 4,
 	clip = true,
 ): number[] {
-	return Array.from(toneMap(Float32Array.from(values), width, height, channels, { clip }).data);
+	return Array.from(
+		toneMap(Float32Array.from(values), width, height, channels, { clip }).image.data,
+	);
 }
 
 /** A deterministic generator, so a failing block is the same one next run. */

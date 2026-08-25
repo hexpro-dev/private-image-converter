@@ -211,7 +211,7 @@ export async function convert(
 			droppedFrames:
 				sourceAnimation && sourceAnimation.frames.length > 1 && !wroteFrames ? true : undefined,
 			metadata: output.exif ? readExif(output.exif) : undefined,
-			droppedGainMap: output.droppedGainMap,
+			gainMap: output.droppedGainMap ? 'dropped' : undefined,
 			sourceBytes: input.length,
 			outputBytes: bytes.length,
 			decodeMs,
