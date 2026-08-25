@@ -34,8 +34,9 @@
  */
 
 import { DecodeFailedError } from '../../errors.js';
-import { toneMap } from '../../raster/tonemap.js';
-import type { ColourSpace, RasterImage } from '../../types.js';
+import { createFloat } from '../../raster/float.js';
+import { toneMapImage } from '../../raster/tonemap.js';
+import type { ColourSpace, FloatImage, RasterImage } from '../../types.js';
 
 const DECODER_ID = 'hdr-pure';
 
@@ -469,16 +470,6 @@ function readScanline(bytes: Uint8Array, cursor: Cursor, width: number, scan: Ui
 	readOldRle(bytes, cursor, width, scan);
 }
 
-/** Linear light, three floats a pixel, with the top row first. */
-export interface HdrFloatImage {
-	readonly data: Float32Array;
-	readonly width: number;
-	readonly height: number;
-	/** The cumulative `EXPOSURE` the header declared, already divided out of `data`. */
-	readonly exposure: number;
-	readonly colourSpace: ColourSpace;
-}
-
 /**
  * Read a Radiance picture as the linear light it holds.
  *
@@ -486,18 +477,29 @@ export interface HdrFloatImage {
  * one is the file: a caller measuring luminance, or converting to another high
  * dynamic range format, needs the samples and not somebody's idea of an
  * exposure. `decodeHdr` is the picture, for a screen.
+ *
+ * The `EXPOSURE` the header declared is divided back out rather than reported,
+ * because a sample that has been corrected and a factor saying it has not been
+ * are two ways of describing the same picture and only one of them can be
+ * passed to something that does not know this format. What comes back is the
+ * light that was measured.
  */
-export function decodeHdrFloat(bytes: Uint8Array): HdrFloatImage {
+export function decodeHdrFloat(bytes: Uint8Array): FloatImage {
 	const header = readHeader(bytes);
 	const { width, height, flipX, flipY, exposure } = header;
 	const cursor: Cursor = { at: header.pixelsAt };
 
-	let data: Float32Array;
+	let image: FloatImage;
 	try {
-		data = new Float32Array(width * height * 3);
+		// Four channels rather than three, and sixteen bytes a pixel rather than
+		// twelve, because a `FloatImage` is the shape every other high dynamic
+		// range format in this package speaks. A layout of its own would save a
+		// third of the memory and cost a repacking pass at every boundary.
+		image = createFloat(width, height, header.colourSpace, false);
 	} catch (cause) {
 		fail('there is not enough memory here for a picture that size.', { cause });
 	}
+	const data = image.data;
 
 	const scan = new Uint8Array(width * 4);
 	// The samples were multiplied by the exposure when the picture was written,
@@ -510,6 +512,13 @@ export function decodeHdrFloat(bytes: Uint8Array): HdrFloatImage {
 		const y = flipY ? height - 1 - scanline : scanline;
 
 		for (let p = 0; p < width; p += 1) {
+			const x = flipX ? width - 1 - p : p;
+			const to = (y * width + x) * 4;
+			// Radiance has no alpha and nothing here invents one. The column is
+			// filled because a `FloatImage` always carries four, and `hasAlpha`
+			// is what says it carries no information.
+			data[to + 3] = 1;
+
 			const e = scan[p * 4 + 3] as number;
 			// A zero exponent means the pixel is black, and it is a reserved value
 			// rather than a very small one: running the arithmetic on it would
@@ -517,8 +526,6 @@ export function decodeHdrFloat(bytes: Uint8Array): HdrFloatImage {
 			// in the picture would carry a faint value that nothing put there.
 			if (e === 0) continue;
 			const scale = (EXPONENT_SCALE[e] as number) * gain;
-			const x = flipX ? width - 1 - p : p;
-			const to = (y * width + x) * 3;
 			// The half is what the Radiance sources add, and it is not rounding:
 			// a mantissa stands for the range between itself and the next one up,
 			// so the value it means is in the middle of that range. Leaving it out
@@ -530,7 +537,7 @@ export function decodeHdrFloat(bytes: Uint8Array): HdrFloatImage {
 		}
 	}
 
-	return { data, width, height, exposure, colourSpace: header.colourSpace };
+	return image;
 }
 
 /**
@@ -542,6 +549,10 @@ export function decodeHdrFloat(bytes: Uint8Array): HdrFloatImage {
  * nothing here invents one.
  */
 export function decodeHdr(bytes: Uint8Array): RasterImage {
-	const light = decodeHdrFloat(bytes);
-	return toneMap(light.data, light.width, light.height, 3, { colourSpace: light.colourSpace }).image;
+	const picture = toneMapImage(decodeHdrFloat(bytes)).image;
+	// The tone map reports alpha whenever it is handed four channels, and the
+	// fourth column of a Radiance picture is the constant this reader put
+	// there. Saying it carries something would have the next encoder pay to
+	// store a channel the format could not have held in the first place.
+	return { ...picture, hasAlpha: false };
 }

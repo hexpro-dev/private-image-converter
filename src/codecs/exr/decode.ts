@@ -7,6 +7,12 @@
  * the scan line based half of the format, which is what everything writes
  * unless it was asked for tiles, and refuses the rest of the family by name.
  *
+ * There is one reader and two ways out of it. `decodeExrFloat` hands back the
+ * light as the file stored it, which is the measurement and the reason anybody
+ * chose this format; `decodeExr` tone maps that into eight bits, which is a
+ * decision about how a picture should look rather than a decoding step. Every
+ * refusal, every bounds check and every channel is shared between them.
+ *
  * What it reads: version 2 scan line files, UINT, HALF and FLOAT channels in
  * any mixture, NONE, RLE, ZIPS and ZIP compression, a data window anywhere on
  * the plane placed inside the display window that says where the image is,
@@ -33,9 +39,10 @@
  */
 
 import { CodecUnavailableError, DecodeFailedError } from '../../errors.js';
+import { createFloat } from '../../raster/float.js';
 import { blit, createRaster, crop, detectAlpha } from '../../raster/image.js';
-import { halfToFloat, toneMap } from '../../raster/tonemap.js';
-import type { ColourSpace, RasterImage } from '../../types.js';
+import { halfToFloat, toneMapImage } from '../../raster/tonemap.js';
+import type { ColourSpace, FloatImage, RasterImage } from '../../types.js';
 
 const DECODER_ID = 'exr-pure';
 
@@ -675,15 +682,22 @@ function sampleAt(view: DataView, at: number, pixelType: number): number {
  * Alpha is not part of the range question: it is coverage rather than light,
  * and a file whose alpha strays outside 0 to 1 is still a finished frame
  * everywhere that matters.
+ *
+ * Both entry points run this, not only the one that tone maps. The light a
+ * caller asks for is a measurement, so leaving the file's own infinities in it
+ * has an argument behind it, but an infinity is not a measurement of light
+ * either, and whatever meters or encodes that light later is as defenceless
+ * against one as the tone mapper is. Replacing it once, here, is the only way
+ * both paths agree about what the file holds.
  */
-function sanitise(samples: Float32Array, channels: 3 | 4): boolean {
+function sanitise(samples: Float32Array): boolean {
 	let display = true;
 	let largest = 0;
 	let broken = false;
 
 	for (let i = 0; i < samples.length; i += 1) {
 		const value = samples[i] as number;
-		const colour = channels === 3 || i % 4 !== 3;
+		const colour = i % 4 !== 3;
 		if (!Number.isFinite(value)) {
 			broken = true;
 			if (colour) display = false;
@@ -702,7 +716,7 @@ function sanitise(samples: Float32Array, channels: 3 | 4): boolean {
 		for (let i = 0; i < samples.length; i += 1) {
 			const value = samples[i] as number;
 			if (Number.isFinite(value)) continue;
-			const colour = channels === 3 || i % 4 !== 3;
+			const colour = i % 4 !== 3;
 			if (!colour) samples[i] = 1;
 			else samples[i] = value > 0 ? ceiling : 0;
 		}
@@ -771,16 +785,82 @@ function place(pixels: RasterImage, data: Box, display: Box, alpha: boolean): Ra
 	return out;
 }
 
-/* ── Entry point ──────────────────────────────────────────────────────── */
+/**
+ * The same placement, in light rather than in bytes.
+ *
+ * There are two of these rather than one because the raster one runs after the
+ * tone mapping, which is where it has to run for the exposure to be metered on
+ * the pixels the file has rather than on the background around them. Light
+ * never goes through that step, so it is placed here instead, and the two
+ * agree about everything except what a sample is: black is 0 and opaque is 1.
+ */
+function placeFloat(pixels: FloatImage, data: Box, display: Box): FloatImage {
+	if (
+		data.xMin === display.xMin &&
+		data.yMin === display.yMin &&
+		data.xMax === display.xMax &&
+		data.yMax === display.yMax
+	) {
+		return pixels;
+	}
+
+	const out = createFloat(
+		display.xMax - display.xMin + 1,
+		display.yMax - display.yMin + 1,
+		pixels.colourSpace,
+		pixels.hasAlpha,
+	);
+	if (!pixels.hasAlpha) {
+		for (let i = 3; i < out.data.length; i += 4) out.data[i] = 1;
+	}
+
+	const xMin = Math.max(data.xMin, display.xMin);
+	const yMin = Math.max(data.yMin, display.yMin);
+	const xMax = Math.min(data.xMax, display.xMax);
+	const yMax = Math.min(data.yMax, display.yMax);
+	if (xMax < xMin || yMax < yMin) return out;
+
+	const span = (xMax - xMin + 1) * 4;
+	for (let y = yMin; y <= yMax; y += 1) {
+		const from = ((y - data.yMin) * pixels.width + (xMin - data.xMin)) * 4;
+		const to = ((y - display.yMin) * out.width + (xMin - display.xMin)) * 4;
+		out.data.set(pixels.data.subarray(from, from + span), to);
+	}
+	return out;
+}
+
+/* ── Entry points ─────────────────────────────────────────────────────── */
+
+/** Everything the file says, with its pixels as the light they are. */
+interface ExrPixels {
+	/** The data window, four channels, linear and unbounded. */
+	readonly image: FloatImage;
+	readonly dataWindow: Box;
+	readonly displayWindow: Box;
+	/**
+	 * Whether the file carries an A channel, which is not the same question as
+	 * whether anything in it is translucent. It is the channel list that decides
+	 * what the background outside the data window should be, and an encoder
+	 * writing this back out has a reason to keep a channel the file had.
+	 */
+	readonly alpha: boolean;
+	/** Whether every colour sample already sits inside 0 to 1. */
+	readonly clip: boolean;
+}
 
 /**
- * Read a scan line based OpenEXR file.
+ * Read a scan line based OpenEXR file as the light it holds.
+ *
+ * The whole reader, and the only one: the two entry points below differ in what
+ * they do with what comes out of here, not in how they get it. The light is the
+ * file, and reducing it to something a screen can show is a decision about how
+ * a picture should look rather than a decoding step.
  *
  * Asynchronous because ZIP and ZIPS are deflate, and the only deflate here is
  * the platform's own `DecompressionStream`. A NONE or RLE file never waits on
  * anything, but one signature for the format is better than two.
  */
-export async function decodeExr(bytes: Uint8Array): Promise<RasterImage> {
+async function readExr(bytes: Uint8Array): Promise<ExrPixels> {
 	requireBytes(bytes, 0, 8, 'the end of its magic number and version field');
 	for (let i = 0; i < MAGIC.length; i += 1) {
 		if (bytes[i] !== MAGIC[i]) fail('it does not start with the four byte OpenEXR magic number.');
@@ -891,8 +971,15 @@ export async function decodeExr(bytes: Uint8Array): Promise<RasterImage> {
 		fail('its offset table claims more scanline blocks than the rest of the file could hold.');
 	}
 
-	const outChannels: 3 | 4 = alpha ? 4 : 3;
-	const samples = new Float32Array(width * height * outChannels);
+	// Four channels whether or not the file has an A, because that is what a
+	// `FloatImage` is. The alpha column of a file without one is filled with 1
+	// rather than left at 0, which is the difference between an opaque picture
+	// and one that is entirely a hole.
+	const light = createFloat(width, height, colourSpace, alpha);
+	const samples = light.data;
+	if (!alpha) {
+		for (let i = 3; i < samples.length; i += 4) samples[i] = 1;
+	}
 	const seen = new Uint8Array(blocks);
 
 	for (let block = 0; block < blocks; block += 1) {
@@ -926,14 +1013,14 @@ export async function decodeExr(bytes: Uint8Array): Promise<RasterImage> {
 
 		let at = 0;
 		for (let line = 0; line < lines; line += 1) {
-			const row = (y - dataWindow.yMin + line) * width * outChannels;
+			const row = (y - dataWindow.yMin + line) * width * 4;
 			for (let i = 0; i < channels.length; i += 1) {
 				const channel = channels[i] as ExrChannel;
 				const target = targets[i] as number;
 				if (target !== SKIP) {
 					for (let x = 0; x < width; x += 1) {
 						const value = sampleAt(blockView, at + x * channel.sampleBytes, channel.pixelType);
-						const to = row + x * outChannels;
+						const to = row + x * 4;
 						if (target === LUMINANCE) {
 							samples[to] = value;
 							samples[to + 1] = value;
@@ -948,22 +1035,52 @@ export async function decodeExr(bytes: Uint8Array): Promise<RasterImage> {
 		}
 	}
 
-	// Which of the two answers is right is a property of the file rather than a
-	// preference, so the file is asked. An EXR whose colour never leaves 0 to 1
-	// has already had somebody's display transform applied to it, by a
-	// compositor writing a final frame or by a converter promoting an eight bit
-	// image, and rolling its highlights off a second time flattens a picture
-	// that has none left to roll off. Anything above 1 is scene referred, where
-	// 1 is a white surface and the lamp in the same frame is in the thousands,
-	// and clipping that turns every window and every highlight into a flat white
-	// shape. Both mistakes look like a bad photograph rather than like an error.
-	const clip = sanitise(samples, outChannels);
-	const pixels = toneMap(samples, width, height, outChannels, { clip, colourSpace }).image;
-	const image = place(pixels, dataWindow, displayWindow, alpha);
+	// An EXR whose colour never leaves 0 to 1 has already had somebody's display
+	// transform applied to it, by a compositor writing a final frame or by a
+	// converter promoting an eight bit image, and rolling its highlights off a
+	// second time flattens a picture that has none left to roll off. Anything
+	// above 1 is scene referred, where 1 is a white surface and the lamp in the
+	// same frame is in the thousands, and clipping that turns every window and
+	// every highlight into a flat white shape. Both mistakes look like a bad
+	// photograph rather than like an error, so the file is asked rather than
+	// guessed at, and the answer travels with the pixels.
+	const clip = sanitise(samples);
+
+	return { image: light, dataWindow, displayWindow, alpha, clip };
+}
+
+/**
+ * Read a scan line based OpenEXR file as something a screen can show.
+ *
+ * The tone map meters the picture the way a camera would and rolls its
+ * highlights off, so what comes back is a photograph of the scene rather than
+ * the measurement the file holds. Which of the two answers is right is a
+ * property of the file rather than a preference, so the file is asked and
+ * `clip` carries the answer here.
+ */
+export async function decodeExr(bytes: Uint8Array): Promise<RasterImage> {
+	const read = await readExr(bytes);
+	const pixels = toneMapImage(read.image, { clip: read.clip }).image;
+	const image = place(pixels, read.dataWindow, read.displayWindow, read.alpha);
 
 	// An alpha channel that is 1 everywhere is an opaque image, whatever the
 	// channel list says. Saying so lets an encoder write the cheaper form. It
 	// also picks up the other direction: a crop region render out of a file with
 	// an alpha channel is transparent everywhere it was not rendered.
 	return { ...image, hasAlpha: detectAlpha(image) };
+}
+
+/**
+ * Read a scan line based OpenEXR file as the linear light it holds.
+ *
+ * The measurement rather than the photograph, and the reason the format was
+ * chosen: a value of 1 is a diffuse white surface, the lamp in the same frame
+ * is somewhere in the thousands, and nothing here has decided yet how any of
+ * that should look. What a caller does with it is convert to another high
+ * dynamic range format, meter it, or tone map it with an exposure of their own
+ * choosing rather than the one this reader would have picked.
+ */
+export async function decodeExrFloat(bytes: Uint8Array): Promise<FloatImage> {
+	const read = await readExr(bytes);
+	return placeFloat(read.image, read.dataWindow, read.displayWindow);
 }

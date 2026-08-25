@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { decodeExr } from '../../src/codecs/exr/decode.js';
+import { decodeExr, decodeExrFloat } from '../../src/codecs/exr/decode.js';
+import { encodeExr, encodeExrFloat, floatToHalf } from '../../src/codecs/exr/encode.js';
 import { deflate } from '../../src/codecs/png/deflate.js';
-import { CodecUnavailableError, DecodeFailedError } from '../../src/errors.js';
-import { toneMap } from '../../src/raster/tonemap.js';
-import type { RasterImage } from '../../src/types.js';
+import { CodecUnavailableError, DecodeFailedError, EncodeFailedError } from '../../src/errors.js';
+import { halfToFloat, toneMap } from '../../src/raster/tonemap.js';
+import type { ColourSpace, FloatImage, RasterImage } from '../../src/types.js';
 
 /* ── Helpers ──────────────────────────────────────────────────────────── */
 
@@ -1847,5 +1848,621 @@ describe('decodeExr refusals', () => {
 		} finally {
 			vi.unstubAllGlobals();
 		}
+	});
+});
+
+/* ── Reading light ────────────────────────────────────────────────────── */
+
+describe('decodeExrFloat', () => {
+	it('hands back the light the file holds rather than a picture of it', async () => {
+		const file = await buildExr({
+			width: 3,
+			height: 1,
+			channels: [
+				{ name: 'B', values: [0.25, 900, 0.5] },
+				{ name: 'G', values: [0.5, 900, 0.5] },
+				{ name: 'R', values: [0.75, 900, 0.5] },
+			],
+		});
+		const light = await decodeExrFloat(file);
+
+		expect([light.width, light.height]).toEqual([3, 1]);
+		expect(light.colourSpace).toBe('srgb');
+		// Nothing has been metered, rolled off or reduced to eight bits: the
+		// numbers that come back are the numbers the file holds.
+		expect(Array.from(light.data.slice(0, 4))).toEqual([0.75, 0.5, 0.25, 1]);
+		expect(light.data[4]).toBe(900);
+	});
+
+	it('fills the alpha of a file with no A channel rather than leaving it empty', async () => {
+		const file = await buildExr({
+			width: 2,
+			height: 1,
+			channels: [{ name: 'Y', values: [0.25, 0.75] }],
+		});
+		const light = await decodeExrFloat(file);
+
+		expect(light.hasAlpha).toBe(false);
+		// A luminance-only file is neutral grey, and the alpha column is 1
+		// rather than 0, which is the difference between an opaque picture and
+		// one that is entirely a hole.
+		expect(Array.from(light.data)).toEqual([0.25, 0.25, 0.25, 1, 0.75, 0.75, 0.75, 1]);
+	});
+
+	it('keeps an A channel and the coverage in it', async () => {
+		const file = await buildExr({
+			width: 2,
+			height: 1,
+			channels: [
+				{ name: 'A', values: [0.5, 1] },
+				{ name: 'B', values: [0.25, 0.25] },
+				{ name: 'G', values: [0.5, 0.5] },
+				{ name: 'R', values: [0.75, 0.75] },
+			],
+		});
+		const light = await decodeExrFloat(file);
+
+		expect(light.hasAlpha).toBe(true);
+		expect(Array.from(light.data)).toEqual([0.75, 0.5, 0.25, 0.5, 0.75, 0.5, 0.25, 1]);
+	});
+
+	it('reads a Display P3 file as Display P3 without touching its samples', async () => {
+		const file = await buildExr({
+			width: 1,
+			height: 1,
+			extras: [
+				{
+					name: 'chromaticities',
+					type: 'chromaticities',
+					bytes: [0.68, 0.32, 0.265, 0.69, 0.15, 0.06, 0.3127, 0.329].flatMap((value) =>
+						f32(value),
+					),
+				},
+			],
+			channels: [{ name: 'Y', values: [0.5] }],
+		});
+		const light = await decodeExrFloat(file);
+
+		expect(light.colourSpace).toBe('display-p3');
+		expect(light.data[0]).toBe(0.5);
+	});
+
+	it('replaces an infinity and a NaN in the light as well as in the picture', async () => {
+		// Whatever meters or encodes this light later is as defenceless against
+		// an infinity as the tone mapper is, so it is replaced once, in the
+		// reader, and both paths agree about what the file holds.
+		const file = await buildExr({
+			width: 3,
+			height: 1,
+			channels: [{ name: 'Y', type: HALF, raw: true, values: [0x7c00, 0x7e00, 0x3800] }],
+		});
+		const light = await decodeExrFloat(file);
+
+		expect(light.data[0]).toBe(0.5);
+		expect(light.data[4]).toBe(0);
+		expect(light.data[8]).toBe(0.5);
+	});
+
+	it('returns the pixels as they are when the two windows agree', async () => {
+		const file = await buildExr({
+			width: 2,
+			height: 1,
+			channels: [{ name: 'Y', values: [0.25, 0.75] }],
+		});
+
+		expect((await decodeExrFloat(file)).width).toBe(2);
+	});
+
+	it('places a crop region render inside the frame its display window names', async () => {
+		const file = await buildExr({
+			width: 2,
+			height: 1,
+			xMin: 4,
+			yMin: 3,
+			display: [0, 0, 9, 5],
+			channels: [{ name: 'Y', values: [0.25, 0.75] }],
+		});
+		const light = await decodeExrFloat(file);
+
+		expect([light.width, light.height]).toEqual([10, 6]);
+		// The render is where the data window says, and the frame around it is
+		// black and opaque, because the file has no alpha channel to be
+		// transparent in.
+		expect(Array.from(light.data.slice((3 * 10 + 4) * 4, (3 * 10 + 6) * 4))).toEqual([
+			0.25, 0.25, 0.25, 1, 0.75, 0.75, 0.75, 1,
+		]);
+		expect(Array.from(light.data.slice(0, 4))).toEqual([0, 0, 0, 1]);
+	});
+
+	it('leaves the background at nothing where the file has an alpha channel', async () => {
+		const file = await buildExr({
+			width: 2,
+			height: 1,
+			xMin: 4,
+			yMin: 3,
+			display: [0, 0, 9, 5],
+			channels: [
+				{ name: 'A', values: [1, 1] },
+				{ name: 'Y', values: [0.25, 0.75] },
+			],
+		});
+		const light = await decodeExrFloat(file);
+
+		expect(light.hasAlpha).toBe(true);
+		expect(Array.from(light.data.slice(0, 4))).toEqual([0, 0, 0, 0]);
+		expect(light.data[(3 * 10 + 4) * 4 + 3]).toBe(1);
+	});
+
+	it('returns an empty frame for a data window that misses the display window', async () => {
+		const file = await buildExr({
+			width: 2,
+			height: 2,
+			xMin: 40,
+			yMin: 40,
+			display: [0, 0, 2, 1],
+			channels: [{ name: 'Y', values: [0.25, 0.5, 0.75, 1] }],
+		});
+		const light = await decodeExrFloat(file);
+
+		expect([light.width, light.height]).toEqual([3, 2]);
+		expect(Array.from(light.data)).toEqual(Array.from({ length: 6 }, () => [0, 0, 0, 1]).flat());
+	});
+
+	it('refuses a file it cannot read at all, the same way the picture path does', async () => {
+		await expect(decodeExrFloat(Uint8Array.from([1, 2, 3, 4]))).rejects.toBeInstanceOf(
+			DecodeFailedError,
+		);
+	});
+});
+
+/* ── Writing ──────────────────────────────────────────────────────────── */
+
+/** A `FloatImage` from four samples a pixel, so a test can say the light it means. */
+function lightOf(
+	width: number,
+	height: number,
+	samples: readonly number[],
+	hasAlpha = false,
+	colourSpace: ColourSpace = 'srgb',
+): FloatImage {
+	return { data: Float32Array.from(samples), width, height, colourSpace, hasAlpha };
+}
+
+/** The value of one attribute in a written file. Throws when it is not there. */
+function attributeBytes(file: Uint8Array, name: string, type: string): Uint8Array {
+	const at = valueOf(file, name, type);
+	const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+	return file.slice(at, at + view.getUint32(at - 4, true));
+}
+
+/** The channel names a written file declares, in the order it declares them. */
+function namesOf(file: Uint8Array): string[] {
+	const list = attributeBytes(file, 'channels', 'chlist');
+	const names: string[] = [];
+	let at = 0;
+	while (list[at] !== 0) {
+		let name = '';
+		while (list[at] !== 0) {
+			name += String.fromCharCode(list[at] as number);
+			at += 1;
+		}
+		// The terminator, then the sixteen bytes of channel description.
+		at += 17;
+		names.push(name);
+	}
+	return names;
+}
+
+/** A written file's box2i, as the four numbers it holds. */
+function boxOf(file: Uint8Array, name: string): number[] {
+	const value = attributeBytes(file, name, 'box2i');
+	const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+	return [0, 1, 2, 3].map((i) => view.getInt32(i * 4, true));
+}
+
+/**
+ * The scanline blocks a written file carries, found through its offset table.
+ *
+ * `screenWindowWidth` is the last attribute this writer emits, so the table
+ * starts one byte past its value: the byte that ends the attribute list. Going
+ * through the table rather than scanning for the blocks is deliberate, because
+ * a table that pointed anywhere else would give nonsense here.
+ */
+function blocksOf(file: Uint8Array, count: number): { y: number; size: number }[] {
+	const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+	const table = valueOf(file, 'screenWindowWidth', 'float') + 4 + 1;
+	const blocks: { y: number; size: number }[] = [];
+	for (let i = 0; i < count; i += 1) {
+		const at = view.getUint32(table + i * 8, true);
+		blocks.push({ y: view.getInt32(at, true), size: view.getUint32(at + 4, true) });
+	}
+	return blocks;
+}
+
+function compressionOf(file: Uint8Array): number {
+	return attributeBytes(file, 'compression', 'compression')[0] as number;
+}
+
+/** The largest relative difference between two images of the same size. */
+function worstError(wanted: FloatImage, got: FloatImage): number {
+	let worst = 0;
+	for (let i = 0; i < wanted.data.length; i += 1) {
+		const a = wanted.data[i] as number;
+		const b = got.data[i] as number;
+		const error = a === 0 ? Math.abs(b) : Math.abs(b - a) / Math.abs(a);
+		if (error > worst) worst = error;
+	}
+	return worst;
+}
+
+/**
+ * Half bit patterns with as little pattern in them as possible.
+ *
+ * For the one case the format has a rule for: a block deflate cannot shrink is
+ * stored as it is. Every pattern here round trips exactly, the two that would
+ * not being the infinity and the NaN that an exponent of all ones spells.
+ */
+function noiseHalves(count: number): number[] {
+	const out: number[] = [];
+	let state = 0x2545f491;
+	for (let i = 0; i < count; i += 1) {
+		state ^= state << 13;
+		state ^= state >>> 17;
+		state ^= state << 5;
+		state >>>= 0;
+		let bits = state & 0xffff;
+		if ((bits & 0x7c00) === 0x7c00) bits &= 0xfbff;
+		out.push(halfToFloat(bits));
+	}
+	return out;
+}
+
+/** `samples` as opaque pixels, three channels of light and an alpha of 1. */
+function opaque(samples: readonly number[]): number[] {
+	const out: number[] = [];
+	for (let i = 0; i < samples.length; i += 3) {
+		out.push(samples[i] as number, samples[i + 1] as number, samples[i + 2] as number, 1);
+	}
+	return out;
+}
+
+describe('encodeExrFloat', () => {
+	/**
+	 * Eight pixels spread across the range the format exists for, none of them a
+	 * value a half holds exactly.
+	 *
+	 * Every one is between 1e-4 and 65504, which is where a half keeps eleven
+	 * bits of significand and so a relative error under 1e-3. Below that the
+	 * subnormals start and the guarantee is an absolute one instead.
+	 */
+	const spread = [
+		5000, 2500, 10000, 1e-4, 2e-4, 5e-4, 0.18, 0.5, 0.75, 1234.5, 0.0033, 42, 65504, 1, 0.25,
+		2.5e-4, 7e-4, 3.5, 900, 0.011, 1e-3, 0.5, 12.75, 0.002,
+	];
+
+	it('round trips light through half precision', async () => {
+		const image = lightOf(4, 2, opaque(spread));
+		const back = await decodeExrFloat(await encodeExrFloat(image));
+
+		expect([back.width, back.height]).toEqual([4, 2]);
+		// Position by position, so a channel written in the wrong order fails
+		// this as loudly as a value written wrong.
+		expect(worstError(image, back)).toBeLessThan(1e-3);
+	});
+
+	it('keeps a value far above 1 and one near nothing', async () => {
+		// The whole point of the format. Eight bits cannot hold either of these,
+		// and a format that clipped at white would lose the first entirely.
+		const image = lightOf(2, 1, [5000, 5000, 5000, 1, 1e-4, 1e-4, 1e-4, 1]);
+		const back = await decodeExrFloat(await encodeExrFloat(image));
+
+		expect(back.data[0]).toBe(5000);
+		expect(back.data[4]).toBeCloseTo(1e-4, 7);
+	});
+
+	it('keeps negative samples, which are legal in an EXR and ordinary in one', async () => {
+		// A colour outside the destination gamut is stored as a negative, and
+		// every reader expects it back.
+		const image = lightOf(1, 1, [-2.5, -0.5, -1024, 1]);
+		const back = await decodeExrFloat(await encodeExrFloat(image));
+
+		expect(Array.from(back.data)).toEqual([-2.5, -0.5, -1024, 1]);
+	});
+
+	it('writes an A channel when the image has one', async () => {
+		const image = lightOf(2, 1, [0.5, 0.25, 0.75, 0.25, 0.5, 0.25, 0.75, 1], true);
+		const file = await encodeExrFloat(image);
+		const back = await decodeExrFloat(file);
+
+		expect(namesOf(file)).toEqual(['A', 'B', 'G', 'R']);
+		expect(back.hasAlpha).toBe(true);
+		expect(Array.from(back.data)).toEqual([0.5, 0.25, 0.75, 0.25, 0.5, 0.25, 0.75, 1]);
+	});
+
+	it('does not give an opaque image an alpha channel', async () => {
+		const file = await encodeExrFloat(lightOf(1, 1, [0.5, 0.25, 0.75, 1]));
+		const back = await decodeExrFloat(file);
+
+		expect(namesOf(file)).toEqual(['B', 'G', 'R']);
+		expect(back.hasAlpha).toBe(false);
+		expect(Array.from(back.data)).toEqual([0.5, 0.25, 0.75, 1]);
+	});
+
+	it('writes HALF channels, sixteen bytes of description each', async () => {
+		const list = attributeBytes(
+			await encodeExrFloat(lightOf(1, 1, [0.5, 0.5, 0.5, 1])),
+			'channels',
+			'chlist',
+		);
+
+		// 'B', its terminator, then pixel type 1, which is HALF.
+		expect(Array.from(list.slice(0, 6))).toEqual([0x42, 0, 1, 0, 0, 0]);
+		// pLinear and the three bytes the C++ writer pads it out to, then the two
+		// sampling rates. A description of fifteen bytes rather than sixteen
+		// reads as a subsampled file to everything that opens it.
+		expect(Array.from(list.slice(6, 18))).toEqual([0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]);
+		// Which is 0x37, exactly the size libOpenEXR and ffmpeg both write for
+		// three channels in the fixtures above.
+		expect(list.length).toBe(3 * 18 + 1);
+	});
+
+	it('writes a data window that is inclusive at both ends', async () => {
+		// Four by three ends at 3 and 2. One too far is a legal header
+		// describing a picture with a row and a column of whatever followed the
+		// pixels along two of its edges.
+		const file = await encodeExrFloat(lightOf(4, 3, new Array<number>(48).fill(1)));
+		const back = await decodeExrFloat(file);
+
+		expect(boxOf(file, 'dataWindow')).toEqual([0, 0, 3, 2]);
+		expect(boxOf(file, 'displayWindow')).toEqual([0, 0, 3, 2]);
+		expect([back.width, back.height]).toEqual([4, 3]);
+	});
+
+	it('carries the attributes a reader other than this one insists on', async () => {
+		const file = await encodeExrFloat(lightOf(1, 1, [0.5, 0.5, 0.5, 1]));
+
+		// libOpenEXR declines to open a file missing any of these, whatever else
+		// is in it, and this reader never looks at them.
+		expect(Array.from(attributeBytes(file, 'pixelAspectRatio', 'float'))).toEqual([
+			0, 0, 0x80, 0x3f,
+		]);
+		expect(Array.from(attributeBytes(file, 'screenWindowCenter', 'v2f'))).toEqual([
+			0, 0, 0, 0, 0, 0, 0, 0,
+		]);
+		expect(Array.from(attributeBytes(file, 'screenWindowWidth', 'float'))).toEqual([
+			0, 0, 0x80, 0x3f,
+		]);
+		expect(Array.from(attributeBytes(file, 'lineOrder', 'lineOrder'))).toEqual([0]);
+	});
+
+	it('compresses with ZIP and falls back to no compression without a compressor', async () => {
+		// Flat colour, which deflates to nothing, so the difference is the
+		// compression rather than the picture.
+		const image = lightOf(8, 40, opaque(new Array<number>(8 * 40 * 3).fill(0.25)));
+		const zipped = await encodeExrFloat(image);
+
+		vi.stubGlobal('CompressionStream', undefined);
+		let flat: Uint8Array;
+		try {
+			flat = await encodeExrFloat(image);
+		} finally {
+			vi.unstubAllGlobals();
+		}
+
+		expect(compressionOf(zipped)).toBe(3);
+		expect(compressionOf(flat)).toBe(0);
+		expect(zipped.length).toBeLessThan(flat.length);
+		// An uncompressed EXR is always legal, which is what makes the fallback
+		// a fallback rather than a failure.
+		expect(Array.from((await decodeExrFloat(flat)).data)).toEqual(Array.from(image.data));
+		expect(Array.from((await decodeExrFloat(zipped)).data)).toEqual(Array.from(image.data));
+	});
+
+	it('writes one scanline a block without a compressor and sixteen with one', async () => {
+		const image = lightOf(2, 3, opaque(new Array<number>(18).fill(0.5)));
+		const zipped = await encodeExrFloat(image);
+
+		vi.stubGlobal('CompressionStream', undefined);
+		let flat: Uint8Array;
+		try {
+			flat = await encodeExrFloat(image);
+		} finally {
+			vi.unstubAllGlobals();
+		}
+
+		expect(blocksOf(zipped, 1).map((block) => block.y)).toEqual([0]);
+		expect(blocksOf(flat, 3).map((block) => block.y)).toEqual([0, 1, 2]);
+		// Two pixels, three channels, two bytes a sample, and nothing between
+		// them: the pixels of a NO_COMPRESSION block are the block.
+		expect(blocksOf(flat, 3).map((block) => block.size)).toEqual([12, 12, 12]);
+	});
+
+	it('writes a last scanline block shorter than the sixteen rows a block covers', async () => {
+		// Nineteen rows is one full block and three left over, and five across
+		// divides by nothing at all.
+		const image = lightOf(5, 19, opaque(noiseHalves(5 * 19 * 3)));
+		const file = await encodeExrFloat(image);
+		const back = await decodeExrFloat(file);
+
+		expect(blocksOf(file, 2).map((block) => block.y)).toEqual([0, 16]);
+		expect([back.width, back.height]).toEqual([5, 19]);
+		expect(Array.from(back.data)).toEqual(Array.from(image.data));
+	});
+
+	it('stores a block whose compressed form came out no smaller than the pixels', async () => {
+		// The format's own rule rather than an optimisation, and real files hit
+		// it constantly: a row of a render with grain in it does not compress.
+		const image = lightOf(8, 16, opaque(noiseHalves(8 * 16 * 3)));
+		const file = await encodeExrFloat(image);
+		const [block] = blocksOf(file, 1);
+
+		expect(compressionOf(file)).toBe(3);
+		expect(block?.size).toBe(16 * 8 * 3 * 2);
+		expect(Array.from((await decodeExrFloat(file)).data)).toEqual(Array.from(image.data));
+	});
+
+	it('names Display P3 primaries rather than letting them pass for Rec. 709', async () => {
+		const file = await encodeExrFloat(lightOf(1, 1, [0.5, 0.25, 0.75, 1], false, 'display-p3'));
+		const back = await decodeExrFloat(file);
+
+		expect(attributeBytes(file, 'chromaticities', 'chromaticities').length).toBe(32);
+		expect(back.colourSpace).toBe('display-p3');
+		expect(Array.from(back.data)).toEqual([0.5, 0.25, 0.75, 1]);
+	});
+
+	it('leaves the primaries out of an sRGB file, where their absence is the answer', async () => {
+		const file = await encodeExrFloat(lightOf(1, 1, [0.5, 0.5, 0.5, 1]));
+
+		expect(() => attributeBytes(file, 'chromaticities', 'chromaticities')).toThrow();
+		expect((await decodeExrFloat(file)).colourSpace).toBe('srgb');
+	});
+
+	it('writes a file the picture reader reads back as a picture', async () => {
+		const image = await decodeExr(
+			await encodeExrFloat(lightOf(2, 1, [0.25, 0.5, 0.75, 1, 4, 2, 1, 1])),
+		);
+
+		expect([image.width, image.height]).toEqual([2, 1]);
+		expect(image.hasAlpha).toBe(false);
+	});
+
+	it.each([
+		['no width', 0, 1],
+		['no height', 1, 0],
+		['a fractional size', 1.5, 1],
+	])('refuses an image with %s', async (_what, width, height) => {
+		await expect(encodeExrFloat(lightOf(width, height, [0, 0, 0, 1]))).rejects.toThrow(
+			/no width or no height/,
+		);
+	});
+
+	it('refuses an image with more pixels than it will allocate for', async () => {
+		await expect(encodeExrFloat(lightOf(100000, 100000, []))).rejects.toThrow(/more pixels/);
+	});
+
+	it('refuses a pixel buffer smaller than the width and height say', async () => {
+		await expect(encodeExrFloat(lightOf(4, 4, [0, 0, 0, 1]))).rejects.toBeInstanceOf(
+			EncodeFailedError,
+		);
+	});
+});
+
+describe('encodeExr', () => {
+	function raster(
+		width: number,
+		height: number,
+		bytes: readonly number[],
+		hasAlpha = false,
+	): RasterImage {
+		return {
+			data: Uint8ClampedArray.from(bytes),
+			width,
+			height,
+			colourSpace: 'srgb',
+			hasAlpha,
+		};
+	}
+
+	it('undoes the sRGB curve on the way in', async () => {
+		// The mistake this format invites: byte 128 is a fifth of the light a
+		// white surface reflects, not half of it. Writing 0.502 gives a file that
+		// opens, looks recognisable and is about a stop out.
+		const back = await decodeExrFloat(await encodeExr(raster(1, 1, [128, 128, 128, 255])));
+
+		expect(back.data[0]).toBeCloseTo(0.2159, 3);
+		expect(back.data[0]).not.toBeCloseTo(0.502, 2);
+	});
+
+	it('writes black and white where they belong', async () => {
+		const back = await decodeExrFloat(
+			await encodeExr(raster(2, 1, [0, 0, 0, 255, 255, 255, 255, 255])),
+		);
+
+		expect(Array.from(back.data)).toEqual([0, 0, 0, 1, 1, 1, 1, 1]);
+	});
+
+	it('carries the alpha of a translucent raster', async () => {
+		const back = await decodeExrFloat(await encodeExr(raster(1, 1, [255, 0, 0, 128], true)));
+
+		expect(back.hasAlpha).toBe(true);
+		expect(back.data[0]).toBe(1);
+		expect(back.data[3]).toBeCloseTo(128 / 255, 3);
+	});
+
+	it('refuses an image with no pixels in it', async () => {
+		await expect(encodeExr(raster(0, 0, []))).rejects.toThrow(/no width or no height/);
+	});
+
+	it('refuses a huge image before converting it rather than after', async () => {
+		// The conversion allocates four floats a pixel from the width and height
+		// it is handed, so a check afterwards is a check the allocator gets to
+		// make first.
+		await expect(encodeExr(raster(65536, 65536, []))).rejects.toThrow(/more pixels/);
+	});
+});
+
+/* ── Half precision ───────────────────────────────────────────────────── */
+
+describe('floatToHalf', () => {
+	function round(value: number): number {
+		return halfToFloat(floatToHalf(value));
+	}
+
+	it('keeps a value a half can hold exactly', () => {
+		for (const value of [0, 1, -1, 0.5, 2048, -1024, 65504, 6.103515625e-5]) {
+			expect(round(value)).toBe(value);
+		}
+	});
+
+	it('keeps the sign of a negative zero', () => {
+		expect(floatToHalf(-0)).toBe(0x8000);
+		expect(Object.is(round(-0), -0)).toBe(true);
+	});
+
+	it('rounds a subnormal rather than flushing it to zero', () => {
+		// The darkest part of a render lives down here, and rounding it away is
+		// the difference between a shadow with detail in it and a black hole.
+		expect(floatToHalf(2 ** -24)).toBe(1);
+		expect(round(2 ** -24 * 700)).toBe(2 ** -24 * 700);
+	});
+
+	it('ties a subnormal to even', () => {
+		expect(floatToHalf(2 ** -25)).toBe(0);
+		expect(floatToHalf(2 ** -24 * 1.5)).toBe(2);
+		expect(floatToHalf(2 ** -24 * 2.5)).toBe(2);
+		expect(floatToHalf(2 ** -24 * 1.6)).toBe(2);
+		expect(floatToHalf(2 ** -24 * 1.4)).toBe(1);
+	});
+
+	it('ties a normal to even', () => {
+		// Truncating instead would bias every picture dark by half a step of
+		// whatever exponent it happened to sit in.
+		expect(floatToHalf(1 + 2 ** -11)).toBe(0x3c00);
+		expect(floatToHalf(1 + 3 * 2 ** -11)).toBe(0x3c02);
+		expect(floatToHalf(1 + 2 ** -11 + 2 ** -23)).toBe(0x3c01);
+		expect(floatToHalf(1 + 2 ** -12)).toBe(0x3c00);
+	});
+
+	it('overflows to infinity rather than wrapping to a small number', () => {
+		expect(floatToHalf(70000)).toBe(0x7c00);
+		expect(floatToHalf(-70000)).toBe(0xfc00);
+		// The overflow that arrives by rounding: halfway between the largest
+		// half and what would come after it, so the carry runs out of the
+		// mantissa and into the exponent, which is exactly right.
+		expect(floatToHalf(65520)).toBe(0x7c00);
+		expect(floatToHalf(65519)).toBe(0x7bff);
+	});
+
+	it('keeps an infinity and a NaN', () => {
+		expect(floatToHalf(Infinity)).toBe(0x7c00);
+		expect(floatToHalf(-Infinity)).toBe(0xfc00);
+		expect(Number.isNaN(round(NaN))).toBe(true);
+	});
+
+	it('takes a value below the smallest subnormal to zero', () => {
+		expect(floatToHalf(1e-9)).toBe(0);
+		expect(floatToHalf(-1e-9)).toBe(0x8000);
+		// A float that was itself subnormal is far below anything a half holds.
+		expect(floatToHalf(1e-42)).toBe(0);
 	});
 });

@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import { decodeHdr, decodeHdrFloat } from '../../src/codecs/hdr/decode.js';
-import { encodeHdr } from '../../src/codecs/hdr/encode.js';
+import { encodeHdr, encodeHdrFloat } from '../../src/codecs/hdr/encode.js';
 import { DecodeFailedError, EncodeFailedError } from '../../src/errors.js';
+import { createFloat } from '../../src/raster/float.js';
 import { createRaster } from '../../src/raster/image.js';
-import type { ColourSpace, RasterImage } from '../../src/types.js';
+import type { ColourSpace, FloatImage, RasterImage } from '../../src/types.js';
 
 /* ── Helpers ──────────────────────────────────────────────────────────── */
 
@@ -110,7 +111,7 @@ function expectPixel(
 	y: number,
 	rgb: readonly number[],
 ): void {
-	const at = (y * image.width + x) * 3;
+	const at = (y * image.width + x) * 4;
 	expectClose(image.data[at] as number, rgb[0] as number);
 	expectClose(image.data[at + 1] as number, rgb[1] as number);
 	expectClose(image.data[at + 2] as number, rgb[2] as number);
@@ -131,6 +132,31 @@ function raster(
 ): RasterImage {
 	const image = createRaster(width, height, colourSpace, hasAlpha);
 	image.data.set(pixels);
+	return image;
+}
+
+/** A picture as light, from raw RGBA quadruples. Nothing here is curved. */
+function light(
+	width: number,
+	height: number,
+	pixels: readonly number[],
+	hasAlpha = false,
+	colourSpace: ColourSpace = 'srgb',
+): FloatImage {
+	const image = createFloat(width, height, colourSpace, hasAlpha);
+	image.data.set(pixels);
+	return image;
+}
+
+/** One colour repeated, opaque, which is what most of the encoder tests want. */
+function flatLight(
+	width: number,
+	height: number,
+	rgb: readonly [number, number, number],
+	colourSpace: ColourSpace = 'srgb',
+): FloatImage {
+	const image = createFloat(width, height, colourSpace, false);
+	for (let i = 0; i < width * height; i += 1) image.data.set([rgb[0], rgb[1], rgb[2], 1], i * 4);
 	return image;
 }
 
@@ -166,7 +192,6 @@ describe('decodeHdrFloat headers', () => {
 
 		expect(image.width).toBe(1);
 		expect(image.height).toBe(1);
-		expect(image.exposure).toBe(1);
 		expect(image.colourSpace).toBe('srgb');
 		expectPixel(image, 0, 0, [sampleOf(128, 129), sampleOf(64, 129), sampleOf(32, 129)]);
 	});
@@ -236,7 +261,6 @@ describe('decodeHdrFloat headers', () => {
 		});
 		const image = decodeHdrFloat(file);
 
-		expect(image.exposure).toBe(4);
 		expectPixel(image, 0, 0, [
 			sampleOf(128, 129) / 4,
 			sampleOf(64, 129) / 4,
@@ -255,7 +279,11 @@ describe('decodeHdrFloat headers', () => {
 		// Each tool that changed the exposure appended its own line, so the
 		// picture was multiplied by all of them and recovering it divides by all
 		// of them. Taking only the last would be out by a factor of two here.
-		expect(decodeHdrFloat(file).exposure).toBe(10);
+		expectPixel(decodeHdrFloat(file), 0, 0, [
+			sampleOf(128, 129) / 10,
+			sampleOf(64, 129) / 10,
+			sampleOf(32, 129) / 10,
+		]);
 	});
 
 	it('accepts the corrections that say nothing was corrected', () => {
@@ -324,8 +352,9 @@ describe('decodeHdrFloat samples', () => {
 		const image = decodeHdrFloat(file);
 
 		// Reserved, not merely small. Running the arithmetic on it would light
-		// every unlit pixel in the picture.
-		expect(Array.from(image.data)).toEqual([0, 0, 0]);
+		// every unlit pixel in the picture. The fourth number is the alpha the
+		// format cannot store, which is opaque for every pixel there is.
+		expect(Array.from(image.data)).toEqual([0, 0, 0, 1]);
 	});
 
 	it('adds the half a mantissa stands for, so a zero mantissa is not zero', () => {
@@ -356,7 +385,7 @@ describe('decodeHdrFloat samples', () => {
 		// what comes back is a subnormal and carries about ten bits rather than
 		// twenty four. It is still the right number to a part in a thousand, and
 		// it is nine orders of magnitude below anything a screen can show.
-		expectClose(image.data[3] as number, sampleOf(1, 1), 1e-3);
+		expectClose(image.data[4] as number, sampleOf(1, 1), 1e-3);
 		expect(image.data.every((value) => Number.isFinite(value))).toBe(true);
 	});
 });
@@ -401,9 +430,9 @@ describe('decodeHdrFloat scanlines', () => {
 		const image = decodeHdrFloat(file);
 
 		expectClose(image.data[0] as number, sampleOf(10, 128));
-		expectClose(image.data[3] as number, sampleOf(20, 128));
-		expectClose(image.data[6] as number, sampleOf(30, 128));
-		expectClose(image.data[9] as number, sampleOf(40, 128));
+		expectClose(image.data[4] as number, sampleOf(20, 128));
+		expectClose(image.data[8] as number, sampleOf(30, 128));
+		expectClose(image.data[12] as number, sampleOf(40, 128));
 	});
 
 	it('reads a compressed scanline made of literals', () => {
@@ -459,10 +488,10 @@ describe('decodeHdrFloat scanlines', () => {
 		const image = decodeHdrFloat(file);
 
 		expectClose(image.data[0] as number, sampleOf(7, 128));
-		expectClose(image.data[12] as number, sampleOf(7, 128));
-		expectClose(image.data[15] as number, sampleOf(1, 128));
-		expectClose(image.data[18] as number, sampleOf(2, 128));
-		expectClose(image.data[21] as number, sampleOf(3, 128));
+		expectClose(image.data[16] as number, sampleOf(7, 128));
+		expectClose(image.data[20] as number, sampleOf(1, 128));
+		expectClose(image.data[24] as number, sampleOf(2, 128));
+		expectClose(image.data[28] as number, sampleOf(3, 128));
 	});
 
 	it('reads a literal of exactly 128, which is not a run of nothing', () => {
@@ -478,7 +507,7 @@ describe('decodeHdrFloat scanlines', () => {
 		const image = decodeHdrFloat(buildHdr({ width, height: 1, payload }));
 
 		expectClose(image.data[0] as number, sampleOf(0, 128));
-		expectClose(image.data[(width - 1) * 3] as number, sampleOf(127, 128));
+		expectClose(image.data[(width - 1) * 4] as number, sampleOf(127, 128));
 	});
 
 	it('reads the longest run there is, which is 127 rather than 128', () => {
@@ -493,9 +522,9 @@ describe('decodeHdrFloat scanlines', () => {
 		const image = decodeHdrFloat(buildHdr({ width, height: 1, payload }));
 
 		expectClose(image.data[0] as number, sampleOf(9, 128));
-		expectClose(image.data[126 * 3] as number, sampleOf(9, 128));
-		expectClose(image.data[127 * 3] as number, sampleOf(1, 128));
-		expectClose(image.data[129 * 3] as number, sampleOf(3, 128));
+		expectClose(image.data[126 * 4] as number, sampleOf(9, 128));
+		expectClose(image.data[127 * 4] as number, sampleOf(1, 128));
+		expectClose(image.data[129 * 4] as number, sampleOf(3, 128));
 	});
 
 	it('reads a wide picture as several compressed scanlines', () => {
@@ -505,8 +534,8 @@ describe('decodeHdrFloat scanlines', () => {
 		);
 
 		expectClose(image.data[0] as number, sampleOf(10, 128));
-		expectClose(image.data[8 * 3] as number, sampleOf(20, 128));
-		expectClose(image.data[16 * 3] as number, sampleOf(30, 128));
+		expectClose(image.data[8 * 4] as number, sampleOf(20, 128));
+		expectClose(image.data[16 * 4] as number, sampleOf(30, 128));
 	});
 
 	it('reads a repeat marker as the pixel before it, over again', () => {
@@ -620,8 +649,8 @@ describe('decodeHdrFloat scanlines', () => {
 		const image = decodeHdrFloat(file);
 
 		expectClose(image.data[0] as number, sampleOf(11, 128));
-		expectClose(image.data[8 * 3] as number, sampleOf(22, 128));
-		expectClose(image.data[15 * 3] as number, sampleOf(22, 128));
+		expectClose(image.data[8 * 4] as number, sampleOf(22, 128));
+		expectClose(image.data[15 * 4] as number, sampleOf(22, 128));
 	});
 
 	it('ignores bytes after the last scanline', () => {
@@ -667,7 +696,7 @@ describe('decodeHdrFloat orientation', () => {
 		for (let i = 0; i < 4; i += 1) {
 			// Undo the sample arithmetic to get the mantissa back, which is what
 			// says where each pixel landed.
-			out.push(Math.round((image.data[i * 3] as number) / 2 ** (128 - 136) - 0.5));
+			out.push(Math.round((image.data[i * 4] as number) / 2 ** (128 - 136) - 0.5));
 		}
 		return out;
 	}
@@ -988,6 +1017,201 @@ describe('encodeHdr', () => {
 	});
 });
 
+describe('encodeHdrFloat', () => {
+	it('writes the whole of a one pixel file byte for byte', () => {
+		const out = encodeHdrFloat(flatLight(1, 1, [1, 1, 1]));
+
+		// A diffuse white surface is 1 in light and 255 on a screen, so the two
+		// entry points agree here and nowhere else in this block.
+		expect(textOf(out)).toBe('#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1\n\x80\x80\x80\x81');
+	});
+
+	it('undoes the curve on bytes and leaves light alone, so both write the same grey', () => {
+		// Every eight bit level through both routes at once: the byte path undoing
+		// the sRGB curve, the float path handed exactly what that curve produces.
+		// A curve applied on one side and not the other, or applied twice on one,
+		// separates the two files, so this one comparison covers both mistakes.
+		const bytes = createRaster(256, 1, 'srgb', false);
+		const samples = createFloat(256, 1, 'srgb', false);
+		for (let x = 0; x < 256; x += 1) {
+			bytes.data.set([x, x, x, 255], x * 4);
+			const level = toLinear(x);
+			samples.data.set([level, level, level, 1], x * 4);
+		}
+
+		expect(Array.from(encodeHdrFloat(samples))).toEqual(Array.from(encodeHdr(bytes)));
+	});
+
+	it('does not put a curve back on light that is already linear', () => {
+		// Half the light is not the byte 128, which is a fifth of it. The two
+		// files differing here is the reason the second entry point exists.
+		const half = splitHdr(encodeHdrFloat(flatLight(1, 1, [0.5, 0.5, 0.5])));
+		const grey = splitHdr(encodeHdr(raster(1, 1, [128, 128, 128, 255])));
+
+		expect(half.payload).toEqual([128, 128, 128, 128]);
+		expect(grey.payload).toEqual([221, 221, 221, 126]);
+	});
+
+	it('writes a sample no eight bit picture could have held', () => {
+		const { payload } = splitHdr(encodeHdrFloat(flatLight(1, 1, [5000, 5000, 5000])));
+
+		// 5000 is between 2^12 and 2^13, so the exponent is 13 and the mantissa is
+		// 5000 scaled into it. An encoder that clamped at white would write the
+		// exponent 129 here and lose four stops of sky.
+		expect(payload).toEqual([156, 156, 156, 141]);
+	});
+
+	it('shares one exponent across the three channels', () => {
+		const { payload } = splitHdr(encodeHdrFloat(flatLight(1, 1, [4, 1, 0])));
+
+		expect(payload).toEqual([128, 32, 0, 131]);
+	});
+
+	it('writes anything at or under the black threshold as four zero bytes', () => {
+		expect(splitHdr(encodeHdrFloat(flatLight(1, 1, [0, 0, 0]))).payload).toEqual([0, 0, 0, 0]);
+		expect(splitHdr(encodeHdrFloat(flatLight(1, 1, [1e-33, 0, 0]))).payload).toEqual([0, 0, 0, 0]);
+	});
+
+	it('pins an infinity to the brightest pixel the format can spell', () => {
+		// An EXR carries an infinity wherever a light was divided by zero. Left
+		// alone it drives the exponent past the byte it lives in and every one of
+		// the four bytes lands on zero, so the brightest thing in the picture
+		// comes back as a hole in it.
+		const { payload } = splitHdr(encodeHdrFloat(light(1, 1, [Infinity, 0, 0, 1])));
+
+		expect(payload).toEqual([255, 0, 0, 255]);
+	});
+
+	it('writes a NaN as black, it never having been a measurement', () => {
+		const { payload } = splitHdr(encodeHdrFloat(light(1, 1, [Number.NaN, Number.NaN, 1, 1])));
+
+		// The NaN channels go out at zero and the one real channel keeps its own
+		// value, rather than the whole pixel being lost to the one bad number.
+		expect(payload).toEqual([0, 0, 128, 129]);
+	});
+
+	it('writes a negative sample as black, there being no sign bit for it', () => {
+		// A colour matrixed out of a wider gamut comes out negative in whichever
+		// channel it does not fit in.
+		const { payload } = splitHdr(encodeHdrFloat(light(1, 1, [-0.4, 0.5, 0, 1])));
+
+		expect(payload).toEqual([0, 128, 0, 128]);
+	});
+
+	it('gives back a legal file when every pixel in it is unwritable', () => {
+		const nasty = light(8, 1, [], false);
+		for (let x = 0; x < 8; x += 1) {
+			nasty.data.set([Infinity, Number.NaN, -1, 1], x * 4);
+		}
+		const back = decodeHdrFloat(encodeHdrFloat(nasty));
+
+		expect(back.width).toBe(8);
+		expect(back.data.every((value) => Number.isFinite(value))).toBe(true);
+		expect(back.data[0] as number).toBeGreaterThan(1e38);
+		// The half a mantissa the reader adds back is all that is left of the two
+		// channels that had nothing legal in them.
+		expect(back.data[1] as number).toBeLessThan((back.data[0] as number) / 256);
+	});
+
+	it('writes a scanline of eight or more as runs', () => {
+		const { payload } = splitHdr(encodeHdrFloat(flatLight(8, 1, [1, 1, 1])));
+
+		expect(payload).toEqual([2, 2, 0, 8, 136, 128, 136, 128, 136, 128, 136, 129]);
+	});
+
+	it('writes samples that do not repeat as literals', () => {
+		const image = createFloat(8, 1, 'srgb', false);
+		for (let x = 0; x < 8; x += 1) image.data.set([1, (x + 1) / 16, 0, 1], x * 4);
+		const { payload } = splitHdr(encodeHdrFloat(image));
+
+		expect(payload.slice(0, 4)).toEqual([2, 2, 0, 8]);
+		expect(payload[4]).toBe(136); // red, one run of eight
+		expect(payload[6]).toBe(8); // green, eight literals
+	});
+
+	it('writes the widths the compressed encoding is not legal at flat', () => {
+		// Below eight the four byte header would be read as a pixel, and above
+		// 32767 the width does not fit in the two bytes the header has for it.
+		const narrow = splitHdr(encodeHdrFloat(flatLight(7, 1, [1, 1, 1])));
+		const wide = splitHdr(encodeHdrFloat(flatLight(32768, 1, [1, 1, 1])));
+
+		expect(narrow.payload.length).toBe(7 * 4);
+		expect(narrow.payload.slice(0, 4)).toEqual([128, 128, 128, 129]);
+		expect(wide.payload.length).toBe(32768 * 4);
+		expect(wide.payload.slice(0, 4)).toEqual([128, 128, 128, 129]);
+	});
+
+	it('compresses the widest scanline the encoding is legal at', () => {
+		const { payload } = splitHdr(encodeHdrFloat(flatLight(32767, 1, [1, 1, 1])));
+
+		// The width goes in the third and fourth bytes of the header, which is
+		// where 32767 is the last value that fits.
+		expect(payload.slice(0, 4)).toEqual([2, 2, 0x7f, 0xff]);
+		expect(payload.length).toBeLessThan(32767 * 4);
+	});
+
+	it('writes one scanline for every row, from the top down', () => {
+		const out = encodeHdrFloat(light(1, 2, [1, 1, 1, 1, 0, 0, 0, 1]));
+
+		expect(splitHdr(out).payload).toEqual([128, 128, 128, 129, 0, 0, 0, 0]);
+	});
+
+	it('never writes the three mantissas that mean "repeat" into a flat scanline', () => {
+		// A sample a hair under a power of two encodes to 255 in all three
+		// channels, which in an uncompressed scanline is not a pixel at all but
+		// the marker that repeats the pixel before it.
+		const almost = 1 - 2 ** -12;
+		const { payload } = splitHdr(encodeHdrFloat(flatLight(4, 1, [almost, almost, almost])));
+
+		expect(payload.slice(0, 4)).toEqual([254, 254, 254, 128]);
+		expect(decodeHdrFloat(encodeHdrFloat(flatLight(4, 1, [almost, almost, almost]))).width).toBe(4);
+	});
+
+	it('composites a translucent pixel onto white by default', () => {
+		const out = encodeHdrFloat(light(1, 1, [0, 0, 0, 0], true));
+
+		expect(splitHdr(out).payload).toEqual([128, 128, 128, 129]);
+	});
+
+	it('composites onto the background it was given, in light rather than in bytes', () => {
+		// The background arrives as display bytes, so it goes through the curve
+		// before it is mixed with samples that are already linear. Mixed as bytes
+		// it would land at twice the light it is.
+		const out = encodeHdrFloat(light(1, 1, [0, 0, 0, 0], true), { background: [128, 128, 128] });
+		const { payload } = splitHdr(out);
+
+		expect(payload).toEqual([221, 221, 221, 126]);
+		expectClose(sampleOf(221, 126), toLinear(128), 0.005);
+	});
+
+	it('ignores the alpha column of an image that says it carries none', () => {
+		// A `FloatImage` fresh from `createFloat` has zero in every alpha slot and
+		// says it is opaque. Compositing those would write the background.
+		const image = createFloat(1, 1, 'srgb', false);
+		image.data.set([1, 1, 1, 0]);
+
+		expect(splitHdr(encodeHdrFloat(image)).payload).toEqual([128, 128, 128, 129]);
+	});
+
+	it('says so in the header when the numbers are Display P3', () => {
+		const out = encodeHdrFloat(flatLight(1, 1, [1, 1, 1], 'display-p3'));
+
+		expect(splitHdr(out).header).toContain('PRIMARIES=0.680 0.320 0.265 0.690 0.150 0.060');
+		expect(decodeHdrFloat(out).colourSpace).toBe('display-p3');
+	});
+
+	it('writes no primaries line for an ordinary sRGB picture', () => {
+		expect(splitHdr(encodeHdrFloat(flatLight(1, 1, [1, 1, 1]))).header).not.toContain('PRIMARIES');
+	});
+
+	it('ignores the quality setting, there being nothing lossy to steer', () => {
+		const low = encodeHdrFloat(flatLight(2, 1, [3, 2, 1]), { quality: 0.1 });
+		const high = encodeHdrFloat(flatLight(2, 1, [3, 2, 1]), { quality: 1 });
+
+		expect(Array.from(low)).toEqual(Array.from(high));
+	});
+});
+
 /* ── Round trips ──────────────────────────────────────────────────────── */
 
 describe('HDR round trips', () => {
@@ -1017,7 +1241,7 @@ describe('HDR round trips', () => {
 			const brightest = Math.max(...source);
 			for (let channel = 0; channel < 3; channel += 1) {
 				const difference = Math.abs(
-					(back.data[i * 3 + channel] as number) - (source[channel] as number),
+					(back.data[i * 4 + channel] as number) - (source[channel] as number),
 				);
 				expect(difference).toBeLessThanOrEqual(brightest / 256 + 1e-9);
 			}
@@ -1055,7 +1279,7 @@ describe('HDR round trips', () => {
 	it('keeps black exactly black', () => {
 		const back = decodeHdrFloat(encodeHdr(raster(8, 1, new Array<number>(32).fill(0))));
 
-		expect(Array.from(back.data)).toEqual(new Array<number>(24).fill(0));
+		expect(Array.from(back.data)).toEqual(Array.from({ length: 8 }, () => [0, 0, 0, 1]).flat());
 	});
 
 	it('writes a picture wider than the compressed encoding allows, and reads it back', () => {
@@ -1070,7 +1294,7 @@ describe('HDR round trips', () => {
 		expect(splitHdr(file).payload.length).toBe(width * 4);
 		const back = decodeHdrFloat(file);
 		expect(back.width).toBe(width);
-		expectClose(back.data[3 * 100] as number, toLinear(100), 0.02);
+		expectClose(back.data[4 * 100] as number, toLinear(100), 0.02);
 	});
 
 	it('settles after one pass, because the tone map has metered it by then', () => {
@@ -1097,6 +1321,112 @@ describe('HDR round trips', () => {
 		});
 
 		expect(decodeHdr(encodeHdr(image)).colourSpace).toBe('display-p3');
+	});
+});
+
+describe('HDR float round trips', () => {
+	/**
+	 * How far a sample may move through the float path.
+	 *
+	 * The three channels of a pixel share one exponent, so the step between one
+	 * mantissa and the next is a 256th of the brightest of them, and the reader
+	 * lands in the middle of a step. That is the whole loss, and it is relative:
+	 * it is the same fraction at 1e-4 as at 1e4, which is the property eight
+	 * bits a channel does not have and the reason this path exists.
+	 */
+	function expectFloatRoundTrip(image: FloatImage): void {
+		const back = decodeHdrFloat(encodeHdrFloat(image));
+
+		expect(back.width).toBe(image.width);
+		expect(back.height).toBe(image.height);
+		expect(back.hasAlpha).toBe(false);
+
+		for (let i = 0; i < image.width * image.height; i += 1) {
+			const source = [
+				image.data[i * 4] as number,
+				image.data[i * 4 + 1] as number,
+				image.data[i * 4 + 2] as number,
+			];
+			const brightest = Math.max(...source);
+			for (let channel = 0; channel < 3; channel += 1) {
+				const difference = Math.abs(
+					(back.data[i * 4 + channel] as number) - (source[channel] as number),
+				);
+				expect(difference).toBeLessThanOrEqual(brightest / 256 + 1e-9);
+			}
+		}
+	}
+
+	it('carries a sample of 5000 back as 5000 rather than as white', () => {
+		// The test the whole float path exists for. Through the eight bit
+		// entry point this pixel is clipped to 1 and four stops of it are gone;
+		// here it comes back inside RGBE's own mantissa precision.
+		const back = decodeHdrFloat(encodeHdrFloat(flatLight(8, 1, [5000, 5000, 5000])));
+		const value = back.data[0] as number;
+
+		expect(value).toBeGreaterThan(4000);
+		expect(Math.abs(value - 5000) / 5000).toBeLessThanOrEqual(1 / 256);
+	});
+
+	it('carries eight decades in one picture, both ends at the same accuracy', () => {
+		const image = flatLight(8, 1, [1, 1, 1]);
+		image.data.set([1e-4, 1e-4, 1e-4, 1], 0);
+		image.data.set([1e4, 1e4, 1e4, 1], 4);
+		const back = decodeHdrFloat(encodeHdrFloat(image));
+
+		// A shared exponent per pixel rather than one for the picture is what
+		// makes these two survive together. A format with a single scale would
+		// have to give up one end or the other.
+		expect(Math.abs((back.data[0] as number) - 1e-4) / 1e-4).toBeLessThanOrEqual(1 / 256);
+		expect(Math.abs((back.data[4] as number) - 1e4) / 1e4).toBeLessThanOrEqual(1 / 256);
+	});
+
+	it.each([
+		[1, 1],
+		[7, 1],
+		[8, 1],
+		[9, 3],
+		[16, 16],
+		[130, 2],
+	])('carries a %i by %i picture of light through within half a mantissa step', (width, height) => {
+		const image = createFloat(width, height, 'srgb', false);
+		let state = 0x2545f491;
+		for (let i = 0; i < width * height; i += 1) {
+			for (let channel = 0; channel < 3; channel += 1) {
+				state = (state * 1103515245 + 12345) & 0x7fffffff;
+				// Spread over ten decades, so no run of pixels shares an exponent
+				// and every scanline is a mixture of runs and literals.
+				image.data[i * 4 + channel] = 10 ** (((state >> 12) % 1000) / 100 - 5);
+			}
+			image.data[i * 4 + 3] = 1;
+		}
+
+		expectFloatRoundTrip(image);
+	});
+
+	it('keeps black exactly black', () => {
+		const back = decodeHdrFloat(encodeHdrFloat(flatLight(8, 1, [0, 0, 0])));
+
+		expect(Array.from(back.data)).toEqual(Array.from({ length: 8 }, () => [0, 0, 0, 1]).flat());
+	});
+
+	it('carries a Display P3 picture through as Display P3', () => {
+		const back = decodeHdrFloat(encodeHdrFloat(flatLight(8, 1, [2, 1, 0.5], 'display-p3')));
+
+		expect(back.colourSpace).toBe('display-p3');
+		expectClose(back.data[0] as number, 2, 1 / 256);
+	});
+
+	it('settles after one pass, the second file being the first one again', () => {
+		// Unlike the eight bit path there is nothing to meter and nothing to
+		// clip, so the only loss is the mantissa and it happens once. Writing
+		// what came back has to produce the same bytes, or something in the
+		// middle is still making a decision it should not be.
+		const image = flatLight(16, 2, [1200, 0.004, 3]);
+		const once = encodeHdrFloat(image);
+		const twice = encodeHdrFloat(decodeHdrFloat(once));
+
+		expect(Array.from(twice)).toEqual(Array.from(once));
 	});
 });
 
@@ -1400,5 +1730,120 @@ describe('encodeHdr refusals', () => {
 			hasAlpha: false,
 		};
 		expectRefusal(short, /smaller than the width and height/);
+	});
+});
+
+describe('encodeHdrFloat refusals', () => {
+	function expectRefusal(image: FloatImage, pattern: RegExp): void {
+		let thrown: unknown;
+		try {
+			encodeHdrFloat(image);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(EncodeFailedError);
+		const error = thrown as EncodeFailedError;
+		expect(error.code).toBe('encode/failed');
+		expect(error.format).toBe('hdr');
+		expect(error.message).toMatch(pattern);
+		expect(error.message.endsWith('.')).toBe(true);
+	}
+
+	it('refuses an image with no pixels', () => {
+		expectRefusal(createFloat(0, 0), /no width or no height/);
+	});
+
+	it('refuses a fractional size', () => {
+		const odd: FloatImage = {
+			data: new Float32Array(16),
+			width: 1.5,
+			height: 1,
+			colourSpace: 'srgb',
+			hasAlpha: false,
+		};
+		expectRefusal(odd, /no width or no height/);
+	});
+
+	it('refuses a sample buffer shorter than its own dimensions', () => {
+		const short: FloatImage = {
+			data: new Float32Array(8),
+			width: 4,
+			height: 4,
+			colourSpace: 'srgb',
+			hasAlpha: false,
+		};
+		expectRefusal(short, /smaller than the width and height/);
+	});
+});
+
+/* ── Values at the edges of the maths ─────────────────────────────────── */
+
+describe('the clamps that only bite on out of range input', () => {
+	it('picks the right exponent on exact powers of two and either side of them', () => {
+		// `Math.ceil(Math.log2(v))` is off by one in both directions near a
+		// power of two, because log2 of an exact power can land a hair above or
+		// below the integer. Both corrections are needed and each fires on a
+		// different input, so a picture that only ever holds ordinary values
+		// never exercises either and the ladder still looks right.
+		for (const value of [0.25, 0.5, 1, 2, 4, 8, 1024, 0.4999999, 1.0000001, 2.9999999]) {
+			const written = encodeHdrFloat(flatLight(2, 1, [value, value, value]));
+			const back = decodeHdrFloat(written);
+			const got = back.data[0] as number;
+			// RGBE keeps eight mantissa bits, so half a percent is the floor of
+			// what any correct implementation can promise here.
+			expect(Math.abs(got - value) / value, `value ${value}`).toBeLessThan(0.006);
+		}
+	});
+
+	it('composites coverage outside zero to one without letting it through', () => {
+		// Radiance has no alpha, so anything translucent is composited against
+		// the background before it is written. A `FloatImage` is not clamped by
+		// its own type the way a byte raster is, so a value above 1 or below 0
+		// reaches this code and would otherwise scale the background the wrong
+		// way and produce a colour that is in neither picture.
+		const source = light(
+			3,
+			1,
+			[
+				1,
+				1,
+				1,
+				1.5, // coverage past opaque
+				1,
+				1,
+				1,
+				-0.5, // coverage past clear
+				1,
+				1,
+				1,
+				0.5, // and one that is really translucent
+			],
+			true,
+		);
+		const written = encodeHdrFloat(source, { background: [0, 0, 0] });
+		const back = decodeHdrFloat(written);
+
+		// Past opaque is opaque: the pixel is its own colour, not a brighter one.
+		expectClose(back.data[0] as number, 1, 0.01);
+		// Past clear is clear: the pixel is the background, not a negative.
+		expectClose(back.data[4] as number, 0, 0.01);
+		// And the one in between really is composited.
+		expectClose(back.data[8] as number, 0.5, 0.01);
+	});
+
+	it('holds a background channel to the range a byte has', () => {
+		// The background arrives as numbers rather than as a raster, so nothing
+		// upstream has clamped it. Out of range here would index past the end
+		// of the transfer table and read undefined into the file.
+		const source = light(1, 1, [1, 1, 1, 0], true);
+		const written = encodeHdrFloat(source, { background: [300, -20, 255.6] });
+		const back = decodeHdrFloat(written);
+
+		expectClose(back.data[0] as number, 1, 0.01);
+		// Not exactly zero, and it cannot be: the three channels share one
+		// exponent, so a channel at zero beside a channel at one comes back as
+		// one part in 256. That is RGBE working, not the clamp failing.
+		expect(back.data[1] as number).toBeLessThan(0.005);
+		expectClose(back.data[2] as number, 1, 0.01);
 	});
 });
