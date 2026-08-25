@@ -74,6 +74,69 @@ export function fullBox(
 	);
 }
 
+/**
+ * A stand-in ISO 21496-1 parameter block.
+ *
+ * Sixty-two opaque bytes, which is the length a recent iPhone writes. The
+ * values are invented rather than lifted out of somebody's photograph, and
+ * nothing is lost by inventing them: no code in this package reads the block,
+ * it is carried from one container to another unchanged, so what a test has to
+ * show is that every byte survives the trip. A pattern nobody could produce by
+ * accident shows that better than a real block would.
+ */
+export const SAMPLE_GAIN_MAP_METADATA: Uint8Array = Uint8Array.from(
+	{ length: 62 },
+	(_, index) => (index * 7 + 11) & 0xff,
+);
+
+/** The auxiliary type urn an iPhone puts on the gain map picture. */
+export const GAIN_MAP_AUX_TYPE = 'urn:com:apple:photo:2020:aux:hdrgainmap';
+
+export interface HeifGainMapFixture {
+	/**
+	 * How the file advertises the gain map.
+	 *
+	 * `tmap` is the ISO 21496-1 arrangement: a hidden gain map picture, plus a
+	 * `tmap` item whose `dimg` names the base and the gain map and whose payload
+	 * is the parameter block. `auxl` is what iOS wrote before that standard
+	 * existed: the same hidden picture and the same `auxl` reference, with no
+	 * `tmap` and so no parameters anybody outside Apple can read.
+	 */
+	readonly layout?: 'tmap' | 'auxl';
+	/** The gain map's own grid. One by one gives a plain untiled picture. */
+	readonly columns?: number;
+	readonly rows?: number;
+	readonly tileSize?: number;
+	/** The parameter block the `tmap` item carries. */
+	readonly metadata?: Uint8Array;
+	/**
+	 * What the `tmap`'s `dimg` names. Defaults to the base and the gain map.
+	 *
+	 * An empty list leaves the reference out altogether, which is the file that
+	 * declares a picture to be tone mapped and then never says from what.
+	 */
+	readonly children?: readonly number[];
+	/** Leave the gain map's tiles without a decoder configuration. */
+	readonly withoutConfig?: boolean;
+	/**
+	 * Write the `tmap` item's extent so it runs past the end of `idat`.
+	 *
+	 * A file whose second half is damaged while the photograph in it is
+	 * perfectly readable, which is the case a reader is most likely to get
+	 * wrong by refusing the whole thing.
+	 */
+	readonly damagedLocation?: boolean;
+	/**
+	 * The gain map's own rotation, when it differs from the base's.
+	 *
+	 * Exists so a test can tell apart a reader that asks each item for its own
+	 * orientation from one that copies the base's onto the gain map. In a real
+	 * file the two always agree, which is exactly why a fixture where they
+	 * also always agree cannot catch the second reader.
+	 */
+	readonly rotation?: 0 | 90 | 180 | 270;
+}
+
 export interface HeifFixtureOptions {
 	/** Grid shape. One by one produces a plain untiled image instead of a grid. */
 	readonly columns?: number;
@@ -86,8 +149,8 @@ export interface HeifFixtureOptions {
 	readonly mirror?: 'none' | 'horizontal' | 'vertical';
 	/** Colour primaries as H.273 numbers. 12 is Display P3, 1 is BT.709. */
 	readonly primaries?: number;
-	/** Add a hidden `tmap` item, as an HDR photograph carries. */
-	readonly gainMap?: boolean;
+	/** Add an HDR gain map, as every recent phone photograph carries. */
+	readonly gainMap?: HeifGainMapFixture;
 	/** Attach an EXIF item with this payload, starting at its TIFF header. */
 	readonly exif?: Uint8Array;
 	/** Declare a grid whose tiles do not cover its stated size. */
@@ -105,9 +168,9 @@ export interface HeifFixtureOptions {
 /**
  * Assemble a HEIF file.
  *
- * The grid descriptor is placed in `idat` and located with construction method
- * 1, which is what Apple does and what a reader that assumes method 0 gets
- * wrong.
+ * The grid descriptors and the `tmap` parameter block are placed in `idat` and
+ * located with construction method 1, which is what Apple does and what a
+ * reader that assumes method 0 gets wrong.
  */
 export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 	const columns = options.columns ?? 2;
@@ -124,8 +187,30 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 	// Untiled, the single image is itself the primary item. Tiled, the primary
 	// is the grid and the tiles sit behind it.
 	const tileIds = tiled ? Array.from({ length: tileCount }, (_, i) => i + 2) : [primaryId];
-	const gainMapId = primaryId + tileCount + 1;
-	const exifId = gainMapId + 1;
+
+	/* ── Gain map shape ───────────────────────────────────────────── */
+	//
+	// Deliberately smaller than the base and on its own grid, because that is
+	// what a phone writes and because a reader that quietly stretched it to the
+	// base's size would still pass a test where the two matched.
+
+	const gain = options.gainMap;
+	const gainColumns = gain?.columns ?? 1;
+	const gainRows = gain?.rows ?? 1;
+	const gainTiled = gainColumns > 1 || gainRows > 1;
+	const gainTileSize = gain?.tileSize ?? 32;
+	const gainWidth = gainColumns * gainTileSize;
+	const gainHeight = gainRows * gainTileSize;
+	const gainMetadata = gain?.metadata ?? SAMPLE_GAIN_MAP_METADATA;
+
+	let nextId = (tiled ? (tileIds[tileIds.length - 1] ?? primaryId) : primaryId) + 1;
+	const gainPictureId = gain ? nextId++ : 0;
+	const gainTileIds: number[] = [];
+	if (gain && gainTiled) {
+		for (let i = 0; i < gainColumns * gainRows; i += 1) gainTileIds.push(nextId++);
+	}
+	const tmapId = gain && (gain.layout ?? 'tmap') === 'tmap' ? nextId++ : 0;
+	const exifId = nextId++;
 
 	/* ── Item information ─────────────────────────────────────────── */
 
@@ -136,8 +221,16 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 	for (const id of tileIds) {
 		infes.push(fullBox('infe', 2, tiled ? 1 : 0, u16(id), u16(0), ascii('hvc1'), u8(0)));
 	}
-	if (options.gainMap) {
-		infes.push(fullBox('infe', 2, 1, u16(gainMapId), u16(0), ascii('tmap'), u8(0)));
+	if (gain) {
+		infes.push(
+			fullBox('infe', 2, 1, u16(gainPictureId), u16(0), ascii(gainTiled ? 'grid' : 'hvc1'), u8(0)),
+		);
+		for (const id of gainTileIds) {
+			infes.push(fullBox('infe', 2, 1, u16(id), u16(0), ascii('hvc1'), u8(0)));
+		}
+		// The `tmap` item is the one part of an HDR photograph that is not
+		// hidden: it is the picture a viewer that understands HDR should show.
+		if (tmapId) infes.push(fullBox('infe', 2, 0, u16(tmapId), u16(0), ascii('tmap'), u8(0)));
 	}
 	if (options.exif) {
 		infes.push(fullBox('infe', 2, 0, u16(exifId), u16(0), ascii('Exif'), u8(0)));
@@ -167,23 +260,85 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 		mirrorIndex = next;
 		next += 1;
 	}
+
+	let gainIspeIndex = 0;
+	let gainTileIspeIndex = 0;
+	let gainAuxIndex = 0;
+	let gainColrIndex = 0;
+	let gainRotationIndex = 0;
+	if (gain) {
+		properties.push(fullBox('ispe', 0, 0, u32(gainWidth), u32(gainHeight)));
+		gainIspeIndex = next;
+		next += 1;
+		if (gainTiled) {
+			properties.push(fullBox('ispe', 0, 0, u32(gainTileSize), u32(gainTileSize)));
+			gainTileIspeIndex = next;
+			next += 1;
+		}
+		properties.push(fullBox('auxC', 0, 0, ascii(GAIN_MAP_AUX_TYPE), u8(0)));
+		gainAuxIndex = next;
+		next += 1;
+		// Primaries 2 is "unspecified", which is what a phone writes on a gain
+		// map: the samples are a ratio rather than a colour.
+		properties.push(box('colr', ascii('nclx'), u16(2), u16(2), u16(2), u8(0x80)));
+		gainColrIndex = next;
+		next += 1;
+		// Its own `irot`, only when the fixture asks for one that differs. A
+		// property shared with the base cannot tell a reader that asks each
+		// item apart from one that copies the base's answer across.
+		if (gain.rotation !== undefined) {
+			properties.push(box('irot', u8((gain.rotation / 90) & 0x03)));
+			gainRotationIndex = next;
+			next += 1;
+		}
+	}
 	const ipco = box('ipco', ...properties);
 
-	const associations: Uint8Array[] = [];
-	const primaryProperties = tiled
-		? [3, 4, rotationIndex, mirrorIndex].filter((n) => n > 0)
-		: // Untiled, the item's own ispe is the image size, which is what a real
-			// single-image HEIC records. Associating the tile-size one instead
-			// would make the fixture disagree with every file in the wild.
-			[3, 2, 4, rotationIndex, mirrorIndex].filter((n) => n > 0);
-	associations.push(u16(primaryId), u8(primaryProperties.length), u8(...primaryProperties));
+	const entries: { readonly id: number; readonly indices: readonly number[] }[] = [];
+	entries.push({
+		id: primaryId,
+		indices: tiled
+			? [3, 4, rotationIndex, mirrorIndex].filter((n) => n > 0)
+			: // Untiled, the item's own ispe is the image size, which is what a real
+				// single-image HEIC records. Associating the tile-size one instead
+				// would make the fixture disagree with every file in the wild.
+				[3, 2, 4, rotationIndex, mirrorIndex].filter((n) => n > 0),
+	});
 	for (const id of tiled ? tileIds : []) {
 		// Tiles carry their own size and the decoder configuration. Deliberately
 		// not the rotation: in a real file that lives on the grid, and a reader
 		// that took it from a tile would rotate every tile individually.
-		associations.push(u16(id), u8(2), u8(1, 2));
+		entries.push({ id, indices: [1, 2] });
 	}
-	const ipma = fullBox('ipma', 0, 0, u32(tiled ? tileCount + 1 : 1), ...associations);
+	if (gain) {
+		// The gain map carries the same rotation as the base, which is what a
+		// phone writes and what keeps the two lined up. A reader that applied the
+		// base's rotation to the gain map as well would turn it twice.
+		const configIndex = gain.withoutConfig ? 0 : 2;
+		const gainRotation = gainRotationIndex > 0 ? gainRotationIndex : rotationIndex;
+		entries.push({
+			id: gainPictureId,
+			indices: (gainTiled
+				? [gainIspeIndex, gainColrIndex, gainAuxIndex, gainRotation, mirrorIndex]
+				: [gainIspeIndex, configIndex, gainColrIndex, gainAuxIndex, gainRotation, mirrorIndex]
+			).filter((n) => n > 0),
+		});
+		for (const id of gainTileIds) {
+			entries.push({ id, indices: [gainTileIspeIndex, configIndex].filter((n) => n > 0) });
+		}
+		// The `tmap` item claims the size of the finished HDR picture, which is
+		// the base's, and never the gain map's.
+		if (tmapId) entries.push({ id: tmapId, indices: [3, 4] });
+	}
+	const ipma = fullBox(
+		'ipma',
+		0,
+		0,
+		u32(entries.length),
+		...entries.map((entry) =>
+			concat([u16(entry.id), u8(entry.indices.length), u8(...entry.indices)]),
+		),
+	);
 	const iprp = box('iprp', ipco, ipma);
 
 	/* ── References ───────────────────────────────────────────────── */
@@ -192,6 +347,22 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 	if (tiled) {
 		referenceBoxes.push(box('dimg', u16(primaryId), u16(tileIds.length), ...tileIds.map(u16)));
 	}
+	if (gain) {
+		if (gainTiled) {
+			referenceBoxes.push(
+				box('dimg', u16(gainPictureId), u16(gainTileIds.length), ...gainTileIds.map(u16)),
+			);
+		}
+		// Present in both layouts. In the older one it is the only thing that
+		// ties the gain map to the picture it belongs to.
+		referenceBoxes.push(box('auxl', u16(gainPictureId), u16(1), u16(primaryId)));
+		if (tmapId) {
+			const children = gain.children ?? [primaryId, gainPictureId];
+			if (children.length > 0) {
+				referenceBoxes.push(box('dimg', u16(tmapId), u16(children.length), ...children.map(u16)));
+			}
+		}
+	}
 	if (options.exif) {
 		referenceBoxes.push(box('cdsc', u16(exifId), u16(1), u16(primaryId)));
 	}
@@ -199,13 +370,30 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 
 	/* ── Payloads ─────────────────────────────────────────────────── */
 
-	// The grid descriptor: version, flags, rows - 1, columns - 1, then the
-	// output size at 16 bits because the flag's low bit is clear.
+	// A grid descriptor: version, flags, rows - 1, columns - 1, then the output
+	// size at 16 bits because the flag's low bit is clear.
 	const gridDescriptor = concat([u8(0, 0, rows - 1, columns - 1), u16(width), u16(height)]);
-	const idat = tiled ? box('idat', gridDescriptor) : undefined;
+	const gainGridDescriptor = concat([
+		u8(0, 0, gainRows - 1, gainColumns - 1),
+		u16(gainWidth),
+		u16(gainHeight),
+	]);
 
-	const payloads: Uint8Array[] = tileIds.map(() => SAMPLE_TILE);
-	if (options.gainMap) payloads.push(SAMPLE_TILE);
+	const idatParts: Uint8Array[] = [];
+	let idatLength = 0;
+	const intoIdat = (part: Uint8Array): number => {
+		const at = idatLength;
+		idatParts.push(part);
+		idatLength += part.length;
+		return at;
+	};
+	const baseGridAt = tiled ? intoIdat(gridDescriptor) : 0;
+	const gainGridAt = gain && gainTiled ? intoIdat(gainGridDescriptor) : 0;
+	const tmapAt = tmapId ? intoIdat(gainMetadata) : 0;
+	const idat = idatParts.length > 0 ? box('idat', ...idatParts) : undefined;
+
+	const gainPictureItems = gain ? (gainTiled ? gainTileIds : [gainPictureId]) : [];
+	const payloads: Uint8Array[] = [...tileIds, ...gainPictureItems].map(() => SAMPLE_TILE);
 	if (options.exif) payloads.push(concat([u32(0), options.exif]));
 
 	/* ── Locations ────────────────────────────────────────────────── */
@@ -216,34 +404,38 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 	// added to this builder.
 
 	const buildIloc = (mdatStart: number): Uint8Array => {
-		const entries: Uint8Array[] = [];
-		if (tiled) {
-			// Construction method 1: the extent is an offset into idat.
-			entries.push(u16(primaryId), u16(1), u16(0), u16(1), u32(0), u32(gridDescriptor.length));
+		const located: Uint8Array[] = [];
+		let count = 0;
+		// Construction method 1: the extent is an offset into idat.
+		const fromIdat = (id: number, at: number, length: number): void => {
+			located.push(u16(id), u16(1), u16(0), u16(1), u32(at), u32(length));
+			count += 1;
+		};
+		const fromFile = (id: number, at: number, length: number): void => {
+			located.push(u16(id), u16(0), u16(0), u16(1), u32(at), u32(length));
+			count += 1;
+		};
+
+		if (tiled) fromIdat(primaryId, baseGridAt, gridDescriptor.length);
+		if (gain && gainTiled) fromIdat(gainPictureId, gainGridAt, gainGridDescriptor.length);
+		if (tmapId) {
+			fromIdat(tmapId, tmapAt, gainMetadata.length + (gain?.damagedLocation ? 4096 : 0));
 		}
+
 		let at = mdatStart;
-		const located = tiled ? tileIds : tileIds;
-		for (const _id of located) {
-			entries.push(u16(_id), u16(0), u16(0), u16(1), u32(at), u32(SAMPLE_TILE.length));
-			at += SAMPLE_TILE.length;
-		}
-		if (options.gainMap) {
-			entries.push(u16(gainMapId), u16(0), u16(0), u16(1), u32(at), u32(SAMPLE_TILE.length));
+		for (const id of [...tileIds, ...gainPictureItems]) {
+			fromFile(id, at, SAMPLE_TILE.length);
 			at += SAMPLE_TILE.length;
 		}
 		if (options.exif) {
-			const length = 4 + (options.exif as Uint8Array).length;
-			entries.push(u16(exifId), u16(0), u16(0), u16(1), u32(at), u32(length));
-			at += length;
+			fromFile(exifId, at, 4 + options.exif.length);
 		}
 		// offset_size 4, length_size 4, base_offset_size 0, index_size 0. With no
 		// base offset there is no base offset field, so a version 1 entry is
 		// item id, construction method, data reference index, extent count,
 		// then the extents. An extra field here shifts the extent count onto
 		// the wrong bytes and every later item reads as garbage.
-		const count =
-			(tiled ? 1 : 0) + tileIds.length + (options.gainMap ? 1 : 0) + (options.exif ? 1 : 0);
-		return fullBox('iloc', 1, 0, u8(0x44), u8(0x00), u16(count), ...entries);
+		return fullBox('iloc', 1, 0, u8(0x44), u8(0x00), u16(count), ...located);
 	};
 
 	const hdlr = fullBox('hdlr', 0, 0, u32(0), ascii('pict'), u32(0), u32(0), u32(0), u8(0));

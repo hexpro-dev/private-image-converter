@@ -2,7 +2,13 @@ import { describe, expect, it } from 'vitest';
 import { planHeifImage } from '../../src/heif/image.js';
 import { assembleHeifImage } from '../../src/heif/assemble.js';
 import { HeifMalformedError, HeifUnsupportedFeatureError } from '../../src/errors.js';
-import { buildHeif, concat, fakeTileDecoder, u32 } from '../helpers/heif.js';
+import {
+	SAMPLE_GAIN_MAP_METADATA,
+	buildHeif,
+	concat,
+	fakeTileDecoder,
+	u32,
+} from '../helpers/heif.js';
 
 /**
  * A minimal ICC profile carrying one `rXYZ` tag.
@@ -109,12 +115,142 @@ describe('EXIF', () => {
 });
 
 describe('gain maps', () => {
-	it('notices one and still decodes the standard range base', () => {
-		// Refusing the file would refuse every HDR photograph a recent iPhone
-		// takes, which is all of them.
-		const plan = planHeifImage(buildHeif({ gainMap: true }));
+	it('plans the second picture alongside the base', () => {
+		// The shape a real iPhone file has: a tiled base, a smaller tiled gain
+		// map on its own grid, and a `tmap` item naming the two of them.
+		const plan = planHeifImage(
+			buildHeif({ columns: 2, rows: 2, gainMap: { columns: 2, rows: 1, tileSize: 32 } }),
+		);
 		expect(plan.hasGainMap).toBe(true);
+		expect(plan.tiles).toHaveLength(4);
+		expect(plan.gainMap?.tiles).toHaveLength(2);
+		expect([plan.gainMap?.width, plan.gainMap?.height]).toEqual([64, 32]);
+		expect(plan.gainMap?.metadata).toHaveLength(62);
+		expect(plan.gainMap?.standard).toBe('iso-21496-1');
+	});
+
+	it('carries the parameter block through byte for byte', () => {
+		// Nothing in this package reads the block, so the only thing that can go
+		// wrong with it is a byte, and the only way to catch that is to compare
+		// all of them. Every value that defines the photograph is in there.
+		const plan = planHeifImage(buildHeif({ gainMap: {} }));
+		expect(Array.from(plan.gainMap?.metadata ?? [])).toEqual(Array.from(SAMPLE_GAIN_MAP_METADATA));
+	});
+
+	it('reports nothing at all when the file has no tmap and no auxiliary', () => {
+		// A standard range photograph has lost nothing by being read as one, so
+		// there is nothing here for an interface to warn about.
+		const plan = planHeifImage(buildHeif({}));
+		expect(plan.hasGainMap).toBe(false);
+		expect(plan.gainMap).toBeUndefined();
+	});
+
+	it.each([
+		['one', [1]],
+		['three', [1, 6, 7]],
+		['no', []],
+	])('drops a tmap deriving from %s pictures rather than two', (_label, children) => {
+		// Base first, gain map second, is the entire meaning of the box, so a
+		// different count is a container disagreeing with itself and picking
+		// one of three children would be a guess handed back as a photograph.
+		// The gain map goes, and the photograph does not: refusing to open a
+		// picture because the second half of it is odd is a worse answer than
+		// handing back the standard range version.
+		const plan = planHeifImage(buildHeif({ gainMap: { children } }));
+
+		expect(plan.hasGainMap).toBe(true);
+		expect(plan.gainMap).toBeUndefined();
+		expect(plan.width).toBeGreaterThan(0);
 		expect(plan.tiles.length).toBeGreaterThan(0);
+	});
+
+	it('drops a gain map whose parameter block cannot be read, and keeps the photograph', () => {
+		// The regression this guards: reading the parameters moved into the
+		// planner, and reading them outside the guard meant a file that used to
+		// convert perfectly well started being refused outright because one
+		// length field in the second half of it was wrong.
+		const plan = planHeifImage(buildHeif({ gainMap: { damagedLocation: true } }));
+
+		expect(plan.hasGainMap).toBe(true);
+		expect(plan.gainMap).toBeUndefined();
+		expect(plan.width).toBeGreaterThan(0);
+	});
+
+	it('reports the older Apple layout as present and dropped', () => {
+		// An `auxl` gain map with no `tmap` is what iOS wrote before ISO 21496-1
+		// existed. The picture is there but its parameters are in a proprietary
+		// block, and without the headroom and the gain range it is a grey
+		// rectangle of unknown meaning, so it cannot be carried anywhere.
+		const plan = planHeifImage(buildHeif({ gainMap: { layout: 'auxl' } }));
+		expect(plan.hasGainMap).toBe(true);
+		expect(plan.gainMap).toBeUndefined();
+	});
+
+	it.each([
+		['the picture has no decoder configuration', { withoutConfig: true }],
+		['the tmap names an item that is not there', { children: [1, 99] }],
+		['the parameter block is empty', { metadata: new Uint8Array(0) }],
+	])('reports present and dropped when %s', (_label, gainMap) => {
+		// Not fatal, deliberately. The base is a perfectly good photograph and
+		// refusing to open it because the second half of it is odd would be a
+		// worse answer than handing back the standard range version.
+		const plan = planHeifImage(buildHeif({ gainMap }));
+		expect(plan.hasGainMap).toBe(true);
+		expect(plan.gainMap).toBeUndefined();
+	});
+
+	it('keeps the gain map at its own size rather than at the base size', async () => {
+		// A gain map is stored smaller than the picture it describes, and it is
+		// meant to be. Resizing it here would throw away the one cheap thing
+		// about it and would hide the arithmetic behind an interpolation.
+		const plan = planHeifImage(
+			buildHeif({ columns: 2, rows: 2, tileSize: 64, gainMap: { tileSize: 32 } }),
+		);
+		const map = plan.gainMap;
+		if (!map) throw new Error('the fixture should have planned a gain map');
+		const image = await assembleHeifImage(map, fakeTileDecoder());
+		expect([image.width, image.height]).toEqual([32, 32]);
+		expect([plan.width, plan.height]).toEqual([120, 124]);
+	});
+
+	it('turns the gain map by its own rotation rather than by the base rotation', async () => {
+		// Both items carry the same `irot` in a real file, so the gain map ends
+		// up the same way up as the base without anything being applied twice.
+		// Reading the rotation off the base and applying it here as well is the
+		// 540 degree bug with a second picture to hide in.
+		const plan = planHeifImage(
+			buildHeif({ rotation: 90, columns: 2, rows: 2, gainMap: { columns: 2, rows: 1 } }),
+		);
+		const map = plan.gainMap;
+		if (!map) throw new Error('the fixture should have planned a gain map');
+		expect(map.orientation).toEqual(plan.orientation);
+		const image = await assembleHeifImage(map, fakeTileDecoder());
+		expect([image.width, image.height]).toEqual([map.displayWidth, map.displayHeight]);
+		expect([image.width, image.height]).toEqual([32, 64]);
+	});
+
+	it('reads the rotation off the gain map itself, not off the base', async () => {
+		// The test above cannot fail on a reader that copies the base's
+		// orientation across, because every real file has the two agreeing. So
+		// this one makes them disagree, which no phone does and no other test
+		// can arrange, purely so that the two implementations are told apart.
+		const plan = planHeifImage(
+			buildHeif({
+				rotation: 90,
+				columns: 2,
+				rows: 2,
+				gainMap: { columns: 2, rows: 1, rotation: 180 },
+			}),
+		);
+		const map = plan.gainMap;
+		if (!map) throw new Error('the fixture should have planned a gain map');
+
+		expect(plan.orientation.rotation).toBe(90);
+		expect(map.orientation.rotation).toBe(180);
+		// A half turn keeps the shape, so the gain map stays 64 by 32 while the
+		// base's quarter turn swaps its own.
+		const image = await assembleHeifImage(map, fakeTileDecoder());
+		expect([image.width, image.height]).toEqual([64, 32]);
 	});
 });
 

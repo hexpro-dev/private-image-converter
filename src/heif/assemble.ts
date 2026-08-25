@@ -9,7 +9,7 @@
 
 import type { RasterImage } from '../types.js';
 import { applyOrientation, blit, createRaster, crop } from '../raster/image.js';
-import type { HeifImagePlan, HeifTile } from './image.js';
+import type { HeifPicturePlan, HeifTile } from './image.js';
 
 /** What a tile decoder is handed. Mirrors `VideoDecoderConfig` without naming it. */
 export interface TileDecoderConfig {
@@ -35,7 +35,7 @@ export type TileDecoder = (
 ) => Promise<readonly RasterImage[]>;
 
 export async function assembleHeifImage(
-	plan: HeifImagePlan,
+	plan: HeifPicturePlan,
 	decodeTiles: TileDecoder,
 	signal?: AbortSignal,
 ): Promise<RasterImage> {

@@ -94,11 +94,11 @@ describe('the decode plan', () => {
 	});
 
 	it('notices a gain map without failing on it', () => {
-		// The right behaviour is to decode the standard range base and say so.
-		// Refusing the file would refuse every HDR photograph a recent iPhone
-		// takes, which is all of them.
-		expect(planHeifImage(buildHeif({ gainMap: true })).hasGainMap).toBe(true);
-		expect(planHeifImage(buildHeif({ gainMap: false })).hasGainMap).toBe(false);
+		// The right behaviour is to plan the standard range base and record that
+		// the second picture is there. Refusing the file would refuse every HDR
+		// photograph a recent iPhone takes, which is all of them.
+		expect(planHeifImage(buildHeif({ gainMap: {} })).hasGainMap).toBe(true);
+		expect(planHeifImage(buildHeif({})).hasGainMap).toBe(false);
 	});
 
 	it('extracts the EXIF payload past its offset header', () => {
