@@ -18,9 +18,10 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { fitSquare, resizeRaster } from '../../src/raster/resize.js';
+import { fitLongestSide, fitSquare, resizeFloat, resizeRaster } from '../../src/raster/resize.js';
 import { createRaster } from '../../src/raster/image.js';
-import type { ColourSpace, RasterImage } from '../../src/types.js';
+import { createFloat } from '../../src/raster/float.js';
+import type { ColourSpace, FloatImage, RasterImage } from '../../src/types.js';
 
 type Pixel = readonly [number, number, number, number];
 
@@ -440,5 +441,109 @@ describe('fitting a raster into a square', () => {
 			Array.from({ length: 8 }, () => grey(10)),
 		);
 		expect(() => fitSquare(image, 0)).toThrow(RangeError);
+	});
+});
+
+/* ── The longest side ─────────────────────────────────────────────────── */
+
+describe('fitting the longest side', () => {
+	it('scales by whichever side is longer', () => {
+		expect(fitLongestSide(400, 200, 100)).toEqual({ width: 100, height: 50 });
+		expect(fitLongestSide(200, 400, 100)).toEqual({ width: 50, height: 100 });
+	});
+
+	it('returns the picture untouched when it is already smaller', () => {
+		// Not clamped to the requested side, returned as it was. A tool that
+		// upscaled here would report a resolution the file never had.
+		expect(fitLongestSide(40, 20, 4000)).toEqual({ width: 40, height: 20 });
+	});
+
+	it('returns the picture untouched when the request matches it exactly', () => {
+		expect(fitLongestSide(400, 200, 400)).toEqual({ width: 400, height: 200 });
+	});
+
+	it('never rounds a side away to nothing', () => {
+		// A 1000 by 3 banner capped at 10 scales the short side to 0.03. One
+		// pixel is the floor, because a zero would be a raster that cannot
+		// exist and every caller below here would throw on it.
+		expect(fitLongestSide(1000, 3, 10)).toEqual({ width: 10, height: 1 });
+	});
+
+	it('ignores a request that is not a usable number', () => {
+		expect(fitLongestSide(400, 200, 0)).toEqual({ width: 400, height: 200 });
+		expect(fitLongestSide(400, 200, -100)).toEqual({ width: 400, height: 200 });
+		expect(fitLongestSide(400, 200, Number.NaN)).toEqual({ width: 400, height: 200 });
+		expect(fitLongestSide(400, 200, Number.POSITIVE_INFINITY)).toEqual({
+			width: 400,
+			height: 200,
+		});
+	});
+});
+
+/* ── Light ────────────────────────────────────────────────────────────── */
+
+function lightOf(
+	width: number,
+	height: number,
+	fill: (index: number) => readonly [number, number, number, number],
+): FloatImage {
+	const image = createFloat(width, height, 'srgb', true);
+	for (let i = 0; i < width * height; i += 1) {
+		const [r, g, b, a] = fill(i);
+		image.data.set([r, g, b, a], i * 4);
+	}
+	return image;
+}
+
+describe('resampling light', () => {
+	it('averages by the same area rule as the byte filter', () => {
+		// Four pixels across, two out. Each output covers two inputs exactly,
+		// so the answer is the plain mean of each pair.
+		const image = lightOf(4, 1, (i) => [[0.2, 0.4, 1.6, 3.2][i] as number, 0, 0, 1]);
+		const out = resizeFloat(image, 2, 1);
+		expect(out.data[0]).toBeCloseTo(0.30000001192092896, 6);
+		expect(out.data[4]).toBeCloseTo(2.4000000953674316, 6);
+	});
+
+	it('keeps values far above one rather than clipping them to a display range', () => {
+		// The whole reason there are two functions rather than a cast. A
+		// resampler that clamped here would quietly turn a render into an
+		// ordinary photograph.
+		const image = lightOf(2, 1, (i) => [i === 0 ? 500 : 0, 0, 0, 1]);
+		const out = resizeFloat(image, 1, 1);
+		expect(out.data[0]).toBeCloseTo(250, 3);
+	});
+
+	it('premultiplies, so a transparent pixel does not darken its neighbour', () => {
+		// The same halo bug as the byte path, and it is worse here: a
+		// transparent black in linear light drags the average down by the
+		// full value rather than by a gamma-compressed one.
+		const image = lightOf(2, 1, (i) => (i === 0 ? [4, 4, 4, 1] : [0, 0, 0, 0]));
+		const out = resizeFloat(image, 1, 1);
+		expect(out.data[0]).toBeCloseTo(4, 5);
+		expect(out.data[3]).toBeCloseTo(0.5, 5);
+	});
+
+	it('hands back the same image when nothing changes size', () => {
+		const image = lightOf(2, 2, () => [1, 1, 1, 1]);
+		expect(resizeFloat(image, 2, 2)).toBe(image);
+	});
+
+	it('refuses a size with no pixels in it', () => {
+		const image = lightOf(2, 2, () => [1, 1, 1, 1]);
+		expect(() => resizeFloat(image, 0, 2)).toThrow(RangeError);
+	});
+
+	it('resamples one axis while the other stands still', () => {
+		// The `from === to` branch has to premultiply on its own, because the
+		// pass that would have done it is the one being skipped. Getting this
+		// wrong leaves the vertical pass reading straight values as though
+		// they were premultiplied, which shows up only where alpha varies.
+		const image = lightOf(2, 2, (i) => (i < 2 ? [8, 8, 8, 1] : [0, 0, 0, 0]));
+		const out = resizeFloat(image, 2, 1);
+		expect(out.width).toBe(2);
+		expect(out.height).toBe(1);
+		expect(out.data[0]).toBeCloseTo(8, 5);
+		expect(out.data[3]).toBeCloseTo(0.5, 5);
 	});
 });

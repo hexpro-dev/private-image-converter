@@ -1,12 +1,17 @@
 /**
  * Resampling.
  *
- * Only two callers need it, and both are icon formats: an ICO holds several
- * sizes of the same picture and an Apple icon suite holds ten. Neither can be
- * written from a single raster without scaling it, so this exists rather than
- * a canvas call, for the reason on `RasterImage`: a canvas cannot hold a large
+ * Written first for the icon formats, which have no choice: an ICO holds
+ * several sizes of the same picture and an Apple icon suite holds ten, and
+ * neither can be written from a single raster without scaling it. It is not a
+ * canvas call, for the reason on `RasterImage`: a canvas cannot hold a large
  * photograph on iOS Safari, and a resize that fails only on the device people
  * actually use is worse than no resize at all.
+ *
+ * It now also serves `ConvertOptions.resize`, which is a photograph rather than
+ * an icon, so the sizes involved went up by three orders of magnitude and the
+ * memory shape had to change with them. See `resampleAxis` on why nothing
+ * materialises a premultiplied copy of the source any more.
  *
  * Alpha is premultiplied before filtering and undone afterwards. Averaging
  * straight RGBA lets the colour of fully transparent pixels leak into their
@@ -16,8 +21,20 @@
  * background.
  */
 
-import type { RasterImage } from '../types.js';
+import type { FloatImage, RasterImage } from '../types.js';
+import { createFloat } from './float.js';
 import { createRaster } from './image.js';
+
+/**
+ * What one unit of alpha means in the source array.
+ *
+ * A `RasterImage` stores alpha as 0 to 255 and a `FloatImage` stores it as 0 to
+ * 1, and the filter has to normalise it to premultiply correctly. Passing the
+ * reciprocal rather than a flag keeps the inner loop a multiply instead of a
+ * branch.
+ */
+const BYTE_ALPHA = 1 / 255;
+const FLOAT_ALPHA = 1;
 
 /**
  * Scale an image to exactly `width` by `height`.
@@ -30,45 +47,21 @@ import { createRaster } from './image.js';
  */
 export function resizeRaster(image: RasterImage, width: number, height: number): RasterImage {
 	if (width === image.width && height === image.height) return image;
-	if (width < 1 || height < 1) {
-		throw new RangeError('A resized image must be at least one pixel in each direction.');
-	}
+	checkSize(width, height);
 	const horizontal = resampleAxis(
-		premultiply(image),
+		image.data,
 		image.width,
 		image.height,
 		width,
 		image.height,
 		true,
+		BYTE_ALPHA,
 	);
 	const both = resampleAxis(horizontal, width, image.height, width, height, false);
-	return unpremultiply(both, width, height, image);
-}
-
-/** Straight RGBA to premultiplied floats. */
-function premultiply(image: RasterImage): Float32Array {
-	const { data } = image;
-	const out = new Float32Array(data.length);
-	for (let i = 0; i < data.length; i += 4) {
-		const a = (data[i + 3] as number) / 255;
-		out[i] = (data[i] as number) * a;
-		out[i + 1] = (data[i + 1] as number) * a;
-		out[i + 2] = (data[i + 2] as number) * a;
-		out[i + 3] = data[i + 3] as number;
-	}
-	return out;
-}
-
-function unpremultiply(
-	source: Float32Array,
-	width: number,
-	height: number,
-	like: RasterImage,
-): RasterImage {
-	const out = createRaster(width, height, like.colourSpace, like.hasAlpha);
+	const out = createRaster(width, height, image.colourSpace, image.hasAlpha);
 	const target = out.data;
 	for (let i = 0; i < target.length; i += 4) {
-		const alpha = source[i + 3] as number;
+		const alpha = both[i + 3] as number;
 		if (alpha <= 0) {
 			target[i] = 0;
 			target[i + 1] = 0;
@@ -77,12 +70,60 @@ function unpremultiply(
 			continue;
 		}
 		const scale = 255 / alpha;
-		target[i] = Math.round((source[i] as number) * scale);
-		target[i + 1] = Math.round((source[i + 1] as number) * scale);
-		target[i + 2] = Math.round((source[i + 2] as number) * scale);
+		target[i] = Math.round((both[i] as number) * scale);
+		target[i + 1] = Math.round((both[i + 1] as number) * scale);
+		target[i + 2] = Math.round((both[i + 2] as number) * scale);
 		target[i + 3] = Math.round(alpha);
 	}
 	return out;
+}
+
+/**
+ * The same filter over unbounded light.
+ *
+ * Separate from `resizeRaster` only at the ends: the footprint arithmetic in
+ * `resampleAxis` is shared, because averaging is averaging whatever the numbers
+ * mean. What differs is that alpha is already normalised and that nothing is
+ * rounded or clamped on the way out, since a value above 1 is the entire point
+ * of the format that produced it.
+ */
+export function resizeFloat(image: FloatImage, width: number, height: number): FloatImage {
+	if (width === image.width && height === image.height) return image;
+	checkSize(width, height);
+	const horizontal = resampleAxis(
+		image.data,
+		image.width,
+		image.height,
+		width,
+		image.height,
+		true,
+		FLOAT_ALPHA,
+	);
+	const both = resampleAxis(horizontal, width, image.height, width, height, false);
+	const out = createFloat(width, height, image.colourSpace, image.hasAlpha);
+	const target = out.data;
+	for (let i = 0; i < target.length; i += 4) {
+		const alpha = both[i + 3] as number;
+		if (alpha <= 0) {
+			target[i] = 0;
+			target[i + 1] = 0;
+			target[i + 2] = 0;
+			target[i + 3] = 0;
+			continue;
+		}
+		const scale = 1 / alpha;
+		target[i] = (both[i] as number) * scale;
+		target[i + 1] = (both[i + 1] as number) * scale;
+		target[i + 2] = (both[i + 2] as number) * scale;
+		target[i + 3] = alpha;
+	}
+	return out;
+}
+
+function checkSize(width: number, height: number): void {
+	if (width < 1 || height < 1) {
+		throw new RangeError('A resized image must be at least one pixel in each direction.');
+	}
 }
 
 /**
@@ -93,20 +134,49 @@ function unpremultiply(
  * them contributes its overlap; growing, it lies inside one or two and the
  * overlap weights become a linear blend. Writing it once this way is what
  * makes the mixed case fall out for free.
+ *
+ * `alphaScale` is what keeps this affordable on a photograph. Passing it says
+ * the source is straight rather than premultiplied, and the premultiply then
+ * happens against the value already loaded for the weighted sum rather than in
+ * a separate pass over a separate array. That pass used to allocate sixteen
+ * bytes per *source* pixel, which on a 48 megapixel photograph is 768 megabytes
+ * for a picture the caller asked to make smaller. Fused, the largest allocation
+ * is the intermediate at the target width, which for any real downscale is a
+ * fraction of it.
  */
 function resampleAxis(
-	source: Float32Array,
+	source: ArrayLike<number>,
 	sourceWidth: number,
 	sourceHeight: number,
 	targetWidth: number,
 	targetHeight: number,
 	alongX: boolean,
+	alphaScale?: number,
 ): Float32Array {
-	const out = new Float32Array(targetWidth * targetHeight * 4);
 	const outer = alongX ? sourceHeight : targetWidth;
 	const from = alongX ? sourceWidth : sourceHeight;
 	const to = alongX ? targetWidth : targetHeight;
-	if (from === to) return source;
+	const straight = alphaScale !== undefined;
+	const normalise = alphaScale ?? 1;
+
+	// Nothing to filter along this axis. A premultiplied source can be handed
+	// straight back; a straight one still owes the caller the premultiply the
+	// loop below would otherwise have done.
+	if (from === to) {
+		if (!straight) return source as Float32Array;
+		const copy = new Float32Array(sourceWidth * sourceHeight * 4);
+		for (let i = 0; i < copy.length; i += 4) {
+			const alpha = source[i + 3] as number;
+			const premultiplier = alpha * normalise;
+			copy[i] = (source[i] as number) * premultiplier;
+			copy[i + 1] = (source[i + 1] as number) * premultiplier;
+			copy[i + 2] = (source[i + 2] as number) * premultiplier;
+			copy[i + 3] = alpha;
+		}
+		return copy;
+	}
+
+	const out = new Float32Array(targetWidth * targetHeight * 4);
 	const scale = from / to;
 
 	for (let o = 0; o < outer; o += 1) {
@@ -129,10 +199,12 @@ function resampleAxis(
 				const weight = Math.min(s + 1, centre + radius) - Math.max(s, centre - radius);
 				if (weight <= 0) continue;
 				const at = alongX ? (o * sourceWidth + s) * 4 : (s * targetWidth + o) * 4;
-				r += (source[at] as number) * weight;
-				g += (source[at + 1] as number) * weight;
-				b += (source[at + 2] as number) * weight;
-				a += (source[at + 3] as number) * weight;
+				const alpha = source[at + 3] as number;
+				const colourWeight = straight ? weight * alpha * normalise : weight;
+				r += (source[at] as number) * colourWeight;
+				g += (source[at + 1] as number) * colourWeight;
+				b += (source[at + 2] as number) * colourWeight;
+				a += alpha * weight;
 				total += weight;
 			}
 			// A footprint can miss every cell centre only when it is degenerate,
@@ -147,6 +219,31 @@ function resampleAxis(
 		}
 	}
 	return out;
+}
+
+/**
+ * The size an image becomes when its longest side is capped.
+ *
+ * Never upscales. Asking for a longest side larger than the picture already has
+ * returns the picture's own size, because a conversion tool that quietly
+ * invented pixels would be lying about what came out of it, and because
+ * somebody who types a big number into a box means "do not shrink this" rather
+ * than "interpolate it up".
+ */
+export function fitLongestSide(
+	width: number,
+	height: number,
+	longestSide: number,
+): { width: number; height: number } {
+	const longest = Math.max(width, height);
+	if (!Number.isFinite(longestSide) || longestSide < 1 || longestSide >= longest) {
+		return { width, height };
+	}
+	const scale = longestSide / longest;
+	return {
+		width: Math.max(1, Math.round(width * scale)),
+		height: Math.max(1, Math.round(height * scale)),
+	};
 }
 
 /**

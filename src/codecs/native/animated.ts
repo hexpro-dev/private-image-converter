@@ -17,9 +17,9 @@
  * checklist in RELEASING.md instead.
  */
 
-import { DecodeFailedError } from '../../errors.js';
+import { DecodeFailedError, SurfaceTooLargeError } from '../../errors.js';
 import type { Animation, AnimationFrame, FormatId, RasterImage } from '../../types.js';
-import { canvasCanHold, context2d, requireCanvas } from '../../raster/canvas.js';
+import { canvasHolds, context2d, requireCanvas } from '../../raster/canvas.js';
 
 /**
  * The parts of `ImageDecoder` this uses.
@@ -121,12 +121,8 @@ export async function decodeAnimatedNative(
 			const decoded = await decoder.decode({ frameIndex: index });
 			try {
 				const { displayWidth, displayHeight } = decoded.image;
-				if (!canvasCanHold(displayWidth, displayHeight)) {
-					throw new DecodeFailedError(
-						format,
-						'native-animated',
-						`its frames are ${displayWidth} by ${displayHeight}, which is larger than this browser can hold in a drawing surface`,
-					);
+				if (!canvasHolds(displayWidth, displayHeight)) {
+					throw new SurfaceTooLargeError(displayWidth, displayHeight);
 				}
 				frames.push({
 					image: frameToRaster(decoded.image, displayWidth, displayHeight),

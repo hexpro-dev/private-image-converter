@@ -35,12 +35,12 @@ import type {
 	GainMap,
 	RasterImage,
 } from '../../types.js';
-import { ImageTooLargeError, UnsupportedHereError } from '../../errors.js';
+import { ImageTooLargeError, SurfaceTooLargeError, UnsupportedHereError } from '../../errors.js';
 import { assembleHeifImage } from '../../heif/assemble.js';
 import type { TileDecoder, TileDecoderConfig } from '../../heif/assemble.js';
 import { planHeifImage } from '../../heif/image.js';
 import type { HeifImagePlan } from '../../heif/image.js';
-import { MAX_CANVAS_AREA, canvasCanHold } from '../../raster/canvas.js';
+import { canvasHolds } from '../../raster/canvas.js';
 import { detectAlpha } from '../../raster/image.js';
 import { decodeNative, nativeDecodeAvailable } from '../native/decode.js';
 import { supportsHevcConfig, webCodecsTileDecoder } from './webcodecs.js';
@@ -153,8 +153,14 @@ export function createHeicNativeDecoder(seams: HeicNativeSeams = {}): Decoder {
 			const plan = planHeifImage(bytes);
 			const pixels = plan.displayWidth * plan.displayHeight;
 			if (pixels > context.maxPixels) throw new ImageTooLargeError(pixels, context.maxPixels);
-			if (!canvasCanHold(plan.displayWidth, plan.displayHeight)) {
-				throw new ImageTooLargeError(pixels, MAX_CANVAS_AREA);
+			// A decline, not a refusal. This rung hands the file to the
+			// browser's own decoder, which lands on a canvas; the rung below
+			// reads the container here and never needs one. Every recent
+			// iPhone shoots past what a canvas gives on iOS, so sharing an
+			// error class with the hard ceiling stopped the ladder on exactly
+			// the photographs this package exists to read.
+			if (!canvasHolds(plan.displayWidth, plan.displayHeight)) {
+				throw new SurfaceTooLargeError(plan.displayWidth, plan.displayHeight);
 			}
 			const image = await decodeImage(bytes, 'heic', 'image/heic', plan.colourSpace);
 			return {

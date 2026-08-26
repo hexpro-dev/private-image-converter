@@ -65,10 +65,17 @@ export {
 	withColourSpace,
 } from './raster/image.js';
 export { outOfSrgbGamut, toColourSpace } from './raster/colour.js';
-export { MAX_CANVAS_AREA, MAX_CANVAS_SIDE, canvasCanHold } from './raster/canvas.js';
+export {
+	MAX_CANVAS_AREA,
+	MAX_CANVAS_AREA_CEILING,
+	MAX_CANVAS_SIDE,
+	canvasCanHold,
+	canvasHolds,
+	openCanvas,
+} from './raster/canvas.js';
 export { exactPalette, indexedToRaster, quantise } from './raster/quantise.js';
 export type { IndexedImage, Palette, QuantiseOptions } from './raster/quantise.js';
-export { fitSquare, resizeRaster } from './raster/resize.js';
+export { fitLongestSide, fitSquare, resizeFloat, resizeRaster } from './raster/resize.js';
 export { halfToFloat, toneMap, toneMapImage } from './raster/tonemap.js';
 export type { ToneMapOptions, ToneMapResult } from './raster/tonemap.js';
 export {
@@ -111,6 +118,7 @@ export {
 	HeifMalformedError,
 	HeifUnsupportedFeatureError,
 	ImageTooLargeError,
+	SurfaceTooLargeError,
 	UnknownFormatError,
 	UnsupportedHereError,
 	isConverterError,

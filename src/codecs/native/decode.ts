@@ -12,14 +12,9 @@
  * one.
  */
 
-import { DecodeFailedError } from '../../errors.js';
+import { DecodeFailedError, SurfaceTooLargeError } from '../../errors.js';
 import type { ColourSpace, FormatId, RasterImage } from '../../types.js';
-import {
-	canvasCanHold,
-	context2d,
-	contextColourSpace,
-	requireCanvas,
-} from '../../raster/canvas.js';
+import { openCanvas } from '../../raster/canvas.js';
 
 export function nativeDecodeAvailable(): boolean {
 	return typeof createImageBitmap === 'function' && typeof Blob !== 'undefined';
@@ -50,17 +45,14 @@ export async function decodeNative(
 	}
 
 	try {
-		if (!canvasCanHold(bitmap.width, bitmap.height)) {
-			throw new DecodeFailedError(
-				format,
-				'native',
-				`it is ${bitmap.width} by ${bitmap.height}, which is larger than this browser can hold in a drawing surface`,
-			);
-		}
-		const canvas = requireCanvas(bitmap.width, bitmap.height);
-		const context = context2d(canvas, preferColourSpace);
+		// Asked of the browser rather than of a constant. The surface this
+		// needs is the one the picture is actually going onto, and on iOS
+		// whether it can be had depends on what else the tab is holding, so a
+		// static ceiling is either too low for a desktop or a guess on a phone.
+		const opened = openCanvas(bitmap.width, bitmap.height, preferColourSpace);
+		if (!opened) throw new SurfaceTooLargeError(bitmap.width, bitmap.height);
+		const { context, space } = opened;
 		context.drawImage(bitmap as unknown as CanvasImageSource, 0, 0);
-		const space = contextColourSpace(context);
 		const pixels = context.getImageData(0, 0, bitmap.width, bitmap.height, {
 			colorSpace: space === 'display-p3' ? 'display-p3' : 'srgb',
 		});

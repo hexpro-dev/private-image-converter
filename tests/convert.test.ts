@@ -25,9 +25,11 @@ import { DEFAULT_MAX_PIXELS, convert } from '../src/convert.js';
 import { installDefaultCodecs, resetDefaultCodecs } from '../src/defaults.js';
 import { emptyCapabilities } from '../src/detect/capabilities.js';
 import {
+	CancelledError,
 	DecodeFailedError,
 	EncodeFailedError,
 	ImageTooLargeError,
+	SurfaceTooLargeError,
 	UnknownFormatError,
 	isConverterError,
 } from '../src/errors.js';
@@ -492,6 +494,206 @@ beforeEach(() => {
 afterAll(() => {
 	clearRegistry();
 	resetDefaultCodecs();
+});
+
+/* ── Declining a rung, and stopping the ladder ────────────────────────── */
+
+describe('what stops the ladder and what only steps off it', () => {
+	it('lets the next rung run when one declines for want of a drawing surface', async () => {
+		// The regression this exists for. Safari's own HEIC decoder is the
+		// first rung and it needs a canvas; the container reader below it does
+		// not. Every recent iPhone shoots past what a canvas gives on iOS, so
+		// sharing an error class with the hard ceiling meant the rung that
+		// would have worked was never asked.
+		registerDecoder(
+			decoder({ id: 'needs-canvas', priority: 10, fails: new SurfaceTooLargeError(5712, 4284) }),
+		);
+		registerDecoder(decoder({ id: 'reads-bytes', priority: 20 }));
+		registerEncoder(encoder({ id: 'png-pure' }));
+
+		const result = await convert(pngInput(), { to: 'png' }, CAPABILITIES);
+
+		expect(decodeCalls).toEqual(['needs-canvas', 'reads-bytes']);
+		expect(result.report.decoderId).toBe('reads-bytes');
+	});
+
+	it('still refuses outright when the image is past what this tool will attempt', async () => {
+		// The other half of the same distinction. This one is about the
+		// picture, not about the rung, so no lower rung can rescue it and
+		// walking the ladder only wastes the time of whoever is waiting.
+		registerDecoder(
+			decoder({
+				id: 'too-big',
+				priority: 10,
+				fails: new ImageTooLargeError(200_000_000, DEFAULT_MAX_PIXELS),
+			}),
+		);
+		registerDecoder(decoder({ id: 'never-asked', priority: 20 }));
+		registerEncoder(encoder({ id: 'png-pure' }));
+
+		const error = await failure(pngInput(), { to: 'png' });
+
+		expect(error.code).toBe('input/too-large');
+		expect(decodeCalls).toEqual(['too-big']);
+	});
+
+	it('reports the surface decline when it was the only thing that went wrong', async () => {
+		// A decline the ladder walks past is still the honest answer when
+		// there was nothing to walk to. Saying the file may be damaged here
+		// would send somebody looking for a problem with their photograph.
+		registerDecoder(decoder({ id: 'only-rung', fails: new SurfaceTooLargeError(9000, 9000) }));
+		registerEncoder(encoder({ id: 'png-pure' }));
+
+		const error = await failure(pngInput(), { to: 'png' });
+
+		expect(error.code).toBe('codec/surface-too-large');
+	});
+
+	it('stops the ladder when the conversion was cancelled', async () => {
+		// Walking on after a cancellation is worse than not handling it at
+		// all: the rung below the one that noticed is the slow software
+		// decoder, so pressing stop used to make the work take longer.
+		registerDecoder(
+			decoder({ id: 'noticed-the-signal', priority: 10, fails: new CancelledError() }),
+		);
+		registerDecoder(decoder({ id: 'slow-fallback', priority: 20 }));
+		registerEncoder(encoder({ id: 'png-pure' }));
+
+		const error = await failure(pngInput(), { to: 'png' });
+
+		expect(error.code).toBe('cancelled');
+		expect(decodeCalls).toEqual(['noticed-the-signal']);
+	});
+
+	it('treats a bare AbortError from a platform codec as a cancellation', async () => {
+		// `VideoDecoder` and `VideoEncoder` reject with a `DOMException` that
+		// never passed through this package, so matching on the class alone
+		// would miss the two rungs where cancelling matters most.
+		const aborted = Object.assign(new Error('The operation was aborted.'), {
+			name: 'AbortError',
+		});
+		registerDecoder(decoder({ id: 'webcodecs-rung', priority: 10, fails: aborted }));
+		registerDecoder(decoder({ id: 'slow-fallback', priority: 20 }));
+		registerEncoder(encoder({ id: 'png-pure' }));
+
+		const error = await failure(pngInput(), { to: 'png' });
+
+		expect(error.code).toBe('cancelled');
+		expect(decodeCalls).toEqual(['webcodecs-rung']);
+	});
+
+	it('stops the light ladder on a cancellation as well', async () => {
+		registerDecoder(
+			decoder({ id: 'light-rung', priority: 10, light: light(), lightFails: new CancelledError() }),
+		);
+		registerDecoder(decoder({ id: 'byte-rung', priority: 20 }));
+		registerEncoder(encoder({ id: 'png-pure' }));
+
+		const error = await failure(pngInput(), { to: 'png' });
+
+		expect(error.code).toBe('cancelled');
+		expect(floatDecodeCalls).toEqual(['light-rung']);
+		expect(decodeCalls).toEqual([]);
+	});
+});
+
+/* ── Resizing ─────────────────────────────────────────────────────────── */
+
+describe('capping the longest side', () => {
+	it('scales by the longer side and reports where it came from', async () => {
+		registerDecoder(decoder({ id: 'png-pure', image: raster({ width: 400, height: 200 }) }));
+		registerEncoder(encoder({ id: 'png-out' }));
+
+		const result = await convert(
+			pngInput(),
+			{ to: 'png', resize: { longestSide: 100 } },
+			CAPABILITIES,
+		);
+
+		expect(result.report.width).toBe(100);
+		expect(result.report.height).toBe(50);
+		expect(result.report.resizedFrom).toEqual({ width: 400, height: 200 });
+	});
+
+	it('takes the longer side whichever way up the picture is', async () => {
+		registerDecoder(decoder({ id: 'png-pure', image: raster({ width: 200, height: 400 }) }));
+		registerEncoder(encoder({ id: 'png-out' }));
+
+		const result = await convert(
+			pngInput(),
+			{ to: 'png', resize: { longestSide: 100 } },
+			CAPABILITIES,
+		);
+
+		expect(result.report.width).toBe(50);
+		expect(result.report.height).toBe(100);
+	});
+
+	it('leaves a picture alone rather than inventing pixels for it', async () => {
+		// Somebody who types a big number means "do not shrink this". A
+		// conversion tool that upscaled here would be reporting a resolution
+		// the file never had.
+		registerDecoder(decoder({ id: 'png-pure', image: raster({ width: 40, height: 20 }) }));
+		registerEncoder(encoder({ id: 'png-out' }));
+
+		const result = await convert(
+			pngInput(),
+			{ to: 'png', resize: { longestSide: 4000 } },
+			CAPABILITIES,
+		);
+
+		expect(result.report.width).toBe(40);
+		expect(result.report.height).toBe(20);
+		expect(result.report.resizedFrom).toBeUndefined();
+	});
+
+	it('hands the encoder the small picture, not the big one', async () => {
+		// The resize has to happen before the flatten and the gamut narrow, or
+		// each of those walks every pixel of a picture that was about to be
+		// thrown away.
+		registerDecoder(decoder({ id: 'png-pure', image: raster({ width: 400, height: 200 }) }));
+		registerEncoder(encoder({ id: 'png-out' }));
+
+		await convert(pngInput(), { to: 'png', resize: { longestSide: 100 } }, CAPABILITIES);
+
+		const seen = seenByEncoder().image;
+		expect(seen.width).toBe(100);
+		expect(seen.height).toBe(50);
+		expect(seen.data.length).toBe(100 * 50 * 4);
+	});
+
+	it('resizes light without rounding it back into eight bits', async () => {
+		// The float path never reaches `correct`, so it does its own resize.
+		// A resampler that clamped here would throw away the range that is the
+		// only reason the format exists.
+		registerDecoder(decoder({ id: 'exr-pure', light: light({ width: 8, height: 4 }) }));
+		registerEncoder(encoder({ id: 'exr-out', format: 'exr', floats: true }));
+
+		const result = await convert(
+			pngInput(),
+			{ to: 'exr', resize: { longestSide: 4 } },
+			CAPABILITIES,
+		);
+
+		expect(result.report.width).toBe(4);
+		expect(result.report.height).toBe(2);
+		const written = lastFloatEncode?.image as FloatImage;
+		expect(written.width).toBe(4);
+		// The bright corner is averaged with its neighbours rather than
+		// clipped, so it stays well above the one that eight bits would cap it
+		// at, which is the whole assertion.
+		expect(Math.max(...written.data)).toBeGreaterThan(1);
+	});
+
+	it('says nothing about a resize that did not happen', async () => {
+		registerDecoder(decoder({ id: 'png-pure', image: raster({ width: 400, height: 200 }) }));
+		registerEncoder(encoder({ id: 'png-out' }));
+
+		const result = await convert(pngInput(), { to: 'png' }, CAPABILITIES);
+
+		expect(result.report.resizedFrom).toBeUndefined();
+		expect(result.report.width).toBe(400);
+	});
 });
 
 /* ── The input ────────────────────────────────────────────────────────── */

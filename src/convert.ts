@@ -7,7 +7,12 @@
  * be narrowed, and both come back on the report so the interface can say so.
  */
 
-import { UnsupportedHereError, EncodeUnsupportedError, ImageTooLargeError } from './errors.js';
+import {
+	CancelledError,
+	EncodeUnsupportedError,
+	ImageTooLargeError,
+	UnsupportedHereError,
+} from './errors.js';
 import { FORMATS } from './formats.js';
 import { detectCapabilities } from './detect/capabilities.js';
 import { installDefaultCodecs } from './defaults.js';
@@ -17,6 +22,7 @@ import { decodersFor, encodersFor } from './registry.js';
 import { detectAlpha, flatten } from './raster/image.js';
 import { toColourSpace } from './raster/colour.js';
 import { toFloatColourSpace } from './raster/float.js';
+import { fitLongestSide, resizeFloat, resizeRaster } from './raster/resize.js';
 import { toneMapImage } from './raster/tonemap.js';
 import type {
 	Capabilities,
@@ -40,6 +46,25 @@ export const DEFAULT_MAX_PIXELS = 80_000_000;
 
 function now(): number {
 	return typeof performance === 'object' ? performance.now() : Date.now();
+}
+
+/**
+ * Whether this failure means the caller asked us to stop.
+ *
+ * Two shapes reach here. The rungs that check the signal themselves throw
+ * `CancelledError`, and the platform APIs underneath them (`VideoDecoder`,
+ * `VideoEncoder`) reject with a bare `AbortError` `DOMException` that never
+ * passed through this package at all. Both mean the same thing and both have to
+ * stop the ladder, because walking on after a cancellation is how pressing stop
+ * used to start the slowest rung of all.
+ */
+function isCancellation(error: unknown): boolean {
+	if (error instanceof CancelledError) return true;
+	return (
+		typeof error === 'object' &&
+		error !== null &&
+		(error as { name?: unknown }).name === 'AbortError'
+	);
 }
 
 export async function convert(
@@ -96,6 +121,7 @@ export async function convert(
 			break;
 		} catch (error) {
 			if (error instanceof ImageTooLargeError) throw error;
+			if (isCancellation(error)) throw new CancelledError();
 			lastError = error;
 		}
 	}
@@ -111,8 +137,12 @@ export async function convert(
 			} catch (error) {
 				// An image that is simply too big will be too big for the next
 				// rung as well, so that one stops the ladder rather than
-				// walking it.
+				// walking it. A cancellation stops it for the opposite reason:
+				// there is nobody left waiting for the answer, and the rung
+				// below this one is the slow software decoder, so continuing
+				// made pressing stop take longer than not pressing it.
 				if (error instanceof ImageTooLargeError) throw error;
+				if (isCancellation(error)) throw new CancelledError();
 				lastError = error;
 			}
 		}
@@ -145,12 +175,41 @@ export async function convert(
 		to === 'exr';
 	const narrow = !wantWide || !canCarryWide;
 
+	/**
+	 * The size everything is going to, decided once from the source.
+	 *
+	 * Taken from the decoded picture rather than per frame, so that every frame
+	 * of an animation lands on the same grid. A frame is the same size as its
+	 * animation by construction, so this is the same answer either way, and
+	 * asking once means a five hundred frame GIF does not recompute it five
+	 * hundred times.
+	 */
+	const sourceGeometry = output?.image ?? light?.image;
+	const resized =
+		options.resize && sourceGeometry
+			? fitLongestSide(sourceGeometry.width, sourceGeometry.height, options.resize.longestSide)
+			: undefined;
+	const shrinks =
+		resized !== undefined &&
+		sourceGeometry !== undefined &&
+		(resized.width !== sourceGeometry.width || resized.height !== sourceGeometry.height);
+
 	const correct = (source: RasterImage): RasterImage => {
 		// Not rotated here. `DecodeOutput.image` is upright by contract, and
 		// the orientation on it says what the decoder already did.
-		let corrected: RasterImage = {
-			...source,
-			hasAlpha: source.hasAlpha || detectAlpha(source),
+		//
+		// Resized first, and deliberately. Everything below this line costs a
+		// pass over every pixel, so doing them on the smaller picture is the
+		// difference between one expensive traversal and three. Narrowing the
+		// gamut after resampling is also the correct order: the filter averages
+		// in whatever primaries the source had, which is where its numbers mean
+		// what the camera meant.
+		let corrected: RasterImage = shrinks
+			? resizeRaster(source, resized.width, resized.height)
+			: source;
+		corrected = {
+			...corrected,
+			hasAlpha: corrected.hasAlpha || detectAlpha(corrected),
 		};
 		if (!target.alpha && corrected.hasAlpha) {
 			corrected = flatten(corrected, options.background);
@@ -186,7 +245,14 @@ export async function convert(
 	let floatImage: FloatImage | undefined;
 	if (light) {
 		if (floatEncoders.length > 0) {
-			floatImage = narrow ? toFloatColourSpace(light.image, 'srgb') : light.image;
+			// This branch never reaches `correct`, so the resize has to happen
+			// here too. It is the same filter over the same footprints; what it
+			// must not do is round or clamp, which is why there are two
+			// functions rather than a cast.
+			const placed = shrinks
+				? resizeFloat(light.image, resized.width, resized.height)
+				: light.image;
+			floatImage = narrow ? toFloatColourSpace(placed, 'srgb') : placed;
 		} else {
 			image = reduce(light);
 		}
@@ -320,6 +386,14 @@ export async function convert(
 			encoderId,
 			width: written.width,
 			height: written.height,
+			// Only when it actually moved. An interface that wants to say "5712
+			// by 4284, saved at 1920 by 1440" needs both numbers, and a field
+			// that was always present would make every caller compare them to
+			// find out whether there was anything to say.
+			resizedFrom:
+				shrinks && sourceGeometry
+					? { width: sourceGeometry.width, height: sourceGeometry.height }
+					: undefined,
 			colourSpace: written.colourSpace,
 			orientation: decoded.orientation,
 			tiles: output?.tiles,

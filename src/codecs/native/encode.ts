@@ -14,7 +14,7 @@
 
 import { EncodeFailedError } from '../../errors.js';
 import type { EncodeOptions, FormatId, RasterImage } from '../../types.js';
-import { canvasCanHold, rasterToCanvas, toBlob } from '../../raster/canvas.js';
+import { rasterToCanvas, toBlob } from '../../raster/canvas.js';
 import { flatten } from '../../raster/image.js';
 
 const MAGIC: Partial<Record<FormatId, readonly number[]>> = {
@@ -50,13 +50,9 @@ export async function encodeNative(
 	mime: string,
 	options: EncodeOptions = {},
 ): Promise<Uint8Array> {
-	if (!canvasCanHold(image.width, image.height)) {
-		throw new EncodeFailedError(
-			format,
-			'native',
-			`it is ${image.width} by ${image.height}, which is larger than this browser can hold in a drawing surface`,
-		);
-	}
+	// No size check here. `rasterToCanvas` probes the surface it actually needs
+	// and throws `SurfaceTooLargeError`, which is a decline the ladder walks
+	// past rather than a refusal that ends the conversion.
 
 	// JPEG has no alpha channel. Compositing first is better than letting the
 	// encoder do it, because the encoder composites onto black without saying

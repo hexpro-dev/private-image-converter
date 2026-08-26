@@ -19,14 +19,9 @@
  * checklist in RELEASING.md instead.
  */
 
-import { DecodeFailedError } from '../../errors.js';
+import { DecodeFailedError, SurfaceTooLargeError } from '../../errors.js';
 import type { RasterImage } from '../../types.js';
-import {
-	canvasCanHold,
-	context2d,
-	contextColourSpace,
-	requireCanvas,
-} from '../../raster/canvas.js';
+import { canvasHolds, context2d, contextColourSpace, requireCanvas } from '../../raster/canvas.js';
 
 const DECODER_ID = 'svg';
 
@@ -159,12 +154,8 @@ export async function rasteriseSvg(
 	const width = Math.max(1, Math.round(intrinsic.width * scale));
 	const height = Math.max(1, Math.round(intrinsic.height * scale));
 
-	if (!canvasCanHold(width, height)) {
-		throw new DecodeFailedError(
-			'svg',
-			DECODER_ID,
-			`it asks to be drawn at ${width} by ${height}, which is larger than this browser can hold in a drawing surface`,
-		);
+	if (!canvasHolds(width, height)) {
+		throw new SurfaceTooLargeError(width, height);
 	}
 
 	// The declared type matters: a blob served as anything else is refused by

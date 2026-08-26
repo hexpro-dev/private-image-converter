@@ -23,6 +23,7 @@ export type ConverterErrorCode =
 	| 'input/too-large'
 	| 'decode/unsupported-here'
 	| 'decode/failed'
+	| 'codec/surface-too-large'
 	| 'encode/unsupported'
 	| 'encode/failed'
 	| 'heif/malformed'
@@ -93,6 +94,35 @@ export class ImageTooLargeError extends ConverterError {
 		);
 		this.pixels = pixels;
 		this.maxPixels = maxPixels;
+	}
+}
+
+/**
+ * This rung needs a drawing surface, and one this size does not work here.
+ *
+ * A decline, not a refusal. It is deliberately not `ImageTooLargeError`: that
+ * one means the picture is beyond what this tool will attempt at all and stops
+ * the ladder, and this one means the rung that threw it happens to need a
+ * canvas. A rung that reads the same picture without one is unaffected, so the
+ * ladder walks past this and only surfaces it when nothing else could run.
+ *
+ * The distinction is load bearing. Every recent iPhone shoots 24 megapixels,
+ * which is above the surface a canvas gives on iOS, and Safari's own HEIC
+ * decoder is the rung that wants one. Sharing an error class with the hard
+ * ceiling meant the container reader behind it never got its turn and the tool
+ * refused the exact file it is named after.
+ */
+export class SurfaceTooLargeError extends ConverterError {
+	readonly width: number;
+	readonly height: number;
+
+	constructor(width: number, height: number) {
+		super(
+			'codec/surface-too-large',
+			`That image is ${width} by ${height}, which is larger than a drawing surface in this browser. Something else may be able to read it, and if nothing can, making it smaller will.`,
+		);
+		this.width = width;
+		this.height = height;
 	}
 }
 

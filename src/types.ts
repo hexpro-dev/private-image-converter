@@ -543,6 +543,18 @@ export interface ConvertOptions extends Omit<EncodeOptions, 'animation'> {
 	 * carry it and converts to sRGB where they cannot. `srgb` always converts.
 	 */
 	readonly colour?: 'preserve' | 'srgb';
+	/**
+	 * Cap the longest side, keeping the aspect ratio.
+	 *
+	 * Never upscales: asking for a longer side than the picture has leaves it
+	 * alone. It is expressed as one number rather than a width and a height
+	 * because a portrait photograph and a landscape one both want "no bigger
+	 * than this", and asking for both invites the stretch that nobody wants.
+	 *
+	 * Applied before the alpha flatten and the gamut narrow, so those run over
+	 * the smaller picture, and applied per frame for an animation.
+	 */
+	readonly resize?: { readonly longestSide: number };
 	readonly maxPixels?: number;
 	/**
 	 * What to do with an animated source.
@@ -576,6 +588,13 @@ export interface ConvertReport {
 	readonly encoderId: string;
 	readonly width: number;
 	readonly height: number;
+	/**
+	 * What the picture measured before it was resized, when it was.
+	 *
+	 * Absent when nothing changed, so an interface tests for the field rather
+	 * than comparing two pairs of numbers to discover there is nothing to say.
+	 */
+	readonly resizedFrom?: { readonly width: number; readonly height: number };
 	readonly colourSpace: ColourSpace;
 	readonly orientation: Orientation;
 	readonly tiles?: number;
