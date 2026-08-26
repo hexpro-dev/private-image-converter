@@ -13,12 +13,62 @@
  */
 
 /**
- * Whether an ICC profile describes a gamut meaningfully wider than sRGB.
+ * Display P3's three colourants, as a profile stores them.
  *
- * Decided from the red colourant rather than the profile description, because
- * the description is free text that vendors change between releases. sRGB puts
- * the red primary's X at about 0.436 and Display P3 at about 0.515, so a
- * midpoint separates them with room to spare and there is nothing to tune.
+ * These are the D50 adapted XYZ triples that live in the `rXYZ`, `gXYZ` and
+ * `bXYZ` tags, not the D65 matrix printed beside the primaries in the
+ * specification. The ICC profile connection space is D50, so a matrix/TRC
+ * profile holds its primaries already run through a Bradford adaptation.
+ * Copying the specification's matrix in here instead moves every number by
+ * more than the tolerance below and nothing matches anything: sRGB's red X, to
+ * take the one people know, is 0.4124 in the specification and 0.4361 in the
+ * profile.
+ *
+ * Derived from the Display P3 primaries (R 0.680, 0.320; G 0.265, 0.690;
+ * B 0.150, 0.060) on a D65 white, Bradford adapted to D50. They agree to the
+ * last digit s15Fixed16 can hold with the `Display P3.icc` that Apple ships in
+ * /System/Library/ColorSync/Profiles, which is where the overwhelming majority
+ * of the P3 files anybody converts came from.
+ */
+const DISPLAY_P3_COLOURANTS = new Map<string, readonly [number, number, number]>([
+	['rXYZ', [0.51512, 0.2412, -0.00105]],
+	['gXYZ', [0.29198, 0.69225, 0.04189]],
+	['bXYZ', [0.1571, 0.06657, 0.78407]],
+]);
+
+/**
+ * How far a colourant may sit from Display P3's and still count as Display P3.
+ *
+ * The nearest rivals are sRGB and Adobe RGB, whose worst components are 0.093
+ * and 0.095 away, so this leaves a factor of four in hand while still admitting
+ * a profile measured off a panel rather than computed. Do not widen it past
+ * about 0.03: DCI-P3 shares the primaries but sits on the theatre white point,
+ * its worst component is 0.032 away, and its pixels are not Display P3 pixels
+ * even though its gamut is the same triangle.
+ */
+const COLOURANT_TOLERANCE = 0.02;
+
+/**
+ * Whether an ICC profile describes Display P3, or something near enough to it
+ * that Display P3 pixels can be tagged with this profile without lying.
+ *
+ * That second clause is the whole of it, and it is why this is not the "wider
+ * than sRGB" test the name suggests. A true here asks the browser for a
+ * `display-p3` canvas readback, so the pixels become P3 numbers, and then the
+ * source's own profile is handed to the encoder and written out beside them.
+ *
+ * The test this replaces looked at one number, the red colourant's X, and
+ * called anything above 0.48 wide. Adobe RGB (1998) puts red at 0.6097,
+ * Rec.2020 at 0.6735 and ProPhoto at 0.7977, so all three passed, and an Adobe
+ * RGB photograph came out as P3 pixels carrying an Adobe RGB profile. Every
+ * colour managed viewer honours that tag, so it pulls the picture back towards
+ * a gamut the numbers were never in and the reds and greens land visibly wrong.
+ * The file looks correct in anything that ignores profiles, which is what makes
+ * it survive a review. Adobe RGB and Display P3 are close in size and nothing
+ * alike in shape, and only checking all three colourants tells them apart.
+ *
+ * Decided from the colourants rather than the profile description, because the
+ * description is free text that vendors change between releases.
  */
 export function iccIsWideGamut(profile: Uint8Array): boolean {
 	if (profile.length < 132) return false;
@@ -28,19 +78,27 @@ export function iccIsWideGamut(profile: Uint8Array): boolean {
 	// this is not a profile at all.
 	if (tagCount === 0 || tagCount > 1024) return false;
 
+	const matched = new Set<string>();
 	for (let i = 0; i < tagCount; i += 1) {
 		const entry = 132 + i * 12;
 		if (entry + 12 > profile.length) break;
 		let signature = '';
 		for (let c = 0; c < 4; c += 1) signature += String.fromCharCode(view.getUint8(entry + c));
-		if (signature !== 'rXYZ') continue;
+		const expected = DISPLAY_P3_COLOURANTS.get(signature);
+		if (!expected) continue;
 		const offset = view.getUint32(entry + 4);
 		if (offset + 20 > profile.length) return false;
 		// An XYZType tag is a signature, four reserved bytes, then s15Fixed16
 		// X, Y and Z.
-		return view.getInt32(offset + 8) / 65536 > 0.48;
+		for (let axis = 0; axis < 3; axis += 1) {
+			const value = view.getInt32(offset + 8 + axis * 4) / 65536;
+			if (Math.abs(value - expected[axis]) > COLOURANT_TOLERANCE) return false;
+		}
+		matched.add(signature);
 	}
-	return false;
+	// All three or none of it. One matching corner is not a gamut, and a
+	// profile that carries only `rXYZ` is a fixture rather than a file.
+	return matched.size === DISPLAY_P3_COLOURANTS.size;
 }
 
 /**

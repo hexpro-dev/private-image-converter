@@ -17,7 +17,7 @@ import { FORMATS } from './formats.js';
 import { detectCapabilities } from './detect/capabilities.js';
 import { installDefaultCodecs } from './defaults.js';
 import { requireFormat } from './detect/sniff.js';
-import { readExif } from './metadata/exif.js';
+import { readExif, withUprightOrientation } from './metadata/exif.js';
 import { decodersFor, encodersFor } from './registry.js';
 import { detectAlpha, flatten } from './raster/image.js';
 import { toColourSpace } from './raster/colour.js';
@@ -290,7 +290,29 @@ export async function convert(
 	const decoded = (output ?? light) as DecodeOutput | FloatDecodeOutput;
 	const geometry = image ?? floatImage;
 	const wide = (geometry?.colourSpace ?? 'srgb') === 'display-p3';
-	const sourceProfile = wide ? decoded?.iccProfile : undefined;
+
+	// Carried on provenance rather than on a gamut test. A profile describes
+	// the numbers the decoder produced, so it stays valid for as long as
+	// nothing has moved those numbers into a different space. Resizing and
+	// flattening do not; narrowing the gamut does, and that is the one case
+	// where re-embedding the source profile would be describing the file
+	// wrongly rather than describing it well.
+	//
+	// The old rule was "carry it when the raster is still wide", which silently
+	// dropped a profile from every ordinary sRGB source that had one. A TIFF
+	// read here carries a profile that its own decoder went and found, and it
+	// went straight into the bin.
+	const sourceSpace = decoded.image.colourSpace;
+	const colourMoved = geometry !== undefined && geometry.colourSpace !== sourceSpace;
+	const sourceProfile = colourMoved ? undefined : decoded.iccProfile;
+
+	// EXIF is only written when it was asked for. The orientation tag has to be
+	// neutralised first: the pixels reaching the encoder are upright by the
+	// decoder contract, so the tag that came off the file describes a rotation
+	// that has already happened, and copying it across turns every portrait
+	// photograph sideways in anything that honours it.
+	const sourceExif =
+		keepMetadata && decoded.exif ? withUprightOrientation(decoded.exif) : undefined;
 
 	// A gain map is a set of coefficients, not a picture, so it is carried
 	// exactly as it arrived: correcting it would be editing the parameters of
@@ -310,6 +332,7 @@ export async function convert(
 		animation,
 		gainMap: gainMapToWrite,
 		iccProfile: sourceProfile ?? (keepMetadata ? options.iccProfile : undefined),
+		exif: sourceExif ?? (keepMetadata ? options.exif : undefined),
 		writeColourTag: wide,
 	};
 
@@ -318,6 +341,7 @@ export async function convert(
 	let encodePath = encoders[0]?.path ?? 'pure';
 	let wroteFrames = false;
 	let wroteGainMap = false;
+	let wroteExif = false;
 	let wroteLight = false;
 	let encodeError: unknown;
 
@@ -357,6 +381,7 @@ export async function convert(
 				encodePath = encoder.path;
 				wroteFrames = encoder.animates === true && animation !== undefined;
 				wroteGainMap = encoder.gainMaps === true && gainMapToWrite !== undefined;
+				wroteExif = encoder.exif === true && encodeOptions.exif !== undefined;
 				break;
 			} catch (error) {
 				encodeError = error;
@@ -404,7 +429,14 @@ export async function convert(
 			// write a moving picture in the format they chose.
 			droppedFrames:
 				sourceAnimation && sourceAnimation.frames.length > 1 && !wroteFrames ? true : undefined,
+			truncatedFrames: output?.truncatedFrames || undefined,
+			droppedAlpha: output?.droppedAlpha || undefined,
 			metadata: decoded.exif ? readExif(decoded.exif) : undefined,
+			// Reported from what the encoder declared rather than from what was
+			// asked for. Saying "kept" about a format that cannot hold EXIF
+			// would be worse than dropping it quietly, because somebody would
+			// stop checking.
+			metadataKept: decoded.exif ? (wroteExif ? 'kept' : 'stripped') : undefined,
 			// Three outcomes, and the difference between the last two is the
 			// difference between a photograph that will still look right and
 			// one that has quietly lost half of what it was.

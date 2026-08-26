@@ -67,8 +67,13 @@ const EGA_PALETTE_ENTRIES = 16;
  * describe four billion pixels and ask for sixteen gigabytes of raster. The
  * converter applies its own `maxPixels` on top of this; this one exists so the
  * decoder is safe to call on its own.
+ *
+ * The number is the converter's own default budget rather than the four
+ * hundred million it used to be. Two ceilings five times apart are not two
+ * defences: the whole range between them was reachable here and refused
+ * there, and nothing a caller would accept ever lived in it.
  */
-const MAX_PIXELS = 400_000_000;
+const MAX_PIXELS = 80_000_000;
 
 /**
  * The IBM EGA palette, for a 16 colour file that left its own table blank.
@@ -91,6 +96,41 @@ function fail(detail: string): never {
 /** PCX is little endian throughout. */
 function readU16(bytes: Uint8Array, at: number): number {
 	return (bytes[at] as number) | ((bytes[at + 1] as number) << 8);
+}
+
+/**
+ * The size the 128 byte header declares, read on its own and before any decode.
+ *
+ * Encoding 1 puts a run length coder between the header and the pixels, and
+ * although `expandRle` refuses a claim the remaining bytes could not reach,
+ * its best case is 63 bytes out of two, so ten megabytes of file honestly
+ * describes three hundred million pixels: three hundred megabytes of expanded
+ * rows and a gigabyte and a bit of raster after them. Both buffers are asked
+ * for on the strength of these four fields. This is what lets a caller with a
+ * budget refuse the file before either.
+ *
+ * The window is inclusive at both ends, so the width is a subtraction plus
+ * one. Forgetting the plus one here would under-report by a pixel a side,
+ * which is invisible on anything large and is the same off-by-one the reader
+ * itself has to get right; it is spelled out rather than shared with
+ * `readHeader` because that function validates a dozen other fields first and
+ * throws, and this one may do neither.
+ *
+ * An inside out window says nothing rather than a negative size. It is a file
+ * `readHeader` refuses by name, and its sentence is the more useful of the
+ * two.
+ */
+export function measurePcx(
+	bytes: Uint8Array,
+): { readonly width: number; readonly height: number } | undefined {
+	if (bytes.length < HEADER_BYTES) return undefined;
+	if ((bytes[0] as number) !== MANUFACTURER) return undefined;
+	const xMin = readU16(bytes, 4);
+	const yMin = readU16(bytes, 6);
+	const xMax = readU16(bytes, 8);
+	const yMax = readU16(bytes, 10);
+	if (xMax < xMin || yMax < yMin) return undefined;
+	return { width: xMax - xMin + 1, height: yMax - yMin + 1 };
 }
 
 /** What the depth and plane count together say the pixels are. */

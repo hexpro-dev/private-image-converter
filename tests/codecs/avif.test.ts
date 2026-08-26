@@ -8,6 +8,8 @@ import type { Av1FrameEncoder, Av1FrameRequest } from '../../src/codecs/avif/web
 import { ByteReader, findBox, readFullBoxHeader, walkBoxes } from '../../src/heif/boxes.js';
 import { itemBytes, itemProperties, itemProperty, parseMeta } from '../../src/heif/parse.js';
 import type { HeifMeta } from '../../src/heif/parse.js';
+import { planHeifImage } from '../../src/heif/image.js';
+import { buildHeif } from '../helpers/heif.js';
 import { CancelledError, EncodeFailedError } from '../../src/errors.js';
 import type {
 	Capabilities,
@@ -181,6 +183,198 @@ function slice(file: Uint8Array, meta: HeifMeta, id: number): Uint8Array {
 	const extent = need(location.extents[0], 'extent');
 	return file.subarray(extent.offset, extent.offset + extent.length);
 }
+
+/* ── Reading the boxes from the standard rather than from the parser ──── */
+//
+// Everything below re-reads the container from ISO/IEC 14496-12 with no help
+// from `src/heif/`. It exists for the assertions where using the same code on
+// both sides would prove nothing: a reference table written backwards and read
+// backwards agrees with itself, and so does a payload prefix that the writer
+// omits and the reader skips anyway.
+
+/**
+ * One box: four bytes of size, four characters of type, then the payload.
+ *
+ * ISO/IEC 14496-12 section 4.2. A size of zero means the box runs to the end of
+ * whatever encloses it. Nothing here writes that, and it is honoured anyway,
+ * because the alternative on meeting one is a loop that never advances.
+ */
+interface RawBox {
+	readonly type: string;
+	readonly bodyStart: number;
+	readonly end: number;
+}
+
+function viewOf(bytes: Uint8Array): DataView {
+	return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+
+function rawBoxes(file: Uint8Array, start: number, end: number): RawBox[] {
+	const view = viewOf(file);
+	const out: RawBox[] = [];
+	let at = start;
+	while (at + 8 <= end) {
+		const size = view.getUint32(at);
+		let type = '';
+		for (let i = 0; i < 4; i += 1) type += String.fromCharCode(view.getUint8(at + 4 + i));
+		const stop = size === 0 ? end : at + size;
+		out.push({ type, bodyStart: at + 8, end: stop });
+		at = stop;
+	}
+	return out;
+}
+
+/** The children of `meta`, which is a full box, so its version and flags come first. */
+function rawMetaChildren(file: Uint8Array): RawBox[] {
+	const meta = need(
+		rawBoxes(file, 0, file.length).find((box) => box.type === 'meta'),
+		'meta box',
+	);
+	return rawBoxes(file, meta.bodyStart + 4, meta.end);
+}
+
+function rawChild(file: Uint8Array, type: string): RawBox {
+	return need(
+		rawMetaChildren(file).find((box) => box.type === type),
+		`${type} box`,
+	);
+}
+
+/**
+ * The item list, read entry by entry.
+ *
+ * ISO/IEC 14496-12 section 8.11.6. `iinf` is a full box holding a count and
+ * then one `infe` per item. Version 2 of `infe` is the first spelling with an
+ * item type in it, and its body is a 16 bit item id, a 16 bit protection
+ * index, four characters of type, then a null terminated name. Bit 0 of the
+ * flags marks the item hidden.
+ */
+interface RawItem {
+	readonly id: number;
+	readonly version: number;
+	readonly type: string;
+	readonly hidden: boolean;
+}
+
+function rawItemInfo(file: Uint8Array): { declared: number; entries: RawItem[] } {
+	const iinf = rawChild(file, 'iinf');
+	const view = viewOf(file);
+	const wide = view.getUint8(iinf.bodyStart) > 0;
+	const declared = wide ? view.getUint32(iinf.bodyStart + 4) : view.getUint16(iinf.bodyStart + 4);
+	const entries = rawBoxes(file, iinf.bodyStart + (wide ? 8 : 6), iinf.end).map((box) => {
+		let type = '';
+		for (let i = 0; i < 4; i += 1) {
+			type += String.fromCharCode(view.getUint8(box.bodyStart + 8 + i));
+		}
+		return {
+			id: view.getUint16(box.bodyStart + 4),
+			version: view.getUint8(box.bodyStart),
+			type,
+			hidden: (view.getUint8(box.bodyStart + 3) & 1) === 1,
+		};
+	});
+	return { declared, entries };
+}
+
+/**
+ * The reference table, with its direction intact.
+ *
+ * ISO/IEC 14496-12 section 8.11.12. `iref` is a full box whose children are one
+ * box per reference and whose box type names the relationship. A version 0
+ * entry is a 16 bit from_item_ID, a 16 bit count, and that many 16 bit
+ * to_item_IDs; version 1 widens the ids to 32 bits and leaves the count alone.
+ */
+interface RawReference {
+	readonly type: string;
+	readonly from: number;
+	readonly to: number[];
+}
+
+function rawReferences(file: Uint8Array): RawReference[] {
+	const iref = rawChild(file, 'iref');
+	const view = viewOf(file);
+	const width = view.getUint8(iref.bodyStart) === 0 ? 2 : 4;
+	const id = (at: number): number => (width === 2 ? view.getUint16(at) : view.getUint32(at));
+	return rawBoxes(file, iref.bodyStart + 4, iref.end).map((box) => {
+		const count = view.getUint16(box.bodyStart + width);
+		const to: number[] = [];
+		for (let i = 0; i < count; i += 1) to.push(id(box.bodyStart + width + 2 + i * width));
+		return { type: box.type, from: id(box.bodyStart), to };
+	});
+}
+
+/**
+ * Where each item's bytes are, and how wide the fields saying so were.
+ *
+ * ISO/IEC 14496-12 section 8.11.3. The byte after the version and flags packs
+ * offset_size into its high nibble and length_size into its low one; the next
+ * packs base_offset_size and, from version 1, index_size. A version 0 entry is
+ * the item id, a data reference index, the base offset, an extent count and
+ * then the extents. The widths come back rather than being assumed, because an
+ * assumption about them is exactly the mistake that makes every later item read
+ * as garbage.
+ */
+interface RawExtent {
+	readonly offset: number;
+	readonly length: number;
+}
+
+function rawLocations(file: Uint8Array): {
+	widths: [number, number, number];
+	extents: Map<number, RawExtent>;
+} {
+	const iloc = rawChild(file, 'iloc');
+	const view = viewOf(file);
+	const version = view.getUint8(iloc.bodyStart);
+	const packed = view.getUint8(iloc.bodyStart + 4);
+	const offsetSize = packed >> 4;
+	const lengthSize = packed & 0x0f;
+	const baseOffsetSize = view.getUint8(iloc.bodyStart + 5) >> 4;
+
+	let at = iloc.bodyStart + 6;
+	const uint = (width: number): number => {
+		let value = 0;
+		for (let i = 0; i < width; i += 1) value = value * 256 + view.getUint8(at + i);
+		at += width;
+		return value;
+	};
+
+	const idWidth = version < 2 ? 2 : 4;
+	const count = uint(idWidth);
+	const extents = new Map<number, RawExtent>();
+	for (let i = 0; i < count; i += 1) {
+		const id = uint(idWidth);
+		if (version === 1 || version === 2) uint(2); // construction method
+		uint(2); // data reference index
+		uint(baseOffsetSize);
+		const extentCount = uint(2);
+		for (let e = 0; e < extentCount; e += 1) {
+			extents.set(id, { offset: uint(offsetSize), length: uint(lengthSize) });
+		}
+	}
+	return { widths: [offsetSize, lengthSize, baseOffsetSize], extents };
+}
+
+/**
+ * A small EXIF payload, built from TIFF 6.0 rather than captured.
+ *
+ * Big endian on purpose: the byte order mark is the first thing anything
+ * reading this lands on, and `MM` cannot be mistaken for the zeroes of a length
+ * field the way `II` nearly can. One IFD with one tag in it, 0x0112 being
+ * Orientation, type 3 being SHORT and the value 1 meaning upright, which is
+ * what `convert` has already guaranteed by the time an encoder sees any of it.
+ */
+const EXIF = Uint8Array.from([
+	// "MM" for big endian, then 42, which is the magic number that confirms it.
+	0x4d, 0x4d, 0x00, 0x2a,
+	// The first IFD begins at byte 8, immediately after this header.
+	0x00, 0x00, 0x00, 0x08,
+	// One entry: tag 0x0112 is Orientation, type 3 is SHORT, one value, and the
+	// value 1 is upright, left aligned in a field four bytes wide.
+	0x00, 0x01, 0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+	// And no IFD after this one.
+	0x00, 0x00, 0x00, 0x00,
+]);
 
 /* ── The AV1 bitstream ────────────────────────────────────────────────── */
 
@@ -869,6 +1063,166 @@ describe('every item together', () => {
 	});
 });
 
+describe('an AVIF carrying EXIF', () => {
+	const file = muxAvif({ colour: coded(GRADIENT128), colourSpace: 'srgb', exif: EXIF });
+	const meta = parseMeta(file);
+	const exifId = 2;
+
+	it('adds an Exif item behind the picture and leaves the picture primary', () => {
+		const info = rawItemInfo(file);
+		expect(info.entries).toEqual([
+			{ id: 1, version: 2, type: 'av01', hidden: false },
+			{ id: exifId, version: 2, type: 'Exif', hidden: false },
+		]);
+		// `iinf` counts its own children, and a count that disagrees with them
+		// is a file some readers stop reading part way through.
+		expect(info.declared).toBe(info.entries.length);
+		expect(meta.primaryItemId).toBe(1);
+	});
+
+	it('points the cdsc reference from the metadata at the picture it describes', () => {
+		// `cdsc` reads as "describes", so it runs from the EXIF to the image and
+		// never the other way. Written backwards, the file still parses, `iref`
+		// still holds one entry of the right type, and the reader finds no EXIF
+		// on the primary item and says nothing about it.
+		expect(rawReferences(file)).toEqual([{ type: 'cdsc', from: exifId, to: [1] }]);
+		expect(meta.references.get('cdsc')?.get(exifId)).toEqual([1]);
+		expect(meta.references.get('cdsc')?.get(1)).toBeUndefined();
+	});
+
+	it('prefixes the payload with the four byte offset to the TIFF header', () => {
+		const located = rawLocations(file);
+		// Four byte offsets, four byte lengths, no base offset. Read rather than
+		// assumed, because every field after them is positioned by these.
+		expect(located.widths).toEqual([4, 4, 0]);
+		const extent = need(located.extents.get(exifId), 'the Exif extent');
+		const payload = file.subarray(extent.offset, extent.offset + extent.length);
+
+		// ISO/IEC 23008-12: an Exif item begins with the offset from the end of
+		// that field to the TIFF header. Asserted against the standard rather
+		// than against the reader, because the reader applies the same skip and
+		// would agree with a writer that had the width wrong. So the check is
+		// that a TIFF header really begins where the field says: the byte order
+		// mark and the magic number 42 land there only if the prefix is exactly
+		// four bytes wide, and neither is a pattern a wrong offset finds by luck.
+		const view = viewOf(payload);
+		expect(view.getUint32(0)).toBe(0);
+		const tiff = 4 + view.getUint32(0);
+		expect([payload[tiff], payload[tiff + 1]]).toEqual([0x4d, 0x4d]);
+		expect(view.getUint16(tiff + 2)).toBe(42);
+		expect(payload.length).toBe(tiff + EXIF.length);
+		expect(payload.subarray(tiff)).toEqual(EXIF);
+	});
+
+	it('comes back byte identical through the reader in src/heif', () => {
+		const payload = itemBytes(file, meta, exifId);
+		const view = viewOf(payload);
+		expect(payload.subarray(4 + view.getUint32(0))).toEqual(EXIF);
+
+		// And the same item, compared against a HEIF the reader is already
+		// known to resolve. `planHeifImage` cannot be pointed at an AVIF, since
+		// it refuses AV1 in a HEIF container by name, so this is what closes the
+		// loop: the reader recovers the payload from that file, and the item
+		// this writer produced is byte for byte the same thing.
+		const heif = buildHeif({ exif: EXIF });
+		const heifMeta = parseMeta(heif);
+		const heifExifId = need(
+			[...heifMeta.items.values()].find((item) => item.type === 'Exif')?.id,
+			'Exif item in the HEIF fixture',
+		);
+		expect(planHeifImage(heif).exif).toEqual(EXIF);
+		expect(payload).toEqual(itemBytes(heif, heifMeta, heifExifId));
+	});
+
+	it('claims no properties for the Exif item, rather than claiming none loudly', () => {
+		// `ipma` names the picture and stops. An entry with an association count
+		// of zero would parse, and no file in the wild carries one.
+		expect([...associations(file).keys()]).toEqual([1]);
+	});
+
+	it('places the payload behind the coded picture inside the mdat', () => {
+		const mdat = need(findBox(file, 0, file.length, 'mdat', 'tile-data'), 'mdat box');
+		const picture = need(need(meta.locations.get(1), 'the picture').extents[0], 'extent');
+		const exif = need(need(meta.locations.get(exifId), 'the Exif item').extents[0], 'extent');
+		expect(picture.offset).toBe(mdat.bodyStart);
+		expect(exif.offset).toBe(picture.offset + picture.length);
+		expect(exif.offset + exif.length).toBe(mdat.end);
+	});
+});
+
+describe('an AVIF with no EXIF', () => {
+	it('writes no Exif item and no iref when the caller supplied none', () => {
+		const file = muxAvif({ colour: coded(GRADIENT128), colourSpace: 'srgb' });
+		expect(rawItemInfo(file).entries.map((item) => item.type)).toEqual(['av01']);
+		expect(rawMetaChildren(file).map((box) => box.type)).not.toContain('iref');
+		expect(parseMeta(file).references.size).toBe(0);
+	});
+
+	it('treats an empty payload as nothing to carry', () => {
+		// An Exif item holding only its own offset field is a claim of metadata
+		// with none behind it, and the reader reports it as absent anyway.
+		const file = muxAvif({
+			colour: coded(GRADIENT128),
+			colourSpace: 'srgb',
+			exif: new Uint8Array(0),
+		});
+		expect(rawItemInfo(file).entries.map((item) => item.type)).toEqual(['av01']);
+		expect(rawMetaChildren(file).map((box) => box.type)).not.toContain('iref');
+	});
+});
+
+describe('an AVIF with a gain map and EXIF together', () => {
+	const metadata = Uint8Array.from({ length: 62 }, (_value, i) => (i * 5 + 3) & 0xff);
+	const file = muxAvif({
+		colour: coded(GRADIENT128),
+		alpha: coded(GRADIENT128),
+		colourSpace: 'display-p3',
+		gainMap: { image: coded(GRADIENT64X48), metadata },
+		exif: EXIF,
+	});
+	const meta = parseMeta(file);
+
+	it('numbers the pictures first, so the metadata cannot renumber them', () => {
+		// The ids the references below name are handed out in the order the
+		// pictures are planned. An Exif item inserted anywhere but last shifts
+		// them, and the `dimg` that says which picture the gain applies to then
+		// points at the wrong one with nothing anywhere reporting it.
+		expect(rawItemInfo(file).entries).toEqual([
+			{ id: 1, version: 2, type: 'av01', hidden: false },
+			{ id: 2, version: 2, type: 'av01', hidden: true },
+			{ id: 3, version: 2, type: 'av01', hidden: true },
+			{ id: 4, version: 2, type: 'tmap', hidden: false },
+			{ id: 5, version: 2, type: 'Exif', hidden: false },
+		]);
+	});
+
+	it('leaves the tmap deriving from the base and the map, in that order', () => {
+		expect(rawReferences(file)).toEqual([
+			{ type: 'auxl', from: 2, to: [1] },
+			{ type: 'dimg', from: 4, to: [1, 3] },
+			{ type: 'cdsc', from: 5, to: [1] },
+		]);
+		expect(itemProperty(meta, 4, 'ispe')).toEqual({ kind: 'ispe', width: 128, height: 128 });
+		expect(itemBytes(file, meta, 4)).toEqual(metadata);
+		expect(brands(file)).toContain('tmap');
+	});
+
+	it('lands the bytes of every item where its own iloc entry says', () => {
+		expect(slice(file, meta, 1)).toEqual(coded(GRADIENT128).data);
+		expect(slice(file, meta, 3)).toEqual(coded(GRADIENT64X48).data);
+		expect(slice(file, meta, 4)).toEqual(metadata);
+		expect(itemBytes(file, meta, 5).subarray(4)).toEqual(EXIF);
+	});
+
+	it('describes the base picture rather than the tone mapped item', () => {
+		// The `tmap` is a derived item with no pixels of its own, and the EXIF
+		// came off the camera that took the base. Anything looking for the
+		// metadata of a photograph looks for a `cdsc` naming the primary item,
+		// so pointing at the derived one would hide it from all of them.
+		expect(meta.references.get('cdsc')?.get(5)).toEqual([meta.primaryItemId]);
+	});
+});
+
 describe('odd dimensions', () => {
 	it('records 33 by 17 without rounding either of them', () => {
 		// Both dimensions odd, so a writer that padded to a chroma pair would
@@ -1050,6 +1404,24 @@ describe('encodeAvif', () => {
 			(property) => property.kind === 'colr' && property.type === 'icc',
 		);
 		expect(icc?.kind === 'colr' ? icc.iccProfile : undefined).toEqual(profile);
+	});
+
+	it('carries the EXIF the caller handed over', async () => {
+		const file = await encodeAvif(
+			raster(128, 128),
+			{ exif: EXIF },
+			CONTEXT,
+			fakeEncoder([GRADIENT128], []),
+		);
+		const meta = parseMeta(file);
+		expect([...meta.items.values()].map((item) => item.type)).toEqual(['av01', 'Exif']);
+		expect(itemBytes(file, meta, 2).subarray(4)).toEqual(EXIF);
+		expect(meta.references.get('cdsc')?.get(2)).toEqual([1]);
+	});
+
+	it('writes no Exif item when the caller handed over none', async () => {
+		const file = await encodeAvif(raster(128, 128), {}, CONTEXT, fakeEncoder([GRADIENT128], []));
+		expect([...parseMeta(file).items.values()].map((item) => item.type)).toEqual(['av01']);
 	});
 
 	it('maps quality onto the quantiser at both ends of the slider', async () => {

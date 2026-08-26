@@ -1,20 +1,28 @@
 /**
- * EXIF and ICC metadata reading.
+ * EXIF: finding the block in each container, and reading what is in it.
  *
- * Every payload here is assembled byte by byte from the TIFF and ICC layouts
- * rather than lifted out of a photograph. Camera files cannot be committed to a
- * public repository, and a fixture written by exiftool would only prove that
- * this reader agrees with exiftool, which is not the claim being made.
+ * Every payload here is assembled byte by byte from the TIFF layout and from
+ * each container's own specification rather than lifted out of a photograph.
+ * Camera files cannot be committed to a public repository, and a fixture
+ * written by exiftool would only prove that this reader agrees with exiftool,
+ * which is not the claim being made.
  *
- * Two traps drive most of what follows: a TIFF value of four bytes or fewer
- * lives in the directory entry instead of at an offset, and EXIF counts
- * rotation clockwise while this package counts anticlockwise. Both produce a
- * file that parses without complaint and comes out wrong.
+ * Three traps drive most of what follows: a TIFF value of four bytes or fewer
+ * lives in the directory entry instead of at an offset, EXIF counts rotation
+ * clockwise while this package counts anticlockwise, and a JPEG carries more
+ * than one APP1 segment so the EXIF one has to be found by its identifier.
+ * All three produce a file that parses without complaint and comes out wrong.
+ *
+ * The ICC side lives in icc.test.ts beside this.
  */
 
 import { describe, expect, it } from 'vitest';
-import { orientationFromExif, readExif } from '../../src/metadata/exif.js';
-import { declaresWideGamut, findIccProfile, iccIsWideGamut } from '../../src/metadata/icc.js';
+import {
+	findExif,
+	orientationFromExif,
+	readExif,
+	withUprightOrientation,
+} from '../../src/metadata/exif.js';
 
 const TAG_IMAGE_WIDTH = 0x0100;
 const TAG_MAKE = 0x010f;
@@ -557,170 +565,142 @@ describe('the rotation an EXIF orientation asks for', () => {
 	});
 });
 
-/**
- * ICC fixtures.
- *
- * A profile is a 128 byte header, a tag count, a table of twelve byte entries,
- * and the tag data. Only the red colourant matters to this reader, so that is
- * the only tag with real numbers in it.
- */
+describe('setting an EXIF payload upright before it is written back out', () => {
+	/** Where the value bytes of the first entry of the first directory sit. */
+	const FIRST_VALUE_AT = MAIN_AT + 2 + 8;
 
-interface IccTag {
-	readonly signature: string;
-	readonly data: Uint8Array;
-	/** Where the table claims the data is, for when that is to be a lie. */
-	readonly offset?: number;
-}
-
-/** s15Fixed16: a signed 32 bit number with sixteen fractional bits. */
-function fixed16(value: number): number {
-	return Math.round(value * 65536);
-}
-
-/** An XYZType tag: a signature, four reserved bytes, then X, Y and Z. */
-function xyzTag(x: number, y: number, z: number): Uint8Array {
-	const data = new Uint8Array(20);
-	const view = new DataView(data.buffer);
-	writeAscii(data, 0, 'XYZ ');
-	view.setInt32(8, fixed16(x));
-	view.setInt32(12, fixed16(y));
-	view.setInt32(16, fixed16(z));
-	return data;
-}
-
-function asciiTag(text: string): Uint8Array {
-	const data = new Uint8Array(text.length);
-	writeAscii(data, 0, text);
-	return data;
-}
-
-function iccProfile(tags: readonly IccTag[], declaredCount = tags.length): Uint8Array {
-	const tableAt = 128;
-	let cursor = tableAt + 4 + tags.length * 12;
-	const placed = tags.map((tag) => {
-		if (tag.offset !== undefined) return { tag, at: tag.offset, embedded: false };
-		const at = cursor;
-		cursor += tag.data.length + ((4 - (tag.data.length % 4)) % 4);
-		return { tag, at, embedded: true };
+	it.each(BYTE_ORDERS)('rewrites an orientation of 6 to 1 in %s byte order', (_o, little) => {
+		const payload = tiff({ little, main: [{ tag: TAG_ORIENTATION, short: 6 }] });
+		const upright = withUprightOrientation(payload);
+		expect(readExif(upright)?.orientation).toBe(1);
+		// The rest of the block has to survive untouched, because the offsets
+		// in it point at each other. Same length, and the same bytes either
+		// side of the two that changed.
+		expect(upright.length).toBe(payload.length);
+		expect(upright.subarray(0, FIRST_VALUE_AT)).toEqual(payload.subarray(0, FIRST_VALUE_AT));
+		expect(upright.subarray(FIRST_VALUE_AT + 2)).toEqual(payload.subarray(FIRST_VALUE_AT + 2));
 	});
 
-	const bytes = new Uint8Array(Math.max(cursor, 132));
-	const view = new DataView(bytes.buffer);
-	// The size field and the 'acsp' signature, so the fixture is shaped like a
-	// profile even though this reader looks at neither.
-	view.setUint32(0, bytes.length);
-	writeAscii(bytes, 36, 'acsp');
-	view.setUint32(tableAt, declaredCount);
-	placed.forEach((entry, i) => {
-		const at = tableAt + 4 + i * 12;
-		writeAscii(bytes, at, entry.tag.signature);
-		view.setUint32(at + 4, entry.at);
-		view.setUint32(at + 8, entry.tag.data.length);
-		if (entry.embedded) bytes.set(entry.tag.data, entry.at);
-	});
-	return bytes;
-}
-
-/** Display P3 puts the red primary's X at about 0.515. */
-function p3Profile(): Uint8Array {
-	return iccProfile([{ signature: 'rXYZ', data: xyzTag(0.5151, 0.2412, 0) }]);
-}
-
-/** sRGB puts it at about 0.436, which is the whole of the difference. */
-function srgbProfile(): Uint8Array {
-	return iccProfile([{ signature: 'rXYZ', data: xyzTag(0.436, 0.2225, 0.0139) }]);
-}
-
-describe('deciding gamut from an ICC profile', () => {
-	it('calls a Display P3 red colourant wide', () => {
-		expect(iccIsWideGamut(p3Profile())).toBe(true);
+	it('leaves the payload it was handed alone', () => {
+		// The source EXIF is a view into the file being converted, and the
+		// summary shown to the user is read from it. Writing through it changes
+		// what the report says was removed.
+		const payload = tiff({ main: [{ tag: TAG_ORIENTATION, short: 8 }] });
+		const upright = withUprightOrientation(payload);
+		expect(upright).not.toBe(payload);
+		expect(readExif(payload)?.orientation).toBe(8);
+		expect(readExif(upright)?.orientation).toBe(1);
 	});
 
-	it('calls an sRGB red colourant narrow', () => {
-		expect(iccIsWideGamut(srgbProfile())).toBe(false);
+	it('hands back the same payload when there is no orientation tag to correct', () => {
+		// Identity rather than a copy, so that carrying metadata across a
+		// conversion does not duplicate every block for nothing.
+		const payload = tiff({ main: [{ tag: TAG_MAKE, text: 'Canon' }] });
+		expect(withUprightOrientation(payload)).toBe(payload);
 	});
 
-	it('ignores a description that says Display P3 when the colourant says sRGB', () => {
-		// Vendors rewrite the description between releases and copy each other's
-		// wording. The numbers are the profile; the text beside them is not.
-		const profile = iccProfile([
-			{ signature: 'desc', data: asciiTag('Display P3') },
-			{ signature: 'rXYZ', data: xyzTag(0.436, 0.2225, 0.0139) },
-		]);
-		expect(iccIsWideGamut(profile)).toBe(false);
-	});
-
-	it('puts the line between the two primaries rather than on top of either', () => {
-		expect(iccIsWideGamut(iccProfile([{ signature: 'rXYZ', data: xyzTag(0.48, 0.24, 0) }]))).toBe(
-			false,
+	it('leaves a second directory alone, because that one describes the thumbnail', () => {
+		// IFD1 is the embedded thumbnail, and its orientation describes the
+		// thumbnail rather than the picture. Written out byte for byte:
+		//
+		//     4d4d 002a 00000008          header, first directory at 8
+		//     0001                        one entry
+		//     0112 0003 00000001 00060000 Orientation, SHORT, one, value 6
+		//     0000001a                    the next directory is at byte 26
+		//     0001                        one entry
+		//     0112 0003 00000001 00080000 Orientation, SHORT, one, value 8
+		//     00000000                    no third directory
+		const payload = hex(
+			'4d4d002a00000008 0001 011200030000000100060000 0000001a' +
+				'0001 011200030000000100080000 00000000',
 		);
-		expect(iccIsWideGamut(iccProfile([{ signature: 'rXYZ', data: xyzTag(0.4801, 0.24, 0) }]))).toBe(
-			true,
-		);
+		expect(payload.length).toBe(44);
+		const upright = withUprightOrientation(payload);
+		expect(upright[19]).toBe(1);
+		expect(upright[37]).toBe(8);
 	});
 
-	it('refuses a buffer too short to hold a header and a tag count', () => {
-		expect(iccIsWideGamut(new Uint8Array(131))).toBe(false);
+	it('leaves an orientation tag alone when its type is not SHORT', () => {
+		// A LONG in that tag is out of specification, and the two bytes this
+		// writes into an entry are only in the right place for a SHORT. Writing
+		// them anyway on a big endian file would set the high half of the value
+		// and leave a file claiming orientation 65536.
+		const payload = tiff({ little: false, main: [{ tag: TAG_ORIENTATION, long: 6 }] });
+		expect(withUprightOrientation(payload)).toBe(payload);
 	});
 
-	it('refuses a tag count no profile would carry', () => {
-		// Reached by handing this arbitrary bytes, where the four at offset 128
-		// are as likely to be four billion as anything else. Trusting the count
-		// is a loop over a table that is not there.
-		expect(
-			iccIsWideGamut(iccProfile([{ signature: 'rXYZ', data: xyzTag(0.5151, 0.24, 0) }], 0)),
-		).toBe(false);
-		const many = iccProfile([{ signature: 'rXYZ', data: xyzTag(0.5151, 0.24, 0) }], 0x7fffffff);
-		expect(iccIsWideGamut(many)).toBe(false);
+	it('hands back anything that is not an EXIF payload unchanged', () => {
+		// Never a throw. A file whose metadata is damaged still has pixels, and
+		// the conversion is what the user asked for.
+		for (const payload of [
+			new Uint8Array(0),
+			u8(0x4d, 0x4d, 0x00),
+			hex('00002a0000000008'),
+			hex('4d4d002b00000008'),
+		]) {
+			expect(withUprightOrientation(payload)).toBe(payload);
+		}
 	});
 
-	it('refuses a profile whose table has no red colourant', () => {
-		expect(iccIsWideGamut(iccProfile([{ signature: 'desc', data: asciiTag('sRGB') }]))).toBe(false);
+	it('stops at a directory that runs off the end of the payload', () => {
+		const full = tiff({
+			main: [
+				{ tag: TAG_MAKE, text: 'Canon' },
+				{ tag: TAG_ORIENTATION, short: 6 },
+			],
+		});
+		const cut = full.subarray(0, MAIN_AT + 2 + 12 + 6);
+		expect(withUprightOrientation(cut)).toBe(cut);
 	});
 
-	it('refuses a table entry that runs off the end rather than reading past it', () => {
-		// A profile of exactly 132 bytes has room for the header and the count
-		// and none for the twelve byte entry the count promises. The entry is
-		// read a byte at a time out of a DataView, so walking into it throws a
-		// RangeError rather than returning a wrong answer, and a throw here is
-		// a failed conversion of a file that was only ever going to be sRGB.
-		const bytes = new Uint8Array(132);
-		new DataView(bytes.buffer).setUint32(128, 1);
-		expect(iccIsWideGamut(bytes)).toBe(false);
-	});
-
-	it('finds a red colourant at the far end of a table of the largest size it accepts', () => {
-		// Every other fixture here puts rXYZ first or second. A real profile
-		// has it after the description, the copyright and the white point, and
-		// the loop has to reach it. 1024 entries is the ceiling this reader
-		// sets, so a profile with exactly that many is the largest it must
-		// still read and one more is the point at which it stops trusting the
-		// count.
-		const filler = (count: number) =>
-			Array.from({ length: count }, () => ({ signature: 'wtpt', data: new Uint8Array(0) }));
-		const red = { signature: 'rXYZ', data: xyzTag(0.5151, 0.2412, 0) };
-		expect(iccIsWideGamut(iccProfile([...filler(1023), red]))).toBe(true);
-		expect(iccIsWideGamut(iccProfile([...filler(1024), red]))).toBe(false);
-	});
-
-	it('refuses an rXYZ entry pointing outside the profile', () => {
-		// This is what a profile truncated partway through looks like: the table
-		// survives and the data it names does not. The wrong answer here is a
-		// confident one taken from whatever bytes follow.
-		const profile = iccProfile([
-			{ signature: 'rXYZ', data: xyzTag(0.5151, 0.2412, 0), offset: 4096 },
-		]);
-		expect(iccIsWideGamut(profile)).toBe(false);
+	it('ignores a first directory offset of zero or one past the end', () => {
+		for (const offset of [0, 0xffff]) {
+			const payload = tiff({ main: [{ tag: TAG_ORIENTATION, short: 6 }] });
+			new DataView(payload.buffer).setUint32(4, offset, true);
+			expect(withUprightOrientation(payload)).toBe(payload);
+		}
 	});
 });
 
 /**
- * PNG fixtures. The chunk CRCs are left as four zero bytes, because the profile
- * reader walks past them and never checks one.
+ * Container fixtures for `findExif`.
+ *
+ * Each one is built from that format's own specification: JPEG segments from
+ * ITU-T T.81 and the Exif identifier from CIPA DC-008, PNG chunks from the PNG
+ * specification, and RIFF chunks from the WebP container specification. The
+ * point of finding the block at all is that a payload written by this
+ * package's own encoder would prove nothing about the files people convert.
  */
+
+const SOI = u8(0xff, 0xd8);
+const SOS = u8(0xff, 0xda, 0x00, 0x02);
+const EOI = u8(0xff, 0xd9);
+/** The JFIF header almost every JPEG opens with, so the walker has to pass one. */
+const JFIF = u8(0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0);
+
+const EXIF_IDENTIFIER = 'Exif\0\0';
+/** What XMP puts at the front of its own APP1, from the XMP specification part 3. */
+const XMP_IDENTIFIER = 'http://ns.adobe.com/xap/1.0/\0';
+
+/** One APP1 segment: 0xffe1, a length that counts itself, an identifier, a payload. */
+function app1(identifier: string, payload: Uint8Array): Uint8Array {
+	const length = 2 + identifier.length + payload.length;
+	const out = new Uint8Array(2 + length);
+	out[0] = 0xff;
+	out[1] = 0xe1;
+	new DataView(out.buffer).setUint16(2, length);
+	writeAscii(out, 4, identifier);
+	out.set(payload, 4 + identifier.length);
+	return out;
+}
+
+function jpeg(...segments: Uint8Array[]): Uint8Array {
+	return concat([SOI, JFIF, ...segments, SOS, EOI]);
+}
 
 const PNG_SIGNATURE = u8(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
 
+/** The CRCs are four zero bytes, because this walker never checks one. */
 function pngChunk(type: string, data: Uint8Array): Uint8Array {
 	const out = new Uint8Array(12 + data.length);
 	new DataView(out.buffer).setUint32(0, data.length);
@@ -734,75 +714,9 @@ function png(...chunks: Uint8Array[]): Uint8Array {
 	return concat([PNG_SIGNATURE, ihdr, ...chunks, pngChunk('IEND', new Uint8Array(0))]);
 }
 
-/** Colour primaries, transfer characteristics, matrix coefficients, full range. */
-function cicpChunk(primaries: number): Uint8Array {
-	return pngChunk('cICP', u8(primaries, 13, 0, 1));
-}
-
-/** A profile name, a NUL, the compression method, then deflated bytes. */
-function iccpChunk(): Uint8Array {
-	return pngChunk('iCCP', u8(0x50, 0x33, 0, 0, 0x78, 0x9c, 0x03, 0x00));
-}
-
 function idatChunk(): Uint8Array {
 	return pngChunk('IDAT', u8(0x78, 0x9c, 0x03, 0x00));
 }
-
-describe('what a PNG declares', () => {
-	it('reads Display P3 out of a cICP chunk carrying 12', () => {
-		// Primaries 12 is SMPTE EG 432-1. An iPhone screenshot says P3 this way
-		// and carries no profile at all, so a reader that only looks for iCCP
-		// calls the most common wide gamut file on the platform narrow.
-		expect(declaresWideGamut(png(cicpChunk(12), idatChunk()), 'png')).toBe(true);
-	});
-
-	it('leaves a cICP chunk naming BT.709 alone', () => {
-		expect(declaresWideGamut(png(cicpChunk(1), idatChunk()), 'png')).toBe(false);
-	});
-
-	it('finds an iCCP chunk but will not call it wide without inflating it', () => {
-		// The profile is deflated, and inflating it would make the whole call
-		// async to answer one boolean. Reporting narrow is the safe half of the
-		// answer: it leaves the image in sRGB, which is where dropping the
-		// profile would have left it anyway.
-		const bytes = png(iccpChunk(), idatChunk());
-		// An empty array rather than undefined, which is the difference between
-		// "there is a profile here and its contents are unknown" and "there is
-		// no profile". The two are told apart by length, so pin the length
-		// rather than only that something came back.
-		expect(findIccProfile(bytes, 'png')?.length).toBe(0);
-		expect(declaresWideGamut(bytes, 'png')).toBe(false);
-	});
-
-	it('stops at IDAT, where a colour chunk can no longer legally appear', () => {
-		// Anything found after the image data is not a declaration, and walking
-		// on means reading every chunk of a large file to learn nothing.
-		expect(declaresWideGamut(png(idatChunk(), cicpChunk(12)), 'png')).toBe(false);
-	});
-
-	it('will not read a cICP chunk the file is too short to be carrying', () => {
-		// Both ways a truncated download can land inside this chunk. The chunk
-		// is sixteen bytes: four of length, four of type, four of data and four
-		// of CRC, and the primaries byte is the first of the data.
-		//
-		// The second cut is the one that matters. The primaries byte is there
-		// and says 12, and everything needed to find it is there, so a reader
-		// that takes the byte without first checking the chunk arrived whole
-		// calls a half downloaded file wide gamut on the strength of four
-		// bytes that were never followed by their CRC.
-		const CHUNK_STARTS_AT = PNG_SIGNATURE.length + 12 + 13;
-		const bytes = png(cicpChunk(12), idatChunk());
-		for (const kept of [9, 12]) {
-			const cut = bytes.subarray(0, CHUNK_STARTS_AT + kept);
-			expect(cut[CHUNK_STARTS_AT + 8]).toBe(12);
-			expect(declaresWideGamut(cut, 'png')).toBe(false);
-		}
-	});
-
-	it('returns false for a PNG with no colour chunk at all', () => {
-		expect(declaresWideGamut(png(idatChunk()), 'png')).toBe(false);
-	});
-});
 
 function riffChunk(fourcc: string, data: Uint8Array): Uint8Array {
 	const out = new Uint8Array(8 + data.length + (data.length & 1));
@@ -822,191 +736,216 @@ function webp(...chunks: Uint8Array[]): Uint8Array {
 	return out;
 }
 
-describe('what a WebP declares', () => {
-	it('reads a Display P3 profile out of an ICCP chunk', () => {
-		expect(declaresWideGamut(webp(riffChunk('ICCP', p3Profile())), 'webp')).toBe(true);
+/** A payload with something in it worth reporting as removed. */
+function samplePayload(): Uint8Array {
+	return tiff({
+		main: [
+			{ tag: TAG_ORIENTATION, short: 6 },
+			{ tag: TAG_MAKE, text: 'Canon' },
+			{ tag: TAG_GPS_IFD, points: 'gps' },
+		],
+		gps: [{ tag: TAG_GPS_LATITUDE, short: 33 }],
+	});
+}
+
+describe('finding the EXIF block in a JPEG', () => {
+	it('reads the payload behind the Exif identifier in an APP1 segment', () => {
+		const payload = samplePayload();
+		const found = findExif(jpeg(app1(EXIF_IDENTIFIER, payload)), 'jpeg');
+		expect(found).toEqual(payload);
+		// The block is what the report and the encoder both consume, so it has
+		// to start at the TIFF header rather than at the identifier.
+		expect(readExif(found ?? new Uint8Array(0))?.hasLocation).toBe(true);
 	});
 
-	it('calls an sRGB profile in the same chunk narrow', () => {
-		expect(declaresWideGamut(webp(riffChunk('ICCP', srgbProfile())), 'webp')).toBe(false);
+	it('finds the EXIF segment behind an XMP one, by identifier and not by position', () => {
+		// Phones write both, XMP usually first. Taking the first APP1 in the
+		// file hands back a lump of RDF/XML whose first two bytes are '<x',
+		// which is neither II nor MM, so the metadata silently disappears.
+		const payload = samplePayload();
+		const xmp = app1(XMP_IDENTIFIER, u8(0x3c, 0x78, 0x3a, 0x78));
+		expect(findExif(jpeg(xmp, app1(EXIF_IDENTIFIER, payload)), 'jpeg')).toEqual(payload);
+		expect(findExif(jpeg(app1(EXIF_IDENTIFIER, payload), xmp), 'jpeg')).toEqual(payload);
+	});
+
+	it('takes the payload from six bytes on whatever the pad byte holds', () => {
+		// The specification fixes the byte after 'Exif\0' at zero and a few
+		// writers put something else there. The TIFF header starts after it
+		// either way, so matching all six exactly loses those files.
+		const payload = samplePayload();
+		const bytes = jpeg(app1('Exif\0\u00ff', payload));
+		expect(findExif(bytes, 'jpeg')).toEqual(payload);
+	});
+
+	it('steps over an APP1 too short to hold the identifier without losing its place', () => {
+		// The identifier check reads six bytes whether the segment has six or
+		// not. What must not happen is the walk advancing by anything other
+		// than this segment's own length, because after that every offset is
+		// wrong and the block behind it is never found.
+		const payload = samplePayload();
+		const stub = u8(0xff, 0xe1, 0x00, 0x04, 0x45, 0x78);
+		expect(findExif(jpeg(stub), 'jpeg')).toBeUndefined();
+		expect(findExif(jpeg(stub, app1(EXIF_IDENTIFIER, payload)), 'jpeg')).toEqual(payload);
+	});
+
+	it('stops at the start of scan rather than reading compressed data as segments', () => {
+		// After SOS the bytes are entropy coded, so anything in there that
+		// looks like a segment header is a coincidence.
+		const bytes = concat([SOI, JFIF, SOS, app1(EXIF_IDENTIFIER, samplePayload()), EOI]);
+		expect(findExif(bytes, 'jpeg')).toBeUndefined();
+	});
+
+	it('gives up on a segment whose length runs past the end of the file', () => {
+		// The commonest damaged JPEG there is: the download stopped. The length
+		// field being read comes out of the same file, so it cannot be trusted
+		// to point anywhere inside it.
+		const bytes = jpeg(app1(EXIF_IDENTIFIER, samplePayload()));
+		const app1At = SOI.length + JFIF.length;
+		new DataView(bytes.buffer).setUint16(app1At + 2, 0xfffe);
+		expect(findExif(bytes, 'jpeg')).toBeUndefined();
+	});
+
+	it('refuses an Exif segment whose payload is not a TIFF block', () => {
+		// A correct identifier in front of rubbish. Handing that back means the
+		// encoder embeds it and the next reader has no way to know, so it is
+		// worse than carrying no metadata at all.
+		expect(
+			findExif(jpeg(app1(EXIF_IDENTIFIER, u8(1, 2, 3, 4, 5, 6, 7, 8))), 'jpeg'),
+		).toBeUndefined();
+		expect(findExif(jpeg(app1(EXIF_IDENTIFIER, u8(0x4d, 0x4d))), 'jpeg')).toBeUndefined();
+	});
+
+	it('gives up where the segment structure stops making sense', () => {
+		// Both of these put the walk somewhere that is not a segment boundary,
+		// and in both the EXIF segment behind them is genuinely there. Carrying
+		// on from a position that is already wrong means reading two arbitrary
+		// bytes as a length and jumping by it, which lands anywhere at all, so
+		// stopping is the only answer that cannot make something up.
+		const payload = samplePayload();
+		const good = app1(EXIF_IDENTIFIER, payload);
+		// A marker has to start with 0xff, and this one does not.
+		expect(findExif(concat([SOI, u8(0x00, 0x00, 0x00, 0x10), good]), 'jpeg')).toBeUndefined();
+		// A length of zero, from a segment claiming to be shorter than the two
+		// bytes of the length field itself.
+		expect(findExif(concat([SOI, u8(0xff, 0xe1, 0x00, 0x00), good]), 'jpeg')).toBeUndefined();
+	});
+
+	it('returns undefined for a JPEG carrying no APP1 at all', () => {
+		expect(findExif(jpeg(), 'jpeg')).toBeUndefined();
+	});
+});
+
+describe('finding the EXIF block in a PNG', () => {
+	it('reads an eXIf chunk, whose contents are the block with no prefix', () => {
+		const payload = samplePayload();
+		expect(findExif(png(pngChunk('eXIf', payload), idatChunk()), 'png')).toEqual(payload);
+	});
+
+	it('reads an eXIf chunk written after the image data', () => {
+		// This is the difference from the ICC walk beside it, which stops at
+		// IDAT because a colour chunk after the image data declares nothing.
+		// eXIf is explicitly allowed on either side, and a tool that appends
+		// metadata to a finished file puts it after. Copying the IDAT guard
+		// across, which looks like an obvious tidy-up, loses exactly those.
+		const payload = samplePayload();
+		expect(findExif(png(idatChunk(), pngChunk('eXIf', payload)), 'png')).toEqual(payload);
+	});
+
+	it('gives up on a chunk whose length is larger than the file', () => {
+		const payload = samplePayload();
+		const bytes = png(pngChunk('eXIf', payload), idatChunk());
+		const chunkAt = PNG_SIGNATURE.length + 12 + 13;
+		new DataView(bytes.buffer).setUint32(chunkAt, payload.length + 64);
+		expect(findExif(bytes, 'png')).toBeUndefined();
+	});
+
+	it('stops at IEND, where nothing legal follows', () => {
+		const bytes = concat([png(idatChunk()), pngChunk('eXIf', samplePayload())]);
+		expect(findExif(bytes, 'png')).toBeUndefined();
+	});
+
+	it('refuses an eXIf chunk whose contents are not a TIFF block', () => {
+		expect(findExif(png(pngChunk('eXIf', u8(0, 0, 0, 0, 0, 0, 0, 0))), 'png')).toBeUndefined();
+	});
+
+	it('returns undefined for a PNG carrying no eXIf chunk', () => {
+		expect(findExif(png(idatChunk()), 'png')).toBeUndefined();
+	});
+});
+
+describe('finding the EXIF block in a WebP', () => {
+	it('reads an EXIF chunk out of the RIFF container', () => {
+		const payload = samplePayload();
+		expect(
+			findExif(webp(riffChunk('VP8 ', new Uint8Array(10)), riffChunk('EXIF', payload)), 'webp'),
+		).toEqual(payload);
 	});
 
 	it('steps over the pad byte RIFF adds after an odd length chunk', () => {
 		// The pad is not counted in the chunk's size. Walking without it lands
-		// one byte into the next fourcc, and every chunk after that is lost.
-		const bytes = webp(riffChunk('EXIF', new Uint8Array(5)), riffChunk('ICCP', p3Profile()));
-		expect(declaresWideGamut(bytes, 'webp')).toBe(true);
+		// one byte into the next fourcc and every chunk after that is lost.
+		const payload = samplePayload();
+		const bytes = webp(riffChunk('ICCP', new Uint8Array(5)), riffChunk('EXIF', payload));
+		expect(findExif(bytes, 'webp')).toEqual(payload);
 	});
 
-	it('reads a profile that starts partway into the file, not at the front of the buffer', () => {
-		// The profile comes back as a view into the WebP rather than a copy, so
-		// a DataView built on the underlying buffer without its byte offset
-		// reads the RIFF header where the profile header should be.
-		const found = findIccProfile(webp(riffChunk('ICCP', p3Profile())), 'webp') ?? new Uint8Array(0);
-		expect(found.byteOffset).toBeGreaterThan(0);
-		expect(iccIsWideGamut(found)).toBe(true);
+	it('returns an odd length payload without the pad byte that follows it', () => {
+		// The pad belongs to the container, not to the block. Handing it over
+		// puts a stray zero on the end of what gets embedded in the output.
+		const payload = concat([samplePayload(), u8(0x41)]);
+		expect(payload.length % 2).toBe(1);
+		const bytes = webp(riffChunk('EXIF', payload), riffChunk('ICCP', new Uint8Array(4)));
+		expect(findExif(bytes, 'webp')).toEqual(payload);
 	});
 
-	it('will not read an ICCP chunk whose size field is larger than the file', () => {
-		// A subarray past the end of a Uint8Array is clipped rather than
-		// refused, so a size field that lies by sixteen bytes yields a profile
-		// that is short by sixteen bytes and says nothing about it. Here the
-		// bytes that are missing are the ones nothing reads, so the answer
-		// would come back wide and confident off a file that is damaged.
-		const profile = p3Profile();
-		const bytes = webp(riffChunk('ICCP', profile));
-		// The chunk starts after the twelve byte RIFF header, and its size is
-		// the four bytes after the fourcc.
-		new DataView(bytes.buffer).setUint32(12 + 4, profile.length + 16, true);
-		expect(declaresWideGamut(bytes, 'webp')).toBe(false);
+	it('gives up on a chunk whose size field is larger than the file', () => {
+		const payload = samplePayload();
+		const bytes = webp(riffChunk('EXIF', payload));
+		new DataView(bytes.buffer).setUint32(12 + 4, payload.length + 16, true);
+		expect(findExif(bytes, 'webp')).toBeUndefined();
 	});
 
-	it('returns false for a WebP with no ICCP chunk', () => {
-		expect(declaresWideGamut(webp(riffChunk('VP8 ', new Uint8Array(10))), 'webp')).toBe(false);
+	it('refuses an EXIF chunk whose contents are not a TIFF block', () => {
+		expect(findExif(webp(riffChunk('EXIF', new Uint8Array(20))), 'webp')).toBeUndefined();
+	});
+
+	it('returns undefined for a WebP carrying no EXIF chunk', () => {
+		expect(findExif(webp(riffChunk('VP8 ', new Uint8Array(10))), 'webp')).toBeUndefined();
 	});
 });
 
-const ICC_MARKER = 'ICC_PROFILE';
-
-/** One APP2 segment carrying a numbered part of a profile. Parts count from 1. */
-function app2Icc(index: number, count: number, data: Uint8Array): Uint8Array {
-	const length = 2 + ICC_MARKER.length + 1 + 2 + data.length;
-	const out = new Uint8Array(2 + length);
-	out[0] = 0xff;
-	out[1] = 0xe2;
-	new DataView(out.buffer).setUint16(2, length);
-	writeAscii(out, 4, ICC_MARKER);
-	out[4 + ICC_MARKER.length] = 0;
-	out[5 + ICC_MARKER.length] = index;
-	out[6 + ICC_MARKER.length] = count;
-	out.set(data, 7 + ICC_MARKER.length);
-	return out;
-}
-
-/**
- * An APP2 segment that is not a profile.
- *
- * A phone with more than one camera writes a Multi-Picture Format segment,
- * which is APP2 marked `MPF\0`, and it comes before the ICC one. Anything that
- * treats APP2 as meaning ICC concatenates this into the profile.
- */
-function app2Mpf(): Uint8Array {
-	// 'MPF\0', a TIFF header, and an index directory of three entries, which is
-	// the size a real one runs to. Size matters here: a segment shorter than
-	// the ICC marker leaves nothing behind it to mistake for profile data, and
-	// this one is long enough that mistaking it puts forty bytes at the front
-	// of the profile. The byte a reader would take as the part number is the
-	// high half of the entry count, which is zero, so the mistake sorts itself
-	// ahead of the real first part.
-	const body = concat([
-		hex('4d504600 4d4d 002a 00000008 0003'),
-		new Uint8Array(3 * 12),
-		new Uint8Array(4),
-	]);
-	const out = new Uint8Array(4 + body.length);
-	out[0] = 0xff;
-	out[1] = 0xe2;
-	new DataView(out.buffer).setUint16(2, 2 + body.length);
-	out.set(body, 4);
-	return out;
-}
-
-/** An APP2 with a length of two, which is to say no payload at all. */
-const EMPTY_APP2 = u8(0xff, 0xe2, 0x00, 0x02);
-
-const SOI = u8(0xff, 0xd8);
-const SOS = u8(0xff, 0xda, 0x00, 0x02);
-const EOI = u8(0xff, 0xd9);
-/** The JFIF header almost every JPEG opens with, so the walker has to pass one. */
-const JFIF = u8(0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0);
-
-function jpeg(...segments: Uint8Array[]): Uint8Array {
-	return concat([SOI, JFIF, ...segments, SOS, EOI]);
-}
-
-describe('what a JPEG declares', () => {
-	it('reads a profile out of a single ICC_PROFILE APP2 segment', () => {
-		expect(declaresWideGamut(jpeg(app2Icc(1, 1, p3Profile())), 'jpeg')).toBe(true);
-		expect(declaresWideGamut(jpeg(app2Icc(1, 1, srgbProfile())), 'jpeg')).toBe(false);
+describe('finding the EXIF block in a TIFF', () => {
+	it('hands back the file itself, without copying it', () => {
+		// A TIFF is a TIFF header followed by its directories, which is what
+		// the other three carry wrapped up. Copying it would mean holding a
+		// second copy of a file that can run to a hundred megabytes for no
+		// gain, so identity is the behaviour being pinned here.
+		const bytes = samplePayload();
+		expect(findExif(bytes, 'tiff')).toBe(bytes);
 	});
 
-	it('joins a profile split across two APP2 segments in index order, not file order', () => {
-		// A profile past 65533 bytes has to be split, and the segments are not
-		// required to appear in order. This fixture puts part two first and cuts
-		// before the tag table, so joining as they come, or reading only the
-		// first, gives a profile whose table points at the wrong bytes.
-		const profile = p3Profile();
-		const cut = 100;
-		const bytes = jpeg(
-			app2Icc(2, 2, profile.subarray(cut)),
-			app2Icc(1, 2, profile.subarray(0, cut)),
-		);
-		expect(findIccProfile(bytes, 'jpeg')).toEqual(profile);
-		expect(declaresWideGamut(bytes, 'jpeg')).toBe(true);
-	});
-
-	it('gives no gamut answer from the first segment of a split profile alone', () => {
-		expect(declaresWideGamut(jpeg(app2Icc(1, 2, p3Profile().subarray(0, 100))), 'jpeg')).toBe(
-			false,
-		);
-		// The more dangerous cut is further in, past the header and the tag
-		// table. The table survives and names a red colourant whose twenty
-		// bytes were in the segment that did not arrive, so there is a
-		// plausible looking profile with the one number missing.
-		expect(declaresWideGamut(jpeg(app2Icc(1, 2, p3Profile().subarray(0, 150))), 'jpeg')).toBe(
-			false,
-		);
-	});
-
-	it('walks past an APP2 that is not a profile', () => {
-		// The marker string is the whole of the test for whether a segment is
-		// a profile. Skipping it and taking any APP2 puts twelve bytes of
-		// Multi-Picture Format at the front of the profile, and every offset in
-		// the tag table then points twelve bytes short of what it names.
-		const bytes = jpeg(app2Mpf(), app2Icc(1, 1, p3Profile()));
-		expect(findIccProfile(bytes, 'jpeg')).toEqual(p3Profile());
-		expect(declaresWideGamut(bytes, 'jpeg')).toBe(true);
-	});
-
-	it('steps over an APP2 too short to hold a marker without losing its place', () => {
-		// The marker check reads twelve bytes whether the segment has twelve
-		// bytes or not, so this one is read into the segment behind it. What
-		// must not happen is the walk advancing by anything other than this
-		// segment's own length, because after that every offset is wrong and
-		// the profile behind it is never found.
-		expect(declaresWideGamut(jpeg(EMPTY_APP2), 'jpeg')).toBe(false);
-		expect(declaresWideGamut(jpeg(EMPTY_APP2, app2Icc(1, 1, p3Profile())), 'jpeg')).toBe(true);
-	});
-
-	it('stops at the start of scan rather than reading compressed data as segments', () => {
-		// After SOS the bytes are entropy coded and their 0xff bytes are stuffed,
-		// so anything that looks like a segment header there is a coincidence.
-		const bytes = concat([SOI, JFIF, SOS, app2Icc(1, 1, p3Profile()), EOI]);
-		expect(declaresWideGamut(bytes, 'jpeg')).toBe(false);
-	});
-
-	it('returns false for a JPEG with no APP2 segment', () => {
-		expect(declaresWideGamut(jpeg(), 'jpeg')).toBe(false);
+	it('refuses a file that is not a TIFF at all', () => {
+		expect(findExif(png(idatChunk()), 'tiff')).toBeUndefined();
+		expect(findExif(hex('4d4d002b00000008'), 'tiff')).toBeUndefined();
 	});
 });
 
-describe('files with nothing to declare', () => {
-	it('returns false for a format this reader does not search', () => {
-		// HEIC is absent on purpose: its profile comes out of the container
+describe('files with no EXIF to find', () => {
+	it('returns undefined for a format this reader does not search', () => {
+		// HEIC is absent on purpose: its block comes out of the container
 		// parser, which has already read it.
-		const bytes = png(cicpChunk(12), idatChunk());
-		expect(findIccProfile(bytes, 'heic')).toBeUndefined();
-		expect(declaresWideGamut(bytes, 'heic')).toBe(false);
+		expect(findExif(jpeg(app1(EXIF_IDENTIFIER, samplePayload())), 'heic')).toBeUndefined();
+		expect(findExif(samplePayload(), 'raw')).toBeUndefined();
 	});
 
-	it('returns false for bytes far too short to be any of the three', () => {
+	it('returns undefined for bytes far too short to be any of the four', () => {
 		// An empty file is what a cancelled download leaves behind, and one
 		// byte is what a picker hands back for a file the user has no
 		// permission to read.
-		for (const format of ['png', 'webp', 'jpeg']) {
-			expect(declaresWideGamut(new Uint8Array(0), format)).toBe(false);
-			expect(declaresWideGamut(u8(0xff), format)).toBe(false);
-			expect(declaresWideGamut(u8(0, 1, 2, 3), format)).toBe(false);
+		for (const format of ['jpeg', 'png', 'webp', 'tiff']) {
+			expect(findExif(new Uint8Array(0), format)).toBeUndefined();
+			expect(findExif(u8(0xff), format)).toBeUndefined();
+			expect(findExif(u8(0x49, 0x49, 0x2a, 0x00), format)).toBeUndefined();
 		}
 	});
 });

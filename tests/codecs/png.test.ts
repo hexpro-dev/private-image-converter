@@ -22,8 +22,18 @@
  * check the encoder without asking the decoder whether the encoder was right.
  * A round trip through both halves of this package passes just as happily
  * when the two agree on something the specification does not say.
+ *
+ * `PINNED` is the other kind of check, and it answers a different question.
+ * Everything else here asks whether the file is correct; `PINNED` asks whether
+ * it is the same file. The digests were taken before the filter pass was
+ * rewritten to score five candidates in one go and before the image data
+ * started reaching the compressor a batch at a time, and neither change is
+ * allowed to move a byte. A faster encoder that quietly picks a different
+ * filter on ties, or drops a row on a batch boundary, passes every other test
+ * in this file.
  */
 
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { adler32, crc32 } from '../../src/codecs/png/crc.js';
 import { decodePng } from '../../src/codecs/png/decode.js';
@@ -31,7 +41,7 @@ import { deflate, inflate } from '../../src/codecs/png/deflate.js';
 import { encodePng } from '../../src/codecs/png/encode.js';
 import { DecodeFailedError } from '../../src/errors.js';
 import { createRaster } from '../../src/raster/image.js';
-import type { RasterImage } from '../../src/types.js';
+import type { EncodeOptions, RasterImage } from '../../src/types.js';
 
 const SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
@@ -212,6 +222,124 @@ function noise(width: number, height: number, hasAlpha: boolean): RasterImage {
 		image.data[at + 3] = hasAlpha ? (i * 37) & 0xff : 255;
 	}
 	return image;
+}
+
+/** A smooth ramp in all three channels, which is what a photograph looks like to a filter. */
+function gradient(width: number, height: number): RasterImage {
+	const image = createRaster(width, height, 'srgb', false);
+	for (let y = 0; y < height; y += 1) {
+		for (let x = 0; x < width; x += 1) {
+			const at = (y * width + x) * 4;
+			image.data[at] = (x * 255) / width;
+			image.data[at + 1] = (y * 255) / height;
+			image.data[at + 2] = ((x + y) * 255) / (width + height);
+			image.data[at + 3] = 255;
+		}
+	}
+	return image;
+}
+
+/** Two colours, every other pixel, which no filter predicts and every filter scores close on. */
+function alternating(width: number, height: number): RasterImage {
+	const image = createRaster(width, height, 'srgb', false);
+	for (let i = 0; i < width * height; i += 1) {
+		const at = i * 4;
+		const on = i % 2 === 0;
+		image.data[at] = on ? 250 : 5;
+		image.data[at + 1] = on ? 10 : 200;
+		image.data[at + 2] = on ? 128 : 129;
+		image.data[at + 3] = 255;
+	}
+	return image;
+}
+
+/** Few enough colours that the encoder writes a palette without being asked. */
+function fewColours(width: number, height: number, hasAlpha: boolean): RasterImage {
+	const image = createRaster(width, height, 'srgb', hasAlpha);
+	const table = [
+		[255, 0, 0, 255],
+		[0, 255, 0, 255],
+		[0, 0, 255, 255],
+		[9, 9, 9, hasAlpha ? 0 : 255],
+	];
+	for (let i = 0; i < width * height; i += 1) {
+		image.data.set(table[(i * 7 + Math.floor(i / width)) % table.length] as number[], i * 4);
+	}
+	return image;
+}
+
+/**
+ * A profile, so an image small enough to fit a palette is written truecolour.
+ *
+ * `paletteFor` leaves a wide gamut picture with a profile attached alone,
+ * which is the only lever here that does not also change the pixels. Without
+ * it a five row grey image comes back as an indexed file with no filtering in
+ * it at all, and a test about filters has nothing to look at.
+ */
+const KEEP_TRUECOLOUR: EncodeOptions = { iccProfile: Uint8Array.from([0, 1, 2, 3]) };
+
+/**
+ * Five grey scanlines, one per filter, worked out from the definitions.
+ *
+ * Every pixel is grey, so each of the three bytes of a pixel carries the row's
+ * value and the arithmetic below is per value rather than per byte. Bytes
+ * before the start of a row count as zero, and so does the row above the top.
+ *
+ * Row 0, all zeroes: every filter scores 0. A five way tie, which must go to
+ * None.
+ * Row 1, all 200 over a row of zeroes: Sub leaves 200 in the leading pixel and
+ * 0 after it, and Paeth leaves exactly the same, because with `left` and
+ * `up-left` both zero the Paeth predictor is whatever is above. A two way tie
+ * at 168, which must go to Sub.
+ * Row 2, all 200 over all 200: Up leaves nothing at all.
+ * Row 3, 200 201 202 203 over all 200: Paeth predicts the pixel to the left
+ * once the row above is flat, so it leaves 1 per pixel against Up's 0 1 2 3.
+ * Row 4, each value the average of its left neighbour and the one above:
+ * Average leaves nothing, and it is the only filter that does.
+ */
+function filterLadder(): RasterImage {
+	const image = createRaster(4, 5, 'display-p3', false);
+	const rows = [
+		[0, 0, 0, 0],
+		[200, 200, 200, 200],
+		[200, 200, 200, 200],
+		[200, 201, 202, 203],
+		[100, 150, 176, 189],
+	];
+	rows.forEach((row, y) => {
+		row.forEach((value, x) => {
+			const at = (y * 4 + x) * 4;
+			image.data[at] = value;
+			image.data[at + 1] = value;
+			image.data[at + 2] = value;
+			image.data[at + 3] = 255;
+		});
+	});
+	return image;
+}
+
+/** Every IDAT in the file, joined, which is the stream the filters wrote. */
+function idatOf(bytes: Uint8Array): Uint8Array {
+	const parts = readChunks(bytes)
+		.filter((chunk) => chunk.type === 'IDAT')
+		.map((chunk) => chunk.data);
+	let total = 0;
+	for (const part of parts) total += part.length;
+	const out = new Uint8Array(total);
+	let at = 0;
+	for (const part of parts) {
+		out.set(part, at);
+		at += part.length;
+	}
+	return out;
+}
+
+/**
+ * Half a SHA-256, which is 128 bits and far past the point where two different
+ * scanline streams could land on the same value by accident.
+ */
+function digestOf(bytes: Uint8Array): string {
+	return createHash('sha256').update(bytes).digest('hex').slice(0, 32);
 }
 
 /**
@@ -517,6 +645,298 @@ describe('the PNG the encoder writes', () => {
 				new Array<number>(stride).fill(0),
 			);
 		}
+	});
+
+	it('picks each of the five filters, and breaks a tie towards the lower one', async () => {
+		// The ties are the point. Two of these five rows are decided by the
+		// rule rather than by the scores, and a scoring loop that compares with
+		// `<=` somewhere gets a file that is exactly the same size and a
+		// different sequence of bytes, which nothing else here would notice.
+		const bytes = await encodePng(filterLadder(), KEEP_TRUECOLOUR);
+		const raw = await inflate(chunkNamed(bytes, 'IDAT').data);
+		const stride = 4 * 3;
+		const filters: number[] = [];
+		const rows: number[][] = [];
+		for (let y = 0; y < 5; y += 1) {
+			const start = y * (stride + 1);
+			filters.push(raw[start] as number);
+			rows.push([...raw.subarray(start + 1, start + 1 + stride)]);
+		}
+
+		// None, Sub, Up, Paeth, Average.
+		expect(filters).toEqual([0, 1, 2, 4, 3]);
+		// The residue each of them leaves, which is what says the winning
+		// filter was applied and not merely named in the leading byte.
+		expect(rows[0], 'None over a row of zeroes').toEqual(new Array<number>(stride).fill(0));
+		expect(rows[1], 'Sub, which only pays for the leading pixel').toEqual([
+			200, 200, 200, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		]);
+		expect(rows[2], 'Up over an identical row').toEqual(new Array<number>(stride).fill(0));
+		expect(rows[3], 'Paeth over a flat row above').toEqual([0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+		expect(rows[4], 'Average, predicting each value exactly').toEqual(
+			new Array<number>(stride).fill(0),
+		);
+	});
+});
+
+/* ── Byte for byte ────────────────────────────────────────────────────── */
+
+/**
+ * What this encoder writes, recorded before it was made faster.
+ *
+ * The digest is over the inflated image data rather than over the file,
+ * because the file also carries whatever the platform's zlib decided, and that
+ * is not this package's output to pin. The scanline stream underneath it is
+ * entirely ours: the filter chosen for every row and the bytes that filter
+ * left. `rawLength` sits beside it so a stream that changed length reads as a
+ * stride bug rather than as an opaque digest mismatch.
+ *
+ * The list covers the shapes where the two rewrites could go wrong: one pixel,
+ * a row with no row above it, a column that is nothing but leading pixels, an
+ * image tall enough to cross several compressor batches in both the filtered
+ * and the unfiltered path, and the palette decision, which reads compressed
+ * lengths and so has to still pick the same file.
+ */
+const PINNED: readonly {
+	readonly name: string;
+	readonly build: () => RasterImage;
+	readonly options: EncodeOptions;
+	readonly chunks: readonly string[];
+	readonly rawLength: number;
+	readonly digest: string;
+}[] = [
+	{
+		name: 'a single opaque pixel',
+		build: () => noise(1, 1, false),
+		options: {},
+		chunks: ['IHDR', 'IDAT', 'IEND'],
+		rawLength: 4,
+		digest: 'c9b0339b3c56913c5d75bcc4fe09e821',
+	},
+	{
+		name: 'a single pixel carrying alpha',
+		build: () => noise(1, 1, true),
+		options: {},
+		chunks: ['IHDR', 'IDAT', 'IEND'],
+		rawLength: 5,
+		digest: '13ba2a85e0805c92c90b6aa8a669be89',
+	},
+	{
+		name: 'one very wide row',
+		build: () => noise(517, 1, false),
+		options: {},
+		chunks: ['IHDR', 'IDAT', 'IEND'],
+		rawLength: 1552,
+		digest: '38456f0a8fede75375a524d1b098f032',
+	},
+	{
+		name: 'one very tall column',
+		build: () => noise(1, 517, true),
+		options: {},
+		chunks: ['IHDR', 'IDAT', 'IEND'],
+		rawLength: 2585,
+		digest: '3ecb8c5f3a3d72780dba775b086a41c3',
+	},
+	{
+		name: 'RGB noise at 37 by 23',
+		build: () => noise(37, 23, false),
+		options: {},
+		chunks: ['IHDR', 'IDAT', 'IEND'],
+		rawLength: 2576,
+		digest: '23d498dc0b9bbba666121fd28d386567',
+	},
+	{
+		name: 'RGBA noise at 37 by 23',
+		build: () => noise(37, 23, true),
+		options: {},
+		chunks: ['IHDR', 'IDAT', 'IEND'],
+		rawLength: 3427,
+		digest: 'a34dd19789a92c7d7b232e28f0ea4780',
+	},
+	{
+		name: 'a smooth gradient',
+		build: () => gradient(64, 64),
+		options: {},
+		chunks: ['IHDR', 'IDAT', 'IEND'],
+		rawLength: 12352,
+		digest: '461b995ca186c0d6cf83533a373eca69',
+	},
+	{
+		name: 'a row of alternating colours',
+		build: () => alternating(63, 9),
+		options: {},
+		chunks: ['IHDR', 'PLTE', 'IDAT', 'IEND'],
+		rawLength: 81,
+		digest: '108517096e4648500c3427b9a685c5b8',
+	},
+	{
+		name: 'a picture with four colours in it',
+		build: () => fewColours(40, 40, false),
+		options: {},
+		chunks: ['IHDR', 'PLTE', 'IDAT', 'IEND'],
+		rawLength: 440,
+		digest: '82ffee1b45ad5dfe9b29e4dbd9327d05',
+	},
+	{
+		name: 'four colours, one of them clear',
+		build: () => fewColours(40, 40, true),
+		options: {},
+		chunks: ['IHDR', 'PLTE', 'tRNS', 'IDAT', 'IEND'],
+		rawLength: 440,
+		digest: '09a99c4e8734db220f630722d0ebbb54',
+	},
+	{
+		name: 'a quantised palette',
+		build: () => noise(33, 17, false),
+		options: { palette: 16 },
+		chunks: ['IHDR', 'PLTE', 'IDAT', 'IEND'],
+		rawLength: 306,
+		digest: 'd337108d9f3650227fd96aadf5b37b8f',
+	},
+	{
+		name: 'a photograph sized gradient',
+		build: () => gradient(300, 200),
+		options: {},
+		chunks: ['IHDR', 'IDAT', 'IEND'],
+		rawLength: 180200,
+		digest: 'da447dcc9b8c1b5f140576e121186ba6',
+	},
+	{
+		name: 'enough filtered rows to cross several batches',
+		build: () => noise(40, 400, true),
+		options: {},
+		chunks: ['IHDR', 'IDAT', 'IEND'],
+		rawLength: 64400,
+		digest: '2df676504702f0d514f4e065daf79085',
+	},
+	{
+		name: 'enough unfiltered rows to cross several batches',
+		build: () => noise(20, 300, false),
+		options: { palette: 8 },
+		chunks: ['IHDR', 'PLTE', 'IDAT', 'IEND'],
+		rawLength: 3300,
+		digest: 'a61e083e852058896bf522b8e7dee09e',
+	},
+	{
+		name: 'a profile in front of the data',
+		build: () => noise(8, 8, false),
+		options: { iccProfile: Uint8Array.from({ length: 300 }, (_, i) => (i * 13) & 0xff) },
+		chunks: ['IHDR', 'iCCP', 'IDAT', 'IEND'],
+		rawLength: 200,
+		digest: '060fc2f2fcb735d7f8630bbb892eca6d',
+	},
+];
+
+describe('the PNG the encoder has always written', () => {
+	for (const pin of PINNED) {
+		it(`writes the same scanlines for ${pin.name}`, async () => {
+			const bytes = await encodePng(pin.build(), pin.options);
+			expect(readChunks(bytes).map((chunk) => chunk.type)).toEqual([...pin.chunks]);
+			const raw = await inflate(idatOf(bytes));
+			expect(raw.length, 'the length of the filtered stream').toBe(pin.rawLength);
+			expect(digestOf(raw)).toBe(pin.digest);
+		});
+	}
+});
+
+/* ── EXIF ─────────────────────────────────────────────────────────────── */
+
+describe('the PNG eXIf chunk', () => {
+	/**
+	 * A real EXIF payload, from its TIFF header onwards.
+	 *
+	 * `II` for little endian, 42 as the answer the format checks itself with,
+	 * then the offset of the first IFD. That IFD holds one entry, Orientation
+	 * (tag 0x0112) as a SHORT of value 1, and then a next-IFD offset of zero.
+	 * Written out here rather than taken from `src/metadata/`, so a reader that
+	 * changed what it produces cannot change what this expects.
+	 */
+	const EXIF = Uint8Array.from([
+		0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x12, 0x01, 0x03, 0x00, 0x01, 0x00,
+		0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	]);
+
+	it('carries the payload byte for byte', async () => {
+		const bytes = await encodePng(noise(6, 4, false), { exif: EXIF });
+		expect([...chunkNamed(bytes, 'eXIf').data]).toEqual([...EXIF]);
+	});
+
+	it('starts the payload at the TIFF header, with no Exif prefix in front of it', async () => {
+		// `Exif\0\0` belongs to JPEG's APP1 segment. A reader handed it here
+		// takes `Ex` for the byte order mark, finds it is neither `II` nor
+		// `MM`, and drops the whole chunk.
+		const { data } = chunkNamed(await encodePng(noise(6, 4, false), { exif: EXIF }), 'eXIf');
+		expect([...data.subarray(0, 2)]).toEqual([0x49, 0x49]);
+		expect(String.fromCharCode(...data.subarray(0, 4))).not.toBe('Exif');
+	});
+
+	it('spells the type with the case each bit of the name stands for', async () => {
+		// Bit 5 of each letter is a flag, and lowercase means it is set:
+		// ancillary, public, the reserved bit clear, and safe to copy.
+		const { type } = chunkNamed(await encodePng(noise(4, 4, false), { exif: EXIF }), 'eXIf');
+		expect([...type].map((letter) => (letter.charCodeAt(0) >> 5) & 1)).toEqual([1, 0, 0, 1]);
+	});
+
+	it('places it after the header and before the image data', async () => {
+		// The specification allows it anywhere between IHDR and IEND except
+		// between IDAT chunks, and asks for it before the first one.
+		const bytes = await encodePng(noise(6, 4, false), { exif: EXIF });
+		expect(readChunks(bytes).map((chunk) => chunk.type)).toEqual(['IHDR', 'eXIf', 'IDAT', 'IEND']);
+	});
+
+	it('places it in front of the palette in an indexed file', async () => {
+		const bytes = await encodePng(fewColours(40, 40, false), { exif: EXIF });
+		expect(readChunks(bytes).map((chunk) => chunk.type)).toEqual([
+			'IHDR',
+			'eXIf',
+			'PLTE',
+			'IDAT',
+			'IEND',
+		]);
+	});
+
+	it('sits beside a profile rather than replacing it', async () => {
+		const bytes = await encodePng(noise(6, 4, false), {
+			exif: EXIF,
+			iccProfile: Uint8Array.from({ length: 64 }, (_, i) => i),
+		});
+		expect(readChunks(bytes).map((chunk) => chunk.type)).toEqual([
+			'IHDR',
+			'iCCP',
+			'eXIf',
+			'IDAT',
+			'IEND',
+		]);
+	});
+
+	it('gives it a CRC that validates when recomputed', async () => {
+		const chunk = chunkNamed(await encodePng(noise(6, 4, false), { exif: EXIF }), 'eXIf');
+		expect(chunk.recomputed).toBe(chunk.crc);
+	});
+
+	it('writes no chunk at all when the caller supplied no payload', async () => {
+		expect(hasChunk(await encodePng(noise(6, 4, false)), 'eXIf')).toBe(false);
+	});
+
+	it('writes no chunk for an empty payload, rather than an empty one', async () => {
+		// An ancillary chunk with nothing in it is something every reader has
+		// to step over and none of them can use.
+		const bytes = await encodePng(noise(6, 4, false), { exif: new Uint8Array(0) });
+		expect(hasChunk(bytes, 'eXIf')).toBe(false);
+	});
+
+	it('leaves the pixels alone', async () => {
+		const image = noise(9, 7, true);
+		expectSamePixels(await decodePng(await encodePng(image, { exif: EXIF })), image);
+	});
+
+	it('does not change the image data it was written beside', async () => {
+		// The chunk goes in front of IDAT, so a mistake in its length field
+		// would move the data rather than corrupt it, and a decoder that
+		// happened to resynchronise would hide that.
+		const plain = await encodePng(noise(37, 23, false));
+		const tagged = await encodePng(noise(37, 23, false), { exif: EXIF });
+		expect([...idatOf(tagged)]).toEqual([...idatOf(plain)]);
 	});
 });
 

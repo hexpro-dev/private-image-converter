@@ -15,6 +15,13 @@
  * own entry point, because a caller who has to remember to ask is a caller who
  * will one day forget, and the symptom of forgetting is a photograph that
  * quietly loses its highlights with nothing anywhere saying so.
+ *
+ * Transparency is a third picture on the same principle. A sticker, a
+ * screenshot with rounded corners or an exported logo keeps its alpha as a
+ * separate monochrome image, tied to the photograph by an `auxl` reference and
+ * identified by the urn in its `auxC` property. It is planned by the same code
+ * again, because the alpha plane of a grid is itself a grid, and a second
+ * reader for it would be the grid arithmetic written twice.
  */
 
 import { HeifMalformedError, HeifUnsupportedFeatureError } from '../errors.js';
@@ -95,6 +102,18 @@ export interface HeifImagePlan extends HeifPicturePlan {
 	readonly hasGainMap: boolean;
 	/** The gain map, where the file carried one this reader could resolve. */
 	readonly gainMap?: HeifGainMapPlan;
+	/**
+	 * Whether the file hangs an alpha auxiliary image off the primary at all.
+	 *
+	 * Separate from `alphaAuxiliary` for the same reason `hasGainMap` is
+	 * separate from `gainMap`: true here with nothing beside it means the
+	 * picture is meant to be transparent and came out opaque, which is a
+	 * sentence an interface can say. A file with no transparency in it sets
+	 * neither and there is nothing to report.
+	 */
+	readonly hasAlphaAuxiliary: boolean;
+	/** The alpha plane, where the file carried one this reader could resolve. */
+	readonly alphaAuxiliary?: HeifPicturePlan;
 }
 
 interface GridDescriptor {
@@ -126,6 +145,25 @@ const GAIN_MAP_AUX_TYPES: readonly string[] = [
 	'urn:iso:std:iso:ts:21496:-1',
 ];
 
+/**
+ * The auxiliary type urns that mark a picture as an alpha plane.
+ *
+ * The first is ISO/IEC 23008-12 clause 6.10.2, "Alpha plane", which requires
+ * the `auxC` urn of a HEVC coded alpha auxiliary to be the auxId 1 name from
+ * ISO/IEC 23008-2 Annex F. The second is ISO/IEC 23000-22 (MIAF) clause
+ * 7.3.5.2, which is what newer writers and every AVIF use. A file carries one
+ * or the other, nothing downstream cares which, so both are accepted.
+ *
+ * Matched exactly, never by prefix. `urn:mpeg:hevc:2015:auxid:2` is a depth
+ * map: same family, same shape, same grey rectangle, and multiplying a
+ * photograph's coverage by a depth map produces a picture that fades out with
+ * distance and throws nothing anywhere.
+ */
+const ALPHA_AUX_TYPES: readonly string[] = [
+	'urn:mpeg:hevc:2015:auxid:1',
+	'urn:mpeg:mpegB:cicp:systems:auxiliary:alpha',
+];
+
 function parseGrid(data: Uint8Array): GridDescriptor {
 	const reader = new ByteReader(data, 'grid', 0, data.length);
 	reader.u8(); // version
@@ -138,32 +176,89 @@ function parseGrid(data: Uint8Array): GridDescriptor {
 	return { rows, columns, outputWidth, outputHeight };
 }
 
+interface Colourant {
+	/** The tag signature that holds it. */
+	readonly tag: string;
+	/** Media-relative X, Y and Z, in that order. */
+	readonly xyz: readonly [number, number, number];
+}
+
+/**
+ * Display P3's colourants, as an ICC profile records them.
+ *
+ * Against the D50 profile connection space, because that is what ICC requires
+ * of an `XYZType` colourant tag. These are therefore the Bradford adapted
+ * numbers out of Apple's published profile, not the D65 matrix a colour
+ * science table prints, and the difference between the two is about 0.03 in
+ * red's X, which is larger than the tolerance below.
+ */
+const DISPLAY_P3_COLOURANTS: readonly Colourant[] = [
+	{ tag: 'rXYZ', xyz: [0.51512, 0.2416, -0.00105] },
+	{ tag: 'gXYZ', xyz: [0.29197, 0.69224, 0.04189] },
+	{ tag: 'bXYZ', xyz: [0.1571, 0.06606, 0.78407] },
+];
+
+/**
+ * How far a colourant may sit from P3's and still count as P3.
+ *
+ * Room for the s15Fixed16 rounding and for the small disagreements between
+ * vendors' adaptation matrices, and well inside the gap to anything else that
+ * ships: sRGB's red colourant is 0.079 below P3's in X and Adobe RGB's is
+ * 0.095 above it. Widening this is how the bug below comes back.
+ */
+const COLOURANT_TOLERANCE = 0.02;
+
 /**
  * Whether an ICC profile describes Display P3.
  *
- * Compared against the profile's red primary rather than its description
- * string, because the description is free text that Apple has changed between
- * iOS releases. The red primary of P3 and of sRGB differ in the first decimal
- * place, so a loose tolerance is enough and there is nothing to tune.
+ * A near copy of `iccIsWideGamut` in `src/metadata/icc.ts`, which is not an
+ * oversight: `eslint.config.js` forbids `src/heif/**` from importing
+ * `src/metadata/**` so the container reader stays liftable into a package of
+ * its own, and nine numbers duplicated is cheaper than the parser acquiring a
+ * dependency on the metadata layer. The two must answer identically, a test
+ * imports both and compares them, so neither is changed without the other.
+ *
+ * All three primaries are checked rather than only red, and that is the whole
+ * point of the shape. Deciding from red's X alone means any threshold that
+ * admits P3 also admits Adobe RGB, ProPhoto and Rec.2020, whose reds all sit
+ * further out again. Those files then get P3 pixels written under a profile
+ * that says something else, which is the exact failure this predicate exists
+ * to prevent, in the direction nobody notices until the image is on a wide
+ * gamut screen.
+ *
+ * A profile that is not quite any of these reads as false, and false is the
+ * safe answer: the picture is then treated as sRGB and left alone, whereas a
+ * wrong true converts numbers that were already right.
  */
-function iccLooksLikeP3(profile: Uint8Array): boolean {
+export function iccIsWideGamut(profile: Uint8Array): boolean {
 	if (profile.length < 132) return false;
 	const view = new DataView(profile.buffer, profile.byteOffset, profile.byteLength);
 	const tagCount = view.getUint32(128);
-	if (tagCount > 1024) return false;
+	// A plausible profile has a handful of tags. A four billion tag count means
+	// this is not a profile at all.
+	if (tagCount === 0 || tagCount > 1024) return false;
+
+	let matched = 0;
 	for (let i = 0; i < tagCount; i += 1) {
 		const entry = 132 + i * 12;
 		if (entry + 12 > profile.length) break;
 		let signature = '';
 		for (let c = 0; c < 4; c += 1) signature += String.fromCharCode(view.getUint8(entry + c));
-		if (signature !== 'rXYZ') continue;
+		const expected = DISPLAY_P3_COLOURANTS.find((colourant) => colourant.tag === signature);
+		if (!expected) continue;
 		const offset = view.getUint32(entry + 4);
+		// An XYZType tag is its signature, four reserved bytes, then s15Fixed16
+		// X, Y and Z.
 		if (offset + 20 > profile.length) return false;
-		// s15Fixed16 X of the red colourant. sRGB is about 0.4360, P3 about 0.5151.
-		const x = view.getInt32(offset + 8) / 65536;
-		return x > 0.48;
+		for (let axis = 0; axis < 3; axis += 1) {
+			const value = view.getInt32(offset + 8 + axis * 4) / 65536;
+			if (Math.abs(value - expected.xyz[axis]) > COLOURANT_TOLERANCE) return false;
+		}
+		matched += 1;
 	}
-	return false;
+	// Every one of them, so a profile carrying a P3 red beside somebody else's
+	// green is not read as P3 on the strength of the half that matched.
+	return matched === DISPLAY_P3_COLOURANTS.length;
 }
 
 function colourSpaceOf(
@@ -182,7 +277,7 @@ function colourSpaceOf(
 	const profile = colr.iccProfile;
 	if (!profile) return { colourSpace: 'srgb' };
 	return {
-		colourSpace: iccLooksLikeP3(profile) ? 'display-p3' : 'srgb',
+		colourSpace: iccIsWideGamut(profile) ? 'display-p3' : 'srgb',
 		iccProfile: profile,
 	};
 }
@@ -443,9 +538,80 @@ function planGainMap(
 	return { present: true, plan: { ...picture, metadata, standard: 'iso-21496-1' } };
 }
 
+/** Whether an item's auxiliary type marks it as an alpha plane. */
+function isAlphaAuxiliary(meta: HeifMeta, itemId: number): boolean {
+	const auxiliary = itemProperty(meta, itemId, 'auxC');
+	return auxiliary !== undefined && ALPHA_AUX_TYPES.includes(auxiliary.auxType);
+}
+
 /**
- * Build the decode plan for the primary image, and for the gain map beside it
- * where the file has one.
+ * Find the alpha plane and plan it.
+ *
+ * The reference runs from the auxiliary to the picture it belongs to, which is
+ * the direction ISO/IEC 23008-12 defines for `auxl` and the opposite of the
+ * one a reader tends to assume, so the search is over the referring items
+ * rather than over the primary's own references. A photograph can hang several
+ * auxiliaries off itself at once, an iPhone routinely does, and the gain map
+ * is one of them: the `auxC` urn is the only thing that tells them apart, so
+ * it is checked before the item is planned rather than after.
+ *
+ * `present` means the file meant this picture to be transparent. `plan` means
+ * the plane can actually be decoded. They disagree when the plane is a codec
+ * or a derivation this reader does not follow, when its item is damaged, or
+ * when it does not measure the same as the picture it covers. None of those
+ * throws. The photograph underneath is complete and refusing it because its
+ * transparency is odd would be the same mistake a damaged gain map once caused
+ * here, where one wrong length field in the second half of a file stopped the
+ * first half being read at all.
+ *
+ * The size rule is a refusal rather than a resize on purpose. An alpha plane
+ * is coverage, not colour: it is stored at the picture's own size by every
+ * writer, and a plane that is not that size means the reader has found the
+ * wrong item or the file disagrees with itself. Stretching it to fit would put
+ * the holes in the wrong places and there would be nothing to say so.
+ */
+function planAlphaAuxiliary(
+	bytes: Uint8Array,
+	meta: HeifMeta,
+	primary: HeifPicturePlan,
+): { present: boolean; plan?: HeifPicturePlan } {
+	const auxiliaries = meta.references.get('auxl');
+	if (!auxiliaries) return { present: false };
+
+	let itemId: number | undefined;
+	for (const [from, to] of auxiliaries) {
+		if (to.includes(meta.primaryItemId) && isAlphaAuxiliary(meta, from)) {
+			itemId = from;
+			break;
+		}
+	}
+	if (itemId === undefined) return { present: false };
+
+	let plan: HeifPicturePlan;
+	try {
+		plan = planPicture(bytes, meta, itemId, {
+			name: 'the transparency',
+			absentStage: 'item-info',
+		});
+	} catch (error) {
+		if (error instanceof HeifMalformedError || error instanceof HeifUnsupportedFeatureError) {
+			return { present: true };
+		}
+		throw error;
+	}
+
+	// Compared after orientation, because each item carries its own `irot` and
+	// a plane that matches the picture only once both have been turned is still
+	// the right plane.
+	if (plan.displayWidth !== primary.displayWidth || plan.displayHeight !== primary.displayHeight) {
+		return { present: true };
+	}
+	return { present: true, plan };
+}
+
+/**
+ * Build the decode plan for the primary image, and for the gain map and alpha
+ * plane beside it where the file has them.
  */
 export function planHeifImage(bytes: Uint8Array): HeifImagePlan {
 	const meta = parseMeta(bytes);
@@ -454,11 +620,14 @@ export function planHeifImage(bytes: Uint8Array): HeifImagePlan {
 		absentStage: 'primary-item',
 	});
 	const gainMap = planGainMap(bytes, meta);
+	const alpha = planAlphaAuxiliary(bytes, meta, primary);
 
 	return {
 		...primary,
 		exif: exifFor(bytes, meta, meta.primaryItemId),
 		hasGainMap: gainMap.present,
 		gainMap: gainMap.plan,
+		hasAlphaAuxiliary: alpha.present,
+		alphaAuxiliary: alpha.plan,
 	};
 }

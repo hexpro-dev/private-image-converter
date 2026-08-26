@@ -30,8 +30,16 @@ const SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
  * than surfacing as a RangeError out of the allocator with nothing to say.
  * The converter applies its own `maxPixels` on top of this; this exists so
  * that the decoder is safe to call on its own.
+ *
+ * The number is the converter's own default budget rather than the four
+ * hundred million it used to be. Two ceilings five times apart are not two
+ * defences: everything a caller would ever accept sat under the lower of
+ * them, so the range in between was reachable here and refused there, and the
+ * only thing living in it was a header nobody had a use for. Lowering it
+ * refuses no file that used to decode. Do not raise it again to keep a
+ * fixture that asks for two hundred million pixels passing.
  */
-const MAX_PIXELS = 400_000_000;
+const MAX_PIXELS = 80_000_000;
 
 /**
  * How a reader refuses.
@@ -186,6 +194,67 @@ export function readPngHeader(body: Uint8Array, refuse: PngRefusal): PngHeader {
 		colourType: body[9] as number,
 		interlace: body[12] as number,
 	};
+}
+
+/** The eight bytes an IHDR chunk starts with: a length of thirteen, then its type. */
+const IHDR_PREFIX = [0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52];
+
+/**
+ * Read four big endian bytes without a DataView and without a sign.
+ *
+ * Shifting the top byte left by 24 makes anything from 0x80 up negative, and a
+ * negative width multiplied by a height is a product that passes every ceiling
+ * below it. Multiplying instead keeps the value where it belongs.
+ */
+function readU32(bytes: Uint8Array, at: number): number {
+	return (
+		(bytes[at] as number) * 0x1000000 +
+		(((bytes[at + 1] as number) << 16) |
+			((bytes[at + 2] as number) << 8) |
+			(bytes[at + 3] as number))
+	);
+}
+
+/**
+ * The size an IHDR declares, read on its own and before anything is decoded.
+ *
+ * This is the one format where the gap between the header and the allocation
+ * is unbounded in both directions. Deflate runs to about a thousand to one, so
+ * four kilobytes of file can honestly say twenty thousand by fifteen thousand,
+ * and `decodePngImage` then hands `inflateWithin` a limit worked out from
+ * those same two numbers: the better part of a gigabyte for a truecolour
+ * header, and past a gigabyte once there is alpha, derived from the field the
+ * file was lying with. Every check further down happens after that has been
+ * set up. Measuring first is what lets a caller refuse the file on the
+ * strength of its own claim, which costs twenty four bytes to read.
+ *
+ * IHDR is required by the specification to be the first chunk and to be
+ * thirteen bytes long, so the two numbers sit at fixed offsets 16 and 20 and
+ * nothing has to be walked to reach them. The length and the type in front of
+ * them are checked rather than assumed: without that, any eight bytes after a
+ * PNG signature would be read as a size, and a truncated or rearranged file
+ * would be refused on the strength of whatever those bytes happened to spell.
+ *
+ * Never throws, and says nothing rather than guessing. A header this cannot
+ * read is one `decodePng` refuses with a sentence naming what is wrong with
+ * it, and that sentence is worth more to the person holding the file than a
+ * size complaint about a file that was never a PNG. A declared zero is left
+ * to it for the same reason.
+ */
+export function measurePng(
+	bytes: Uint8Array,
+): { readonly width: number; readonly height: number } | undefined {
+	if (bytes.length < 24) return undefined;
+	for (let i = 0; i < SIGNATURE.length; i += 1) {
+		if (bytes[i] !== SIGNATURE[i]) return undefined;
+	}
+	for (let i = 0; i < IHDR_PREFIX.length; i += 1) {
+		if (bytes[8 + i] !== IHDR_PREFIX[i]) return undefined;
+	}
+	const width = readU32(bytes, 16);
+	const height = readU32(bytes, 20);
+	if (width < 1 || height < 1) return undefined;
+	return { width, height };
 }
 
 /**

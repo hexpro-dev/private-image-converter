@@ -14,16 +14,53 @@ import {
 	createHeicNativeDecoder,
 	createHeicWebCodecsDecoder,
 } from '../../src/codecs/heic/index.js';
+import type { HeicDecodeOutput } from '../../src/codecs/heic/index.js';
 import { emptyCapabilities } from '../../src/detect/capabilities.js';
-import { ImageTooLargeError, UnsupportedHereError } from '../../src/errors.js';
+import { CancelledError, ImageTooLargeError, UnsupportedHereError } from '../../src/errors.js';
+import type { TileDecoder } from '../../src/heif/assemble.js';
 import type { DecodeContext, RasterImage } from '../../src/types.js';
 import { SAMPLE_GAIN_MAP_METADATA, buildHeif, fakeTileDecoder } from '../helpers/heif.js';
 
 const HDR = buildHeif({ columns: 2, rows: 2, tileSize: 64, gainMap: { columns: 2, rows: 1 } });
 const SDR = buildHeif({ columns: 2, rows: 2, tileSize: 64 });
+/** A sticker: one picture, and an alpha plane the same size hung off it. */
+const TRANSPARENT = buildHeif({ columns: 1, rows: 1, tileSize: 64, alpha: {} });
 
 function context(overrides: Partial<DecodeContext> = {}): DecodeContext {
 	return { capabilities: emptyCapabilities(), maxPixels: 100_000_000, ...overrides };
+}
+
+/** A tile decoder that paints every pixel of every tile the same colour. */
+function flatTileDecoder(red: number, green: number, blue: number): TileDecoder {
+	return async (_config, tiles) =>
+		tiles.map((tile) => {
+			const data = new Uint8ClampedArray(tile.width * tile.height * 4);
+			for (let i = 0; i < data.length; i += 4) {
+				data[i] = red;
+				data[i + 1] = green;
+				data[i + 2] = blue;
+				data[i + 3] = 255;
+			}
+			return {
+				data,
+				width: tile.width,
+				height: tile.height,
+				colourSpace: 'srgb' as const,
+				hasAlpha: false,
+			};
+		});
+}
+
+/**
+ * Hand out a different decoder to each pass, in the order they are asked for.
+ *
+ * The picture, then the alpha plane, then the gain map. Each pass builds its
+ * own decoder, which is the seam that lets a test say "the second stream is
+ * the one that fails" without the first knowing anything about it.
+ */
+function decodersInOrder(...decoders: readonly TileDecoder[]): () => TileDecoder {
+	let index = 0;
+	return () => decoders[Math.min(index++, decoders.length - 1)] as TileDecoder;
 }
 
 /** A stand-in for Safari's own decoder, which returns one finished picture. */
@@ -173,21 +210,171 @@ describe('the cost of the second pass', () => {
 	it('lets an abort through rather than treating it as a missing gain map', async () => {
 		// Somebody asked for this and the caller is waiting to hear that it
 		// happened. Swallowing it would report a successful conversion of a file
-		// nobody waited for.
+		// nobody waited for. The abort lands during the gain map's own pass, so
+		// the failure that comes back is a plain decode failure and the signal
+		// is the only thing that says why it really happened.
 		const controller = new AbortController();
 		const decoder = webCodecs({
-			decodeTiles: () => async (config, tiles, signal) => {
-				// Aborts partway through the base, so the gain map's pass is the one
-				// that finds the signal already set, which is where a swallowed
-				// abort would hide.
-				if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+			decodeTiles: decodersInOrder(fakeTileDecoder(), async () => {
 				controller.abort();
-				return fakeTileDecoder()(config, tiles, signal);
+				throw new Error('the decoder gave up');
+			}),
+		});
+		await expect(decoder.decode(HDR, context({ signal: controller.signal }))).rejects.toThrow(
+			CancelledError,
+		);
+	});
+
+	it('passes a cancellation from the gain map pass straight out', async () => {
+		// What the shipped tile decoder throws once it notices the signal. It
+		// is already the right answer, so the layer above must not turn it into
+		// a gain map that merely failed to decode.
+		const controller = new AbortController();
+		const decoder = webCodecs({
+			decodeTiles: decodersInOrder(fakeTileDecoder(), async () => {
+				throw new CancelledError();
+			}),
+		});
+		await expect(decoder.decode(HDR, context({ signal: controller.signal }))).rejects.toThrow(
+			CancelledError,
+		);
+	});
+});
+
+describe('transparency', () => {
+	it('puts the auxiliary plane on the photograph as its alpha channel', async () => {
+		// The plane is monochrome, so its red, green and blue come back equal
+		// and any of them is the coverage. This fixture makes them differ on
+		// purpose, which no real file does, so that a reader taking the green
+		// or the blue is told apart from one taking the red.
+		const output: HeicDecodeOutput = await webCodecs({
+			decodeTiles: decodersInOrder(flatTileDecoder(10, 20, 30), flatTileDecoder(64, 200, 90)),
+		}).decode(TRANSPARENT, context());
+
+		expect(Array.from(output.image.data.slice(0, 4))).toEqual([10, 20, 30, 64]);
+		expect(output.image.hasAlpha).toBe(true);
+		expect(output.droppedAlpha).toBe(false);
+	});
+
+	it('gives the alpha plane a decoder of its own', async () => {
+		// The plane is a separate item with its own `hvcC`, and a decoder is
+		// configured once and then expects every chunk to match. Sharing one
+		// would mean reconfiguring it in the middle of a stream.
+		let passes = 0;
+		await webCodecs({
+			decodeTiles: () => {
+				passes += 1;
+				return fakeTileDecoder();
+			},
+		}).decode(TRANSPARENT, context());
+		expect(passes).toBe(2);
+	});
+
+	it('still returns the photograph when only the plane fails to decode', async () => {
+		// A monochrome stream is exactly the profile some hardware has no
+		// decode block for. Refusing the sticker because its holes would not
+		// decode would refuse a picture the browser has just read.
+		const output: HeicDecodeOutput = await webCodecs({
+			decodeTiles: decodersInOrder(fakeTileDecoder(), async () => {
+				throw new Error('no decode block for monochrome');
+			}),
+		}).decode(TRANSPARENT, context());
+
+		expect(output.image.width).toBeGreaterThan(0);
+		expect(output.image.hasAlpha).toBe(false);
+		expect(output.droppedAlpha).toBe(true);
+	});
+
+	it('reports the drop, and spends nothing, when the plane is the wrong size', async () => {
+		// The planner refuses a plane that does not measure the same as the
+		// picture, so there is nothing left to decode and the second pass never
+		// happens. The interface is still owed the sentence.
+		let passes = 0;
+		const output: HeicDecodeOutput = await webCodecs({
+			decodeTiles: () => {
+				passes += 1;
+				return fakeTileDecoder();
+			},
+		}).decode(buildHeif({ columns: 1, rows: 1, alpha: { width: 200 } }), context());
+
+		expect(passes).toBe(1);
+		expect(output.droppedAlpha).toBe(true);
+	});
+
+	it('says nothing either way about a photograph with no transparency in it', async () => {
+		const output: HeicDecodeOutput = await webCodecs().decode(SDR, context());
+		expect(output.droppedAlpha).toBe(false);
+		expect(output.image.hasAlpha).toBe(false);
+	});
+
+	it('leaves the plane to the browser on the rung that has already had it', async () => {
+		// Safari composites the alpha into the bitmap it returns, so there is
+		// nothing to attach and nothing was lost. Claiming a drop here would be
+		// a warning about something that did not happen.
+		const output: HeicDecodeOutput = await createHeicNativeDecoder({
+			decodeImage: fakeNativeDecode(56, 60),
+		}).decode(TRANSPARENT, context());
+		expect(output.droppedAlpha).toBeUndefined();
+	});
+
+	it('lets a cancellation during the alpha pass through', async () => {
+		const controller = new AbortController();
+		const decoder = webCodecs({
+			decodeTiles: decodersInOrder(fakeTileDecoder(), async () => {
+				throw new CancelledError();
+			}),
+		});
+		await expect(
+			decoder.decode(TRANSPARENT, context({ signal: controller.signal })),
+		).rejects.toThrow(CancelledError);
+	});
+
+	it('reads an aborted signal as a cancellation, whatever the plane threw', async () => {
+		// A decoder that stops because it was cancelled reports whatever it
+		// feels like reporting, so the signal is the authority on why the pass
+		// failed rather than the error that came out of it.
+		const controller = new AbortController();
+		const decoder = webCodecs({
+			decodeTiles: decodersInOrder(fakeTileDecoder(), async () => {
+				controller.abort();
+				throw new Error('the decoder gave up');
+			}),
+		});
+		await expect(
+			decoder.decode(TRANSPARENT, context({ signal: controller.signal })),
+		).rejects.toThrow(CancelledError);
+	});
+});
+
+describe('cancellation', () => {
+	it.each([
+		['the container reader', () => webCodecs()],
+		['the browser', () => createHeicNativeDecoder({ decodeImage: fakeNativeDecode() })],
+	])('stops %s before it decodes anything', async (_label, make) => {
+		// Checked at each phase boundary rather than once at the top. Reading
+		// the container of a 48 megapixel photograph is not free, and neither
+		// is the encode that would follow a decode nobody is waiting for.
+		const controller = new AbortController();
+		controller.abort();
+		await expect(make().decode(HDR, context({ signal: controller.signal }))).rejects.toThrow(
+			CancelledError,
+		);
+	});
+
+	it('never builds a decoder for a conversion that has already been stopped', async () => {
+		const controller = new AbortController();
+		controller.abort();
+		let passes = 0;
+		const decoder = webCodecs({
+			decodeTiles: () => {
+				passes += 1;
+				return fakeTileDecoder();
 			},
 		});
 		await expect(decoder.decode(HDR, context({ signal: controller.signal }))).rejects.toThrow(
-			'Aborted',
+			CancelledError,
 		);
+		expect(passes).toBe(0);
 	});
 });
 

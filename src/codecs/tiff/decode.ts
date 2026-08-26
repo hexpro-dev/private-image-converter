@@ -26,6 +26,14 @@
  * LZMA, Zstd, WebP, YCbCr and the three Lab interpretations, the floating
  * point predictor, and CCITT's uncompressed mode.
  *
+ * There are two ways out of it. `decodeTiff` hands back eight bit pixels, which
+ * is what almost every TIFF holds. `decodeTiffFloat` hands back the light a
+ * floating point TIFF stored, so that one on its way to OpenEXR is not reduced
+ * here and expanded again there, and it refuses everything else on sight. The
+ * note above it is worth reading before touching either of those refusals: both
+ * of them exist because the alternative is a picture that is quietly wrong
+ * rather than an error anybody would notice.
+ *
  * Every read is bounds checked. These bytes came from a stranger's scanner,
  * and a directory that points past the end of the file has to produce a
  * sentence rather than an undefined that becomes a black band two hundred
@@ -33,9 +41,10 @@
  */
 
 import { CodecUnavailableError, DecodeFailedError } from '../../errors.js';
+import { createFloat, detectFloatAlpha } from '../../raster/float.js';
 import { applyOrientation, createRaster, detectAlpha } from '../../raster/image.js';
 import { halfToFloat, toneMap } from '../../raster/tonemap.js';
-import type { Mirror, RasterImage, Rotation } from '../../types.js';
+import type { FloatImage, Mirror, RasterImage, Rotation } from '../../types.js';
 import { inflate } from '../png/deflate.js';
 import { decodeCcitt, type CcittKind } from './ccitt.js';
 import { decodeLzw } from './lzw.js';
@@ -1116,25 +1125,29 @@ function displayRaster(
 	return out;
 }
 
+/** Floating point samples, gathered three or four to a pixel, and what they are. */
+interface FloatSamples {
+	/** `channels` floats per pixel, with associated alpha already divided out. */
+	readonly source: Float32Array;
+	readonly channels: 3 | 4;
+	/**
+	 * True when no colour sample passes 1.
+	 *
+	 * The whole test for whether the file holds a picture or a measurement.
+	 * `floatRaster` below says why the answer matters that much.
+	 */
+	readonly bounded: boolean;
+}
+
 /**
- * Floating point samples to pixels.
+ * Gather the samples a float page holds into contiguous channels.
  *
- * A float TIFF out of a renderer or a height model has no ceiling at 1, so the
- * exposure has to be chosen from the picture rather than assumed. That work
- * lives in `toneMap`, shared with the Radiance and OpenEXR readers, so all
- * three agree about what a bright sky should look like at eight bits.
- *
- * Unlike Radiance and OpenEXR, though, a float TIFF is more often not that.
- * ImageMagick and GDAL both write ordinary display pictures this way, where the
- * samples are the eight bit values over 255 and nothing exceeds 1. Metering
- * those against middle grey re-exposes a picture that was never scene referred,
- * which is why a `-depth 32 -define quantum:format=floating-point` copy of a
- * photograph comes back several stops brighter than the photograph. So the
- * ceiling decides: anything above 1 is light and is tone mapped, and a file
- * bounded by 1 is a picture and is scaled straight across, which is what every
- * other reader does with it.
+ * Separate from `floatRaster` only because `decodeTiffFloat` has to reach the
+ * same verdict about the same numbers. Two copies of the ceiling test would be
+ * two chances to disagree about what a file is, and the two readings of a
+ * display referred picture are several stops apart.
  */
-function floatRaster(samples: Float32Array, page: Page): RasterImage {
+function gatherFloat(samples: Float32Array, page: Page): FloatSamples {
 	const { width, height, samplesPerPixel: total, alphaIndex } = page;
 	const channels = alphaIndex >= 0 ? 4 : 3;
 	const source = new Float32Array(width * height * channels);
@@ -1164,8 +1177,32 @@ function floatRaster(samples: Float32Array, page: Page): RasterImage {
 			}
 		}
 	}
+	return { source, channels, bounded };
+}
+
+/**
+ * Floating point samples to pixels.
+ *
+ * A float TIFF out of a renderer or a height model has no ceiling at 1, so the
+ * exposure has to be chosen from the picture rather than assumed. That work
+ * lives in `toneMap`, shared with the Radiance and OpenEXR readers, so all
+ * three agree about what a bright sky should look like at eight bits.
+ *
+ * Unlike Radiance and OpenEXR, though, a float TIFF is more often not that.
+ * ImageMagick and GDAL both write ordinary display pictures this way, where the
+ * samples are the eight bit values over 255 and nothing exceeds 1. Metering
+ * those against middle grey re-exposes a picture that was never scene referred,
+ * which is why a `-depth 32 -define quantum:format=floating-point` copy of a
+ * photograph comes back several stops brighter than the photograph. So the
+ * ceiling decides: anything above 1 is light and is tone mapped, and a file
+ * bounded by 1 is a picture and is scaled straight across, which is what every
+ * other reader does with it.
+ */
+function floatRaster(samples: Float32Array, page: Page): RasterImage {
+	const { source, channels, bounded } = gatherFloat(samples, page);
+	const { width, height } = page;
 	if (bounded) return displayRaster(source, width, height, channels);
-	return toneMap(source, width, height, channels === 4 ? 4 : 3).image;
+	return toneMap(source, width, height, channels).image;
 }
 
 /* ── Orientation ──────────────────────────────────────────────────────── */
@@ -1198,6 +1235,81 @@ function orientationOf(value: number): { rotation: Rotation; mirror: Mirror } {
 		default:
 			return { rotation: 0, mirror: 'none' };
 	}
+}
+
+/**
+ * The same turn, applied to light.
+ *
+ * `applyOrientation` in `raster/image.ts` already does this and cannot be
+ * borrowed: it takes a `RasterImage`, whose buffer is bytes, and rounding light
+ * to eight bits to turn it sideways would throw away the entire reason the
+ * float path exists. So this is that function's two passes, in that order,
+ * over a `Float32Array`.
+ *
+ * Mirror first and rotate second, which is the order ISO/IEC 23008-12 gives for
+ * `imir` and `irot` and the order the byte path uses. Swapping them is
+ * indistinguishable for the six orientations that carry only one of the two,
+ * and wrong for the two that carry both, so a suite built from the easy six
+ * would pass either way.
+ */
+function orientFloat(image: FloatImage, tag: number): FloatImage {
+	const { rotation, mirror } = orientationOf(tag);
+	const { width, height } = image;
+	let data = image.data;
+
+	if (mirror !== 'none') {
+		const flipped = new Float32Array(data.length);
+		for (let y = 0; y < height; y += 1) {
+			for (let x = 0; x < width; x += 1) {
+				const sx = mirror === 'horizontal' ? width - 1 - x : x;
+				const sy = mirror === 'vertical' ? height - 1 - y : y;
+				const from = (sy * width + sx) * 4;
+				const to = (y * width + x) * 4;
+				flipped[to] = data[from] as number;
+				flipped[to + 1] = data[from + 1] as number;
+				flipped[to + 2] = data[from + 2] as number;
+				flipped[to + 3] = data[from + 3] as number;
+			}
+		}
+		data = flipped;
+	}
+	if (rotation === 0) return { ...image, data };
+
+	const turned = rotation === 90 || rotation === 270;
+	const out = createFloat(
+		turned ? height : width,
+		turned ? width : height,
+		image.colourSpace,
+		image.hasAlpha,
+	);
+	for (let y = 0; y < height; y += 1) {
+		for (let x = 0; x < width; x += 1) {
+			let tx: number;
+			let ty: number;
+			switch (rotation) {
+				case 90:
+					// Anticlockwise: the right hand column becomes the top row.
+					tx = y;
+					ty = width - 1 - x;
+					break;
+				case 180:
+					tx = width - 1 - x;
+					ty = height - 1 - y;
+					break;
+				default:
+					tx = height - 1 - y;
+					ty = x;
+					break;
+			}
+			const from = (y * width + x) * 4;
+			const to = (ty * out.width + tx) * 4;
+			out.data[to] = data[from] as number;
+			out.data[to + 1] = data[from + 1] as number;
+			out.data[to + 2] = data[from + 2] as number;
+			out.data[to + 3] = data[from + 3] as number;
+		}
+	}
+	return out;
 }
 
 /* ── Entry points ─────────────────────────────────────────────────────── */
@@ -1233,6 +1345,86 @@ export async function decodeTiff(bytes: Uint8Array): Promise<RasterImage> {
 
 	image = applyOrientation(image, { ...orientationOf(page.orientation), source: 'exif' });
 	return { ...image, hasAlpha: detectAlpha(image) };
+}
+
+/**
+ * Read a TIFF as light.
+ *
+ * The counterpart to `decodeTiff` for the files that hold a measurement rather
+ * than a picture of one, so that a float TIFF on its way to OpenEXR keeps the
+ * range it was written with instead of being reduced to eight bits here and
+ * expanded back out there.
+ *
+ * Two of the refusals below are the whole design, and both send the file down
+ * the byte ladder in `convert`, which reads it correctly today. Weakening
+ * either is worse than not having this function at all.
+ *
+ * The first is the sample format, read out of the directory before any of the
+ * real work. `convert` runs the light ladder first and unconditionally for
+ * every decoder that offers one, so an ordinary integer TIFF arrives here on
+ * its way to a PNG. Discovering that after the strips had been expanded would
+ * decompress and unpack every scanline of it twice.
+ *
+ * The second is the ceiling at 1, and it is the same test `floatRaster` makes,
+ * from the same function, for the reason set out there: ImageMagick and GDAL
+ * both write ordinary display pictures as float TIFFs whose samples are the
+ * eight bit values over 255. `toneMap` meters log average luminance against
+ * 0.18 with no shortcut for a bounded image, so handing one of those on as a
+ * `FloatImage` re-exposes a photograph that was never scene referred and it
+ * arrives at the PNG several stops bright. The byte ladder scales it straight
+ * across instead, which is what every other reader of that file does.
+ *
+ * Asynchronous for the same reason `decodeTiff` is: Deflate compressed float
+ * TIFFs are what GDAL writes by default, and the only deflate available with no
+ * dependency is a stream.
+ */
+export async function decodeTiffFloat(bytes: Uint8Array): Promise<FloatImage> {
+	const reader = readFileHeader(bytes);
+	const directory = choosePage(reader, readDirectoryChain(reader));
+
+	// Before `readPage`, which is cheap, and long before `readSamples`, which
+	// is not.
+	const format = scalar(reader, directory, TAG_SAMPLE_FORMAT, SAMPLE_FORMAT_UNSIGNED);
+	if (format !== SAMPLE_FORMAT_FLOAT) {
+		fail('its samples are integers rather than IEEE floating point, so there is no light in it.');
+	}
+
+	const page = readPage(reader, directory);
+	if (page.photometric === PHOTOMETRIC_WHITE_IS_ZERO) {
+		// The byte path inverts the finished pixels, which works because it has
+		// a ceiling of 255 to subtract them from. Unbounded light has none, and
+		// inventing one would be choosing an exposure inside a reader.
+		fail(
+			'its floating point samples are inverted by WhiteIsZero, which needs a ceiling to mean anything.',
+		);
+	}
+
+	// `readPage` has already refused every combination that would not produce
+	// floats here: the format is IEEE, the depth is 16 or 32, and the
+	// interpretation is grey or RGB.
+	const samples = (await readSamples(reader, page)) as Float32Array;
+	const { source, channels, bounded } = gatherFloat(samples, page);
+	if (bounded) {
+		fail('its floating point samples never pass 1, so it is a display picture rather than light.');
+	}
+
+	const { width, height } = page;
+	const image = createFloat(width, height, 'srgb', channels === 4);
+	const target = image.data;
+	for (let i = 0; i < width * height; i += 1) {
+		const from = i * channels;
+		const to = i * 4;
+		target[to] = source[from] as number;
+		target[to + 1] = source[from + 1] as number;
+		target[to + 2] = source[from + 2] as number;
+		// A `FloatImage` always carries four channels, and the fourth is
+		// coverage rather than light. Fully covered is the honest reading of a
+		// file that stored no alpha at all.
+		target[to + 3] = channels === 4 ? (source[from + 3] as number) : 1;
+	}
+
+	const oriented = orientFloat(image, page.orientation);
+	return { ...oriented, hasAlpha: detectFloatAlpha(oriented) };
 }
 
 /**

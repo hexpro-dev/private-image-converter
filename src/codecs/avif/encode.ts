@@ -21,6 +21,12 @@
  * The parameter block is carried through as bytes and never read, which is
  * what makes an HDR photograph survive the trip from a HEIC without this
  * package having to understand what any of the numbers in it mean.
+ *
+ * EXIF goes the same way, straight to the muxer as it arrived. `convert` has
+ * already rewritten the orientation tag to upright by the time it gets here,
+ * which is the one field that has to change: the frame handed to the encoder
+ * is the rotated raster, so an EXIF still asking for a quarter turn would be
+ * asking for a second one.
  */
 
 import { ByteWriter } from '../../bits.js';
@@ -280,6 +286,7 @@ export async function encodeAvif(
 				? { image: gainMap.image, metadata: map.metadata, iccProfile: map.iccProfile }
 				: undefined,
 		iccProfile: options.iccProfile,
+		exif: options.exif,
 		// What the bitstream said, rather than what a writer would prefer. A
 		// `colr` box overrides the sequence header, so claiming full range over
 		// the studio range samples every browser encoder produces would lift

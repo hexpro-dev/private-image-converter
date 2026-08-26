@@ -47,28 +47,60 @@ export async function assembleHeifImage(
 		codedHeight: first.height,
 	};
 
-	const decoded = await decodeTiles(config, plan.tiles, signal);
-	if (decoded.length !== plan.tiles.length) {
+	// Copied into an array of this function's own so that a slot can be emptied
+	// once the tile in it has been blitted. The copy frees nothing by itself:
+	// both arrays point at the same rasters, and it is the clearing in the loop
+	// below that drops the last reference to one. Clearing the decoder's own
+	// array would save the copy and mutate a value the caller still holds, which
+	// is a trap for them and throws outright on the frozen array a careful
+	// implementation hands back. The decoder's array is never named, so nothing
+	// keeps it alive past this line.
+	const pending: (RasterImage | undefined)[] = [...(await decodeTiles(config, plan.tiles, signal))];
+	if (pending.length !== plan.tiles.length) {
 		throw new Error(
-			`the tile decoder returned ${decoded.length} tiles for ${plan.tiles.length} requested`,
+			`the tile decoder returned ${pending.length} tiles for ${plan.tiles.length} requested`,
 		);
 	}
 
-	// A single untiled image skips the intermediate buffer entirely, which
-	// matters more than it looks: for a 48 megapixel photograph that buffer is
-	// close to 200 megabytes and allocating a second one halves the size of
-	// image the tab can handle.
 	let assembled: RasterImage;
 	if (plan.tiles.length === 1 && first.x === 0 && first.y === 0) {
-		assembled = decoded[0] as RasterImage;
+		// A single untiled image is already the whole picture, and a buffer to
+		// copy it into is close to 200 megabytes for a 48 megapixel photograph.
+		assembled = pending[0] as RasterImage;
 	} else {
-		assembled = createRaster(plan.canvasWidth, plan.canvasHeight, plan.colourSpace, false);
+		// Allocated at the cropped size rather than at the padded grid, because
+		// nothing needs the padding to exist. `blit` clips at the destination
+		// edges by design, since the last row and column of tiles hang over the
+		// real image in almost every photograph, and `planPicture` refuses any
+		// grid claiming to be larger than its tiles cover. So a destination this
+		// size drops exactly the overhang the crop below used to drop, one row at
+		// a time, for free.
+		//
+		// Restoring `canvasWidth` by `canvasHeight` here for symmetry with the
+		// plan costs a 201 megabyte allocation and a 195 megabyte copy on a 48
+		// megapixel photograph, and changes not one pixel of the result. No test
+		// comparing output would notice; the allocation test in
+		// tests/heif/container.test.ts is what notices.
+		assembled = createRaster(plan.width, plan.height, plan.colourSpace, false);
 		for (let i = 0; i < plan.tiles.length; i += 1) {
 			const tile = plan.tiles[i] as HeifTile;
-			blit(assembled, decoded[i] as RasterImage, tile.x, tile.y);
+			blit(assembled, pending[i] as RasterImage, tile.x, tile.y);
+			// The pixels are in the output now, so let the collector have the
+			// tile. This does not lower the peak on its own: `TileDecoder` hands
+			// back every tile at once, so all 48 are live at the moment the output
+			// is allocated, and only a decoder that yields tiles as it finishes
+			// them would move that. What it does buy is the tiles being collected
+			// before `applyOrientation` allocates the turned copy, which is a
+			// second full sized raster on every portrait photograph a phone takes.
+			pending[i] = undefined;
 		}
 	}
 
+	// A no-op for the branch above, which allocated at exactly this size: the
+	// early return inside `crop` is load bearing rather than incidental, and it
+	// is what keeps the tiled path to one full sized buffer. It still has work to
+	// do for the single tile branch, where a decoder is entitled to hand back a
+	// raster at the coded size rather than at the declared one.
 	const cropped = crop(
 		{ ...assembled, colourSpace: plan.colourSpace },
 		0,

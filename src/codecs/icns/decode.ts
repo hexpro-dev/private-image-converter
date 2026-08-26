@@ -42,6 +42,17 @@ const ENTRY_HEADER_BYTES = 8;
  * four and still refuses a two hundred byte entry whose header asks for a
  * fourteen gigabyte buffer. Sizes for every other payload form come from the
  * table below rather than from the file, so they need no bound of their own.
+ *
+ * This is also the answer to why this reader has no `measure` hook where the
+ * PNG and PCX readers have one. Those two can be handed a header describing
+ * an image of any size at all, so a caller needs the declared size before the
+ * decode to have any defence. Here the declared size cannot get past this
+ * line: the only payload that carries its own dimensions is a PNG, this
+ * refuses it above 4096 a side, and every other entry is sized from the fixed
+ * table below, whose largest slot is 1024. Sixteen million pixels is the most
+ * an icon suite can ever ask for, which is a fifth of the converter's default
+ * budget. Raising this would change that, so raise the two together or not at
+ * all.
  */
 const MAX_PNG_SIDE = 4096;
 

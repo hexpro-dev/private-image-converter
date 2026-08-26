@@ -92,6 +92,15 @@ export const SAMPLE_GAIN_MAP_METADATA: Uint8Array = Uint8Array.from(
 /** The auxiliary type urn an iPhone puts on the gain map picture. */
 export const GAIN_MAP_AUX_TYPE = 'urn:com:apple:photo:2020:aux:hdrgainmap';
 
+/** The alpha plane urn of ISO/IEC 23008-12 clause 6.10.2, for HEVC coded HEIF. */
+export const ALPHA_AUX_TYPE = 'urn:mpeg:hevc:2015:auxid:1';
+
+/** The alpha plane urn of ISO/IEC 23000-22 (MIAF) clause 7.3.5.2. */
+export const ALPHA_AUX_TYPE_MIAF = 'urn:mpeg:mpegB:cicp:systems:auxiliary:alpha';
+
+/** The depth map urn from the same family as the HEVC alpha one. */
+export const DEPTH_AUX_TYPE = 'urn:mpeg:hevc:2015:auxid:2';
+
 export interface HeifGainMapFixture {
 	/**
 	 * How the file advertises the gain map.
@@ -137,6 +146,43 @@ export interface HeifGainMapFixture {
 	readonly rotation?: 0 | 90 | 180 | 270;
 }
 
+/**
+ * An alpha plane, as a HEIC that came from a sticker or a logo carries one.
+ *
+ * A hidden picture of the same size as the photograph, an `auxC` property
+ * saying what it is, and an `auxl` reference pointing back at the picture it
+ * covers. Everything here exists so a test can break exactly one of those and
+ * see the reader carry on with an opaque photograph instead of refusing it.
+ */
+export interface HeifAlphaFixture {
+	/** The plane's own grid. Defaults to the picture's, which is what a writer does. */
+	readonly columns?: number;
+	readonly rows?: number;
+	readonly tileSize?: number;
+	/** The size the plane declares. Defaults to the picture's. */
+	readonly width?: number;
+	readonly height?: number;
+	/** The urn in the `auxC` property. Defaults to the HEVC alpha one. */
+	readonly auxType?: string;
+	/** Leave `auxC` off, so nothing anywhere says what the auxiliary is. */
+	readonly withoutAuxType?: boolean;
+	/** Leave the plane's tiles without a decoder configuration. */
+	readonly withoutConfig?: boolean;
+	/**
+	 * Write some other item type, so the plane is a structure the reader
+	 * refuses by name rather than one it finds damaged.
+	 */
+	readonly itemType?: string;
+	/**
+	 * Point the `auxl` reference at some other item.
+	 *
+	 * A plane that is auxiliary to something that is not the photograph belongs
+	 * to that something, and a reader which searched by urn alone would take it
+	 * anyway.
+	 */
+	readonly attachedTo?: number;
+}
+
 export interface HeifFixtureOptions {
 	/** Grid shape. One by one produces a plain untiled image instead of a grid. */
 	readonly columns?: number;
@@ -151,6 +197,8 @@ export interface HeifFixtureOptions {
 	readonly primaries?: number;
 	/** Add an HDR gain map, as every recent phone photograph carries. */
 	readonly gainMap?: HeifGainMapFixture;
+	/** Add an alpha plane as an auxiliary image, as a transparent HEIC carries. */
+	readonly alpha?: HeifAlphaFixture;
 	/** Attach an EXIF item with this payload, starting at its TIFF header. */
 	readonly exif?: Uint8Array;
 	/** Declare a grid whose tiles do not cover its stated size. */
@@ -203,6 +251,19 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 	const gainHeight = gainRows * gainTileSize;
 	const gainMetadata = gain?.metadata ?? SAMPLE_GAIN_MAP_METADATA;
 
+	/* ── Alpha plane shape ────────────────────────────────────────── */
+	//
+	// The same size as the photograph by default, because that is what every
+	// writer stores and what the reader requires before it will use one.
+
+	const alpha = options.alpha;
+	const alphaColumns = alpha?.columns ?? columns;
+	const alphaRows = alpha?.rows ?? rows;
+	const alphaTiled = alphaColumns > 1 || alphaRows > 1;
+	const alphaTileSize = alpha?.tileSize ?? tileSize;
+	const alphaWidth = alpha?.width ?? width;
+	const alphaHeight = alpha?.height ?? height;
+
 	let nextId = (tiled ? (tileIds[tileIds.length - 1] ?? primaryId) : primaryId) + 1;
 	const gainPictureId = gain ? nextId++ : 0;
 	const gainTileIds: number[] = [];
@@ -210,6 +271,11 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 		for (let i = 0; i < gainColumns * gainRows; i += 1) gainTileIds.push(nextId++);
 	}
 	const tmapId = gain && (gain.layout ?? 'tmap') === 'tmap' ? nextId++ : 0;
+	const alphaPictureId = alpha ? nextId++ : 0;
+	const alphaTileIds: number[] = [];
+	if (alpha && alphaTiled) {
+		for (let i = 0; i < alphaColumns * alphaRows; i += 1) alphaTileIds.push(nextId++);
+	}
 	const exifId = nextId++;
 
 	/* ── Item information ─────────────────────────────────────────── */
@@ -231,6 +297,22 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 		// The `tmap` item is the one part of an HDR photograph that is not
 		// hidden: it is the picture a viewer that understands HDR should show.
 		if (tmapId) infes.push(fullBox('infe', 2, 0, u16(tmapId), u16(0), ascii('tmap'), u8(0)));
+	}
+	if (alpha) {
+		infes.push(
+			fullBox(
+				'infe',
+				2,
+				1,
+				u16(alphaPictureId),
+				u16(0),
+				ascii(alpha.itemType ?? (alphaTiled ? 'grid' : 'hvc1')),
+				u8(0),
+			),
+		);
+		for (const id of alphaTileIds) {
+			infes.push(fullBox('infe', 2, 1, u16(id), u16(0), ascii('hvc1'), u8(0)));
+		}
 	}
 	if (options.exif) {
 		infes.push(fullBox('infe', 2, 0, u16(exifId), u16(0), ascii('Exif'), u8(0)));
@@ -292,6 +374,25 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 			next += 1;
 		}
 	}
+
+	let alphaIspeIndex = 0;
+	let alphaTileIspeIndex = 0;
+	let alphaAuxIndex = 0;
+	if (alpha) {
+		properties.push(fullBox('ispe', 0, 0, u32(alphaWidth), u32(alphaHeight)));
+		alphaIspeIndex = next;
+		next += 1;
+		if (alphaTiled) {
+			properties.push(fullBox('ispe', 0, 0, u32(alphaTileSize), u32(alphaTileSize)));
+			alphaTileIspeIndex = next;
+			next += 1;
+		}
+		if (!alpha.withoutAuxType) {
+			properties.push(fullBox('auxC', 0, 0, ascii(alpha.auxType ?? ALPHA_AUX_TYPE), u8(0)));
+			alphaAuxIndex = next;
+			next += 1;
+		}
+	}
 	const ipco = box('ipco', ...properties);
 
 	const entries: { readonly id: number; readonly indices: readonly number[] }[] = [];
@@ -330,6 +431,22 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 		// the base's, and never the gain map's.
 		if (tmapId) entries.push({ id: tmapId, indices: [3, 4] });
 	}
+	if (alpha) {
+		// The plane carries the picture's own rotation, which is what keeps the
+		// two the same way up without either being turned twice, and no `colr`
+		// at all: its samples are coverage rather than a colour.
+		const configIndex = alpha.withoutConfig ? 0 : 2;
+		entries.push({
+			id: alphaPictureId,
+			indices: (alphaTiled
+				? [alphaIspeIndex, alphaAuxIndex, rotationIndex, mirrorIndex]
+				: [alphaIspeIndex, configIndex, alphaAuxIndex, rotationIndex, mirrorIndex]
+			).filter((n) => n > 0),
+		});
+		for (const id of alphaTileIds) {
+			entries.push({ id, indices: [alphaTileIspeIndex, configIndex].filter((n) => n > 0) });
+		}
+	}
 	const ipma = fullBox(
 		'ipma',
 		0,
@@ -363,6 +480,18 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 			}
 		}
 	}
+	if (alpha) {
+		if (alphaTiled) {
+			referenceBoxes.push(
+				box('dimg', u16(alphaPictureId), u16(alphaTileIds.length), ...alphaTileIds.map(u16)),
+			);
+		}
+		// From the auxiliary to the picture it covers, which is the direction
+		// the standard defines and the opposite of the one a reader assumes.
+		referenceBoxes.push(
+			box('auxl', u16(alphaPictureId), u16(1), u16(alpha.attachedTo ?? primaryId)),
+		);
+	}
 	if (options.exif) {
 		referenceBoxes.push(box('cdsc', u16(exifId), u16(1), u16(primaryId)));
 	}
@@ -378,6 +507,11 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 		u16(gainWidth),
 		u16(gainHeight),
 	]);
+	const alphaGridDescriptor = concat([
+		u8(0, 0, alphaRows - 1, alphaColumns - 1),
+		u16(alphaWidth),
+		u16(alphaHeight),
+	]);
 
 	const idatParts: Uint8Array[] = [];
 	let idatLength = 0;
@@ -390,10 +524,14 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 	const baseGridAt = tiled ? intoIdat(gridDescriptor) : 0;
 	const gainGridAt = gain && gainTiled ? intoIdat(gainGridDescriptor) : 0;
 	const tmapAt = tmapId ? intoIdat(gainMetadata) : 0;
+	const alphaGridAt = alpha && alphaTiled ? intoIdat(alphaGridDescriptor) : 0;
 	const idat = idatParts.length > 0 ? box('idat', ...idatParts) : undefined;
 
 	const gainPictureItems = gain ? (gainTiled ? gainTileIds : [gainPictureId]) : [];
-	const payloads: Uint8Array[] = [...tileIds, ...gainPictureItems].map(() => SAMPLE_TILE);
+	const alphaPictureItems = alpha ? (alphaTiled ? alphaTileIds : [alphaPictureId]) : [];
+	const payloads: Uint8Array[] = [...tileIds, ...gainPictureItems, ...alphaPictureItems].map(
+		() => SAMPLE_TILE,
+	);
 	if (options.exif) payloads.push(concat([u32(0), options.exif]));
 
 	/* ── Locations ────────────────────────────────────────────────── */
@@ -421,9 +559,10 @@ export function buildHeif(options: HeifFixtureOptions = {}): Uint8Array {
 		if (tmapId) {
 			fromIdat(tmapId, tmapAt, gainMetadata.length + (gain?.damagedLocation ? 4096 : 0));
 		}
+		if (alpha && alphaTiled) fromIdat(alphaPictureId, alphaGridAt, alphaGridDescriptor.length);
 
 		let at = mdatStart;
-		for (const id of [...tileIds, ...gainPictureItems]) {
+		for (const id of [...tileIds, ...gainPictureItems, ...alphaPictureItems]) {
 			fromFile(id, at, SAMPLE_TILE.length);
 			at += SAMPLE_TILE.length;
 		}

@@ -22,6 +22,7 @@
 
 import { ImageTooLargeError } from './errors.js';
 import { FORMATS } from './formats.js';
+import { findExif } from './metadata/exif.js';
 import { declaresWideGamut, findIccProfile } from './metadata/icc.js';
 import { registerDecoder, registerEncoder } from './registry.js';
 import type {
@@ -40,8 +41,9 @@ import { heicNativeDecoder, heicWebCodecsDecoder } from './codecs/heic/index.js'
 import { decodeNative, nativeDecodeAvailable } from './codecs/native/decode.js';
 import { encodeNative } from './codecs/native/encode.js';
 import { decodeAnimatedNative, imageDecoderAvailable } from './codecs/native/animated.js';
-import { decodePng } from './codecs/png/decode.js';
+import { decodePng, measurePng } from './codecs/png/decode.js';
 import { encodePng } from './codecs/png/encode.js';
+import { animatedWebpEncoder } from './codecs/webp/encode.js';
 import { decodeApng } from './codecs/png/apng.js';
 import { encodeApng } from './codecs/png/apngEncode.js';
 import { hasCompressionStream } from './codecs/png/deflate.js';
@@ -57,18 +59,18 @@ import { decodeFarbfeld } from './codecs/farbfeld/decode.js';
 import { encodeFarbfeld } from './codecs/farbfeld/encode.js';
 import { decodeIco } from './codecs/ico/decode.js';
 import { encodeIco } from './codecs/ico/encode.js';
-import { decodeTiff, readTiffIccProfile } from './codecs/tiff/decode.js';
+import { decodeTiff, decodeTiffFloat, readTiffIccProfile } from './codecs/tiff/decode.js';
 import { encodeTiff } from './codecs/tiff/encode.js';
-import { decodeGifAnimation } from './codecs/gif/decode.js';
+import { decodeGifAnimation, measureGif } from './codecs/gif/decode.js';
 import { encodeGif } from './codecs/gif/encode.js';
-import { decodePsd } from './codecs/psd/decode.js';
+import { decodePsd, measurePsd } from './codecs/psd/decode.js';
 import { decodeDds } from './codecs/dds/decode.js';
 import { decodeHdr, decodeHdrFloat } from './codecs/hdr/decode.js';
 import { encodeHdr, encodeHdrFloat } from './codecs/hdr/encode.js';
 import { decodeExr, decodeExrFloat } from './codecs/exr/decode.js';
 import { encodeExr, encodeExrFloat } from './codecs/exr/encode.js';
 import { avifEncoder } from './codecs/avif/index.js';
-import { decodePcx } from './codecs/pcx/decode.js';
+import { decodePcx, measurePcx } from './codecs/pcx/decode.js';
 import { encodePcx } from './codecs/pcx/encode.js';
 import { decodeIcns } from './codecs/icns/decode.js';
 import { encodeIcns } from './codecs/icns/encode.js';
@@ -122,6 +124,11 @@ function nativeDecoder(format: FormatId, mimeOverride?: string): Decoder {
 			const profile = wide ? findIccProfile(bytes, format) : undefined;
 			return {
 				iccProfile: profile && profile.length > 0 ? profile : undefined,
+				// Read off the container here rather than left to the browser,
+				// which strips it during the decode. Without this the report
+				// could only say what a HEIC had been carrying, and the tick box
+				// offering to keep it had nothing to keep for every other source.
+				exif: findExif(bytes, format),
 				// A browser applies EXIF orientation while decoding, so the
 				// pixels are already upright. Applying it again is the classic
 				// double-rotation bug and it only shows on photographs taken
@@ -203,12 +210,35 @@ function nativeEncoder(format: FormatId): Encoder {
 
 type PureDecode = (bytes: Uint8Array) => Promise<RasterImage> | RasterImage;
 
+/** Reads the declared size out of a header. See `Decoder.measure`. */
+type PureMeasure = (
+	bytes: Uint8Array,
+) => { readonly width: number; readonly height: number } | undefined;
+
 function pureDecoder(
 	format: FormatId,
 	decode: PureDecode,
 	available: () => boolean = () => true,
 	readLight?: (bytes: Uint8Array) => Promise<FloatImage> | FloatImage,
+	measure?: PureMeasure,
 ): Decoder {
+	/**
+	 * Refuse a header that describes more than the caller will take.
+	 *
+	 * Before the decode rather than after it. Every reader here already
+	 * refuses a header its file cannot back up, which covers the formats that
+	 * store pixels plainly, but a compressed one has no such relationship: the
+	 * header and the pixels are separated by a decompressor, and a small file
+	 * can honestly declare an enormous image. Measuring first is what turns
+	 * that from an allocation into a sentence.
+	 */
+	const guard = (bytes: Uint8Array, maxPixels: number): void => {
+		const size = measure?.(bytes);
+		if (!size) return;
+		const pixels = size.width * size.height;
+		if (pixels > maxPixels) throw new ImageTooLargeError(pixels, maxPixels);
+	};
+
 	return {
 		id: `${format}-pure`,
 		formats: [format],
@@ -217,7 +247,9 @@ function pureDecoder(
 		async available() {
 			return available();
 		},
+		...(measure ? { measure } : {}),
 		async decode(bytes, context) {
+			guard(bytes, context.maxPixels);
 			const image = await decode(bytes);
 			// Checked here rather than inside each codec. A codec receives bytes
 			// and knows nothing about the caller's budget, and every one of them
@@ -236,6 +268,7 @@ function pureDecoder(
 		...(readLight
 			? {
 					async decodeFloat(bytes: Uint8Array, context: DecodeContext) {
+						guard(bytes, context.maxPixels);
 						const image = await readLight(bytes);
 						// The same ceiling, and it bites sooner here: a pixel of
 						// light is sixteen bytes against four, so the buffer
@@ -272,6 +305,7 @@ function pureAnimatedDecoder(
 	format: FormatId,
 	decode: AnimatedDecode,
 	available: () => boolean = () => true,
+	measure?: PureMeasure,
 ): Decoder {
 	return {
 		id: `${format}-pure`,
@@ -281,7 +315,15 @@ function pureAnimatedDecoder(
 		async available() {
 			return available();
 		},
+		...(measure ? { measure } : {}),
 		async decode(bytes, context) {
+			// The header's own claim, checked before the decompressor is handed
+			// a budget shaped by it. One frame is a floor rather than the whole
+			// answer, so the screen times frames check below still does the rest.
+			const declared = measure?.(bytes);
+			if (declared && declared.width * declared.height > context.maxPixels) {
+				throw new ImageTooLargeError(declared.width * declared.height, context.maxPixels);
+			}
 			const decoded = await decode(bytes);
 			const frames = Math.max(1, decoded.animation.frames.length);
 			const pixels = decoded.image.width * decoded.image.height * frames;
@@ -305,6 +347,8 @@ interface PureEncoderOptions {
 	readonly floats?: (image: FloatImage, options: EncodeOptions) => Promise<Uint8Array> | Uint8Array;
 	readonly available?: () => boolean;
 	readonly animates?: boolean;
+	/** Declares the encoder writes `EncodeOptions.exif`. See `Encoder.exif`. */
+	readonly exif?: boolean;
 }
 
 function pureEncoder(
@@ -318,6 +362,7 @@ function pureEncoder(
 		path: 'pure',
 		priority: options.priority ?? 10,
 		animates: options.animates,
+		exif: options.exif,
 		async available() {
 			return options.available?.() ?? true;
 		},
@@ -362,6 +407,33 @@ const tiffDecoder: Decoder = {
 		return {
 			image,
 			iccProfile: profile && profile.length > 0 ? profile : undefined,
+			// The file is its own EXIF: a TIFF and an EXIF block are the same
+			// structure, which is why this one needs no marker walk.
+			exif: findExif(bytes, 'tiff'),
+			orientation: { rotation: 0, mirror: 'none', source: 'none' },
+		};
+	},
+	/**
+	 * A float TIFF read as light rather than reduced to eight bits.
+	 *
+	 * `decodeTiffFloat` throws immediately for anything that is not floating
+	 * point, and for a float file whose values are already bounded by one.
+	 * Both refusals matter: `convert` runs the light ladder first for any
+	 * decoder that offers one, so a slow refusal would parse every ordinary
+	 * TIFF twice, and a display-referred float file handed on as light would be
+	 * metered against 0.18 and come out several stops too bright.
+	 */
+	async decodeFloat(bytes, context) {
+		const image = await decodeTiffFloat(bytes);
+		// The same ceiling, and it bites sooner here: a pixel of light is
+		// sixteen bytes against four.
+		const pixels = image.width * image.height;
+		if (pixels > context.maxPixels) throw new ImageTooLargeError(pixels, context.maxPixels);
+		const profile = readTiffIccProfile(bytes);
+		return {
+			image,
+			iccProfile: profile && profile.length > 0 ? profile : undefined,
+			exif: findExif(bytes, 'tiff'),
 			orientation: { rotation: 0, mirror: 'none', source: 'none' },
 		};
 	},
@@ -485,10 +557,10 @@ export function installDefaultCodecs(): void {
 	// it cannot run.
 	registerDecoder(pureAnimatedDecoder('apng', decodeApng, hasCompressionStream));
 	registerDecoder(fallbackNativeDecoder('apng', 'image/png'));
-	registerDecoder(pureAnimatedDecoder('gif', decodeGifAnimation));
+	registerDecoder(pureAnimatedDecoder('gif', decodeGifAnimation, () => true, measureGif));
 	registerDecoder(fallbackNativeDecoder('gif'));
 
-	registerDecoder(pureDecoder('png', decodePng, hasCompressionStream));
+	registerDecoder(pureDecoder('png', decodePng, hasCompressionStream, undefined, measurePng));
 	registerDecoder(tiffDecoder);
 	registerDecoder(embeddedPreviewDecoder('raw', 20));
 	// Behind the pure reader rather than instead of it: a TIFF with JPEG strips
@@ -502,13 +574,13 @@ export function installDefaultCodecs(): void {
 	registerDecoder(pureDecoder('pnm', decodePnm));
 	registerDecoder(pureDecoder('farbfeld', decodeFarbfeld));
 	registerDecoder(pureDecoder('ico', decodeIco));
-	registerDecoder(pureDecoder('psd', decodePsd));
+	registerDecoder(pureDecoder('psd', decodePsd, () => true, undefined, measurePsd));
 	registerDecoder(pureDecoder('dds', decodeDds));
 	// Both of these read light as well as bytes, and which one runs is decided
 	// by where the picture is going rather than here.
 	registerDecoder(pureDecoder('hdr', decodeHdr, () => true, decodeHdrFloat));
 	registerDecoder(pureDecoder('exr', decodeExr, () => true, decodeExrFloat));
-	registerDecoder(pureDecoder('pcx', decodePcx));
+	registerDecoder(pureDecoder('pcx', decodePcx, () => true, undefined, measurePcx));
 	registerDecoder(pureDecoder('icns', decodeIcns, hasCompressionStream));
 	registerDecoder(pureDecoder('ras', decodeRas));
 	registerDecoder(pureDecoder('xbm', decodeXbm));
@@ -523,7 +595,7 @@ export function installDefaultCodecs(): void {
 	// the source ICC profile so a wide gamut photograph survives, needs no
 	// canvas and so has no size ceiling, and on a phone photograph it produces
 	// a smaller file than the canvas does.
-	registerEncoder(pureEncoder('png', encodePng, { available: hasCompressionStream }));
+	registerEncoder(pureEncoder('png', encodePng, { available: hasCompressionStream, exif: true }));
 	registerEncoder(
 		pureEncoder('apng', encodeApng, { available: hasCompressionStream, animates: true }),
 	);
@@ -534,13 +606,18 @@ export function installDefaultCodecs(): void {
 	registerEncoder(pureEncoder('tga', encodeTga));
 	registerEncoder(pureEncoder('pnm', encodePnm));
 	registerEncoder(pureEncoder('farbfeld', encodeFarbfeld));
-	registerEncoder(pureEncoder('tiff', encodeTiff));
+	registerEncoder(pureEncoder('tiff', encodeTiff, { exif: true }));
 	registerEncoder(pureEncoder('hdr', encodeHdr, { floats: encodeHdrFloat }));
 	// No availability check. An uncompressed OpenEXR is always legal, so this
 	// is the one encoder here with no platform requirement at all: it prefers
 	// deflate and writes the file either way.
 	registerEncoder(pureEncoder('exr', encodeExr, { floats: encodeExrFloat }));
 	registerEncoder(avifEncoder);
+	// Ahead of the plain canvas WebP encoder on priority, not on registration
+	// order, and the canvas one stays registered behind it: this rung needs the
+	// browser to write a WebP per frame, and where it cannot, a still is still
+	// a result.
+	registerEncoder(animatedWebpEncoder);
 	registerEncoder(pureEncoder('pcx', encodePcx));
 	registerEncoder(pureEncoder('ras', encodeRas));
 	registerEncoder(pureEncoder('xbm', encodeXbm));

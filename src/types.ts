@@ -337,6 +337,22 @@ export interface DecodeOutput {
 	readonly gainMap?: GainMap;
 	/** True when the container carried an HDR gain map this decoder discarded. */
 	readonly droppedGainMap?: boolean;
+	/**
+	 * True when the file carried transparency this decoder could not apply.
+	 *
+	 * The picture came back opaque and is meant to have holes in it. Absent
+	 * means either the file was opaque or the transparency was applied, which
+	 * from a caller's point of view are the same thing and need no report.
+	 */
+	readonly droppedAlpha?: boolean;
+	/**
+	 * True when the source had more frames than this reader was willing to take.
+	 *
+	 * Distinct from `ConvertOptions.frames`, which is the caller asking for one
+	 * frame. This is the reader reaching its own cap, and it has to reach the
+	 * report or an interface says "all 300 frames kept" about a 500 frame GIF.
+	 */
+	readonly truncatedFrames?: boolean;
 	/** Raw EXIF payload (TIFF header onwards), if the container carried one. */
 	readonly exif?: Uint8Array;
 	/**
@@ -397,6 +413,22 @@ export interface Decoder {
 	 * setting mean anything.
 	 */
 	decodeFloat?(bytes: Uint8Array, context: DecodeContext): Promise<FloatDecodeOutput>;
+	/**
+	 * Read the declared size out of the header, without decoding anything.
+	 *
+	 * Optional, and worth implementing wherever the header and the pixels are
+	 * separated by a decompressor. `maxPixels` is otherwise checked against the
+	 * image that came back, which is too late to be a defence: a four kilobyte
+	 * PNG whose IHDR claims twenty thousand by fifteen thousand has already
+	 * been handed a gigabyte-shaped inflate budget by the time anything
+	 * measures it. Formats that carry their pixels uncompressed can skip this,
+	 * because a file that small cannot contain an image that large and their
+	 * readers already refuse a header the file cannot back up.
+	 *
+	 * Returns nothing when the header cannot be read at all, which leaves the
+	 * decision to `decode` and its error messages.
+	 */
+	measure?(bytes: Uint8Array): { readonly width: number; readonly height: number } | undefined;
 }
 
 /**
@@ -458,6 +490,16 @@ export interface EncodeOptions {
 	 */
 	readonly palette?: number;
 	/**
+	 * An EXIF payload to write, from the TIFF header onwards.
+	 *
+	 * Only an encoder that can carry one looks at it. `convert` supplies this
+	 * when the caller asked to preserve metadata and the source had any, and
+	 * rewrites the orientation tag to 1 first: the decoder contract says the
+	 * pixels arrive upright, so carrying the original orientation through would
+	 * tell every future reader to rotate an already rotated photograph.
+	 */
+	readonly exif?: Uint8Array;
+	/**
 	 * The frames to write, for an encoder that can animate.
 	 *
 	 * Ignored by every encoder that cannot, which is most of them, so passing
@@ -499,6 +541,16 @@ export interface Encoder {
 	 * Whether this encoder writes `EncodeOptions.gainMap` rather than dropping it.
 	 */
 	readonly gainMaps?: boolean;
+	/**
+	 * Whether this encoder writes `EncodeOptions.exif`.
+	 *
+	 * Declared rather than inferred, because the report tells somebody whether
+	 * their metadata survived and there is no way to check after the fact
+	 * without parsing the file back. An encoder that quietly ignored the field
+	 * while the interface said "kept" would be the worst of the three possible
+	 * outcomes: worse than dropping it, and worse than saying so.
+	 */
+	readonly exif?: boolean;
 	available(capabilities: Capabilities): Promise<boolean>;
 	encode(image: RasterImage, options: EncodeOptions, context: EncodeContext): Promise<Uint8Array>;
 	/**
@@ -608,6 +660,24 @@ export interface ConvertReport {
 	/** True when the source was animated and only its first frame was kept. */
 	readonly droppedFrames?: boolean;
 	/**
+	 * True when the source had more frames than the reader would take.
+	 *
+	 * Separate from `droppedFrames`, which is all of them but one. This is the
+	 * tail of a very long animation, and saying so is the difference between a
+	 * report that is true and one that claims to have kept everything.
+	 */
+	readonly truncatedFrames?: boolean;
+	/**
+	 * True when the source carried transparency that could not be applied.
+	 *
+	 * Only a HEIC does this today: it stores its alpha as a separate auxiliary
+	 * image, and one that is malformed or a different size from the picture is
+	 * let go of rather than being allowed to refuse the photograph. The result
+	 * is a complete picture with no holes in it, which is worth saying out loud
+	 * because it looks like a working conversion.
+	 */
+	readonly droppedAlpha?: boolean;
+	/**
 	 * What the source file was carrying, when it carried anything.
 	 *
 	 * Present so an interface can say what it removed rather than only that it
@@ -615,6 +685,18 @@ export interface ConvertReport {
 	 * differently from "metadata".
 	 */
 	readonly metadata?: import('./metadata/exif.js').ExifSummary;
+	/**
+	 * What happened to that metadata.
+	 *
+	 * Absent when the source carried none. `kept` means the output format can
+	 * hold EXIF, the caller asked for it, and it was written. `stripped` means
+	 * it is gone, which is the default and is what somebody converting a
+	 * photograph to put on the internet usually wants. There is no third value
+	 * for "asked for but the format cannot hold it", because from the reader's
+	 * point of view that is the same as stripped and the format is on the row
+	 * beside it.
+	 */
+	readonly metadataKept?: 'kept' | 'stripped';
 	/**
 	 * What happened to the source's HDR gain map.
 	 *

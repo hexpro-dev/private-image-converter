@@ -718,14 +718,20 @@ describe('the copy the built document ships', () => {
 });
 
 describe('the size of the built document', () => {
-	// Measured at roughly 75 kB. The bounds are deliberately wide, because the
-	// bundle moves with every codec added and this should not need editing for
-	// that. The floor catches a build that dropped the converter and shipped the
-	// page shell on its own, which is a few kilobytes and would otherwise pass
-	// every other assertion in this file. The ceiling catches something arriving
-	// that was never meant to: an inlined source map, a fixture, a dependency.
+	// The bounds are deliberately wide, because the bundle moves with every
+	// codec added and this should not need editing for that. The floor catches
+	// a build that dropped the converter and shipped the page shell on its own,
+	// which is a few kilobytes and would otherwise pass every other assertion in
+	// this file. The ceiling catches something arriving that was never meant to:
+	// an inlined source map, a fixture, a dependency.
+	//
+	// Raised from 250 kB once, at roughly 253 kB, after animated WebP, EXIF
+	// carriage, float TIFF, the HEIC alpha plane and the header ceilings landed
+	// together. Raise it again the same way if a real feature needs it, and read
+	// the diff first: the failure this exists to catch looks exactly like a
+	// feature until you look at what actually grew.
 	const FLOOR = 40_000;
-	const CEILING = 250_000;
+	const CEILING = 320_000;
 
 	it('is large enough to hold the converter and small enough to be a download', () => {
 		expect(build.bytes).toBeGreaterThan(FLOOR);

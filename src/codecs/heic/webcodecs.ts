@@ -14,7 +14,7 @@
  * interface says which happened.
  */
 
-import { CodecUnavailableError, DecodeFailedError } from '../../errors.js';
+import { CancelledError, CodecUnavailableError, DecodeFailedError } from '../../errors.js';
 import type { RasterImage } from '../../types.js';
 import type { TileDecoder, TileDecoderConfig } from '../../heif/assemble.js';
 import type { HeifTile } from '../../heif/image.js';
@@ -98,6 +98,11 @@ export function webCodecsTileDecoder(): TileDecoder {
 			);
 		}
 
+		// Before the decoder exists, so a conversion cancelled while the
+		// container was being read does not go on to claim a hardware decoder
+		// and hand it back unused.
+		if (signal?.aborted) throw new CancelledError();
+
 		const out: RasterImage[] = new Array(tiles.length);
 		const pending: Promise<void>[] = [];
 		let received = 0;
@@ -146,7 +151,12 @@ export function webCodecsTileDecoder(): TileDecoder {
 			});
 
 			for (let index = 0; index < tiles.length; index += 1) {
-				if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+				// The package's own error rather than an `AbortError`
+				// `DOMException`. Both stop the ladder, but one says so by its
+				// type and the other has to be recognised by the name on
+				// somebody else's error class, which is a string comparison
+				// standing in for a decision.
+				if (signal?.aborted) throw new CancelledError();
 				const tile = tiles[index] as HeifTile;
 				// Every tile of a still image is a key frame: there is nothing
 				// for it to reference.
@@ -162,6 +172,11 @@ export function webCodecsTileDecoder(): TileDecoder {
 
 			await decoder.flush();
 			await Promise.all(pending);
+			// The flush is the long wait on a 48 tile photograph and nothing
+			// inside it looks at the signal, so this is where a cancellation
+			// that arrived during the decode is noticed. Inside the `try`, so
+			// the decoder is still closed on the way out.
+			if (signal?.aborted) throw new CancelledError();
 		} finally {
 			if (decoder.state !== 'closed') decoder.close();
 		}

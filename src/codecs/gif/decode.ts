@@ -68,6 +68,15 @@ const DISPOSE_PREVIOUS = 3;
  *
  * The converter applies its own `maxPixels` on top of this; this exists so the
  * decoder is safe to call on its own.
+ *
+ * This one stays where it is while the animation budget below has come down to
+ * the converter's default, and the two are answering different questions.
+ * `measureGif` reads the screen descriptor for a caller that has a budget, so
+ * a still GIF is refused on the caller's number long before this one is
+ * reached. What is left here is somebody calling `decodeGif` directly with no
+ * budget of their own, and for them the useful bound is the one that says the
+ * buffer cannot be requested at all, not one that guesses at what they meant
+ * to allow.
  */
 const MAX_PIXELS = 400_000_000;
 
@@ -78,8 +87,18 @@ const MAX_PIXELS = 400_000_000;
  * animation multiply out to the same problem as one enormous frame. Counted in
  * pixels rather than in frames, because two hundred frames of a thumbnail and
  * two hundred frames of a wallpaper are not the same request.
+ *
+ * The converter's own default budget, which is not the number above it and is
+ * not meant to be. `pureAnimatedDecoder` multiplies the screen by the frame
+ * count and compares that product against the caller's `maxPixels`, so this is
+ * the same arithmetic against the same figure, one layer earlier. It used to
+ * be five times larger, which meant a nine thousand square animation was
+ * inside this reader's budget at fifty frames and fourteen gigabytes of
+ * raster, and the check that would have caught it ran after every one of those
+ * frames had been built. The frame budget is what stops before the first of
+ * them.
  */
-const MAX_ANIMATION_PIXELS = 400_000_000;
+const MAX_ANIMATION_PIXELS = 80_000_000;
 
 /**
  * A ceiling on the frame count regardless of how small the frames are.
@@ -561,6 +580,42 @@ function readGif(bytes: Uint8Array, firstOnly: boolean): GifResult {
 	const first = frames[0];
 	if (!first) fail('it carries no image data at all.');
 	return { image: first.image, animation: { frames, loopCount } };
+}
+
+/**
+ * The logical screen a GIF declares, read on its own and before any decoding.
+ *
+ * Worth having because the screen descriptor is not a claim this reader can
+ * afford to check later. The canvas is allocated from those two numbers at the
+ * first image descriptor, before a single LZW code has been read, so a file
+ * that stops immediately after its header has still asked for the buffer.
+ * Thirteen bytes can honestly say 65535 by 65535, and the compressed pixels
+ * behind them are a stream with no length in the header at all, which is why a
+ * short file cannot be caught the way a Sun raster or a Netpbm can.
+ *
+ * Two reasons the answer is a floor rather than the final size, both of which
+ * are safe in this direction and would not be in the other. A first frame that
+ * reaches outside the declared screen enlarges it, which is what browsers do
+ * and what `readGif` does below. And an animation returns every frame at that
+ * size, so the memory an animated file actually costs is this multiplied by a
+ * frame count nothing in the header states. A caller refusing on a number that
+ * is too small refuses nothing that should have been allowed; one refusing on
+ * a number that is too large would reject working files, so do not be tempted
+ * to guess a frame count here.
+ *
+ * Never throws, and says nothing rather than guessing. A file this cannot read
+ * is one `readGif` refuses with a sentence naming what it stopped inside.
+ */
+export function measureGif(
+	bytes: Uint8Array,
+): { readonly width: number; readonly height: number } | undefined {
+	if (bytes.length < HEADER_BYTES) return undefined;
+	const signature = ascii(bytes, 0, 6);
+	if (signature !== 'GIF87a' && signature !== 'GIF89a') return undefined;
+	const width = (bytes[6] as number) | ((bytes[7] as number) << 8);
+	const height = (bytes[8] as number) | ((bytes[9] as number) << 8);
+	if (width < 1 || height < 1) return undefined;
+	return { width, height };
 }
 
 /**

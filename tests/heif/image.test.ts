@@ -1,40 +1,90 @@
 import { describe, expect, it } from 'vitest';
-import { planHeifImage } from '../../src/heif/image.js';
+import { iccIsWideGamut, planHeifImage } from '../../src/heif/image.js';
 import { assembleHeifImage } from '../../src/heif/assemble.js';
 import { HeifMalformedError, HeifUnsupportedFeatureError } from '../../src/errors.js';
 import {
+	ALPHA_AUX_TYPE_MIAF,
+	DEPTH_AUX_TYPE,
 	SAMPLE_GAIN_MAP_METADATA,
+	ascii,
 	buildHeif,
 	concat,
 	fakeTileDecoder,
 	u32,
 } from '../helpers/heif.js';
 
+/** A colourant tag: its signature and its media-relative X, Y and Z. */
+type Colourant = readonly [string, number, number, number];
+
 /**
- * A minimal ICC profile carrying one `rXYZ` tag.
+ * The three colourants of the profiles anybody actually ships.
  *
- * The gamut question is decided from the red colourant rather than from the
- * profile description, because the description is free text that vendors
- * change between releases. sRGB puts the red primary's X at about 0.436 and
- * Display P3 at about 0.515.
+ * Every one of these is the published D50 adapted matrix of its profile,
+ * typed out rather than produced by a library, so a test that says "Adobe RGB
+ * is not Display P3" is comparing against Adobe RGB rather than against
+ * whatever this package believes Adobe RGB to be.
  */
-function iccProfile(redX: number): Uint8Array {
-	const header = new Uint8Array(128);
-	const tagCount = u32(1);
-	const tagEntry = concat([
-		new Uint8Array([0x72, 0x58, 0x59, 0x5a]), // 'rXYZ'
-		u32(144), // offset of the tag data
-		u32(20), // its size
-	]);
-	const tagData = concat([
-		new Uint8Array([0x58, 0x59, 0x5a, 0x20]), // 'XYZ '
-		u32(0),
-		u32(Math.round(redX * 65536)),
-		u32(0),
-		u32(0),
-	]);
-	// The entry table ends at 144, which is where the tag data starts.
-	return concat([header, tagCount, tagEntry, tagData]);
+const DISPLAY_P3: readonly Colourant[] = [
+	['rXYZ', 0.51512, 0.2416, -0.00105],
+	['gXYZ', 0.29197, 0.69224, 0.04189],
+	['bXYZ', 0.1571, 0.06606, 0.78407],
+];
+const SRGB: readonly Colourant[] = [
+	['rXYZ', 0.43607, 0.22249, 0.01392],
+	['gXYZ', 0.38515, 0.71687, 0.09708],
+	['bXYZ', 0.14307, 0.06061, 0.7141],
+];
+const ADOBE_RGB: readonly Colourant[] = [
+	['rXYZ', 0.60974, 0.31111, 0.01947],
+	['gXYZ', 0.20528, 0.62567, 0.06087],
+	['bXYZ', 0.14919, 0.06322, 0.74457],
+];
+const PROPHOTO: readonly Colourant[] = [
+	['rXYZ', 0.7977, 0.28804, 0],
+	['gXYZ', 0.13518, 0.71188, 0],
+	['bXYZ', 0.03134, 0.00009, 0.82491],
+];
+const REC2020: readonly Colourant[] = [
+	['rXYZ', 0.67345, 0.27903, -0.00194],
+	['gXYZ', 0.16566, 0.67568, 0.02999],
+	['bXYZ', 0.1251, 0.04529, 0.79683],
+];
+
+/** s15Fixed16, which is how an ICC profile stores a colourant component. */
+function s15(value: number): Uint8Array {
+	return u32(Math.round(value * 65536));
+}
+
+/**
+ * Build an ICC profile carrying the given colourants.
+ *
+ * Assembled from the ICC layout by hand: a 128 byte header, the tag count, one
+ * twelve byte entry per tag, then the tag data those entries point at. A
+ * profile produced by a colour library would only prove this reader agrees
+ * with that library.
+ *
+ * A `desc` tag goes in front of the colourants deliberately, because a real
+ * profile has a dozen tags the predicate has no interest in and a fixture
+ * where every tag matches never walks past one.
+ */
+function iccProfile(colourants: readonly Colourant[]): Uint8Array {
+	const tags = [
+		{ signature: 'desc', data: ascii('A profile written by hand\0') },
+		...colourants.map(([signature, x, y, z]) => ({
+			signature,
+			data: concat([ascii('XYZ '), u32(0), s15(x), s15(y), s15(z)]),
+		})),
+	];
+
+	const entries: Uint8Array[] = [];
+	const payloads: Uint8Array[] = [];
+	let at = 132 + tags.length * 12;
+	for (const tag of tags) {
+		entries.push(concat([ascii(tag.signature), u32(at), u32(tag.data.length)]));
+		payloads.push(tag.data);
+		at += tag.data.length;
+	}
+	return concat([new Uint8Array(128), u32(tags.length), ...entries, ...payloads]);
 }
 
 describe('colour', () => {
@@ -46,7 +96,7 @@ describe('colour', () => {
 		// The profile is carried rather than merely detected, because writing
 		// the source profile into the output is what makes the conversion
 		// lossless in colour rather than only in pixels.
-		const plan = planHeifImage(buildHeif({ icc: iccProfile(0.5151) }));
+		const plan = planHeifImage(buildHeif({ icc: iccProfile(DISPLAY_P3) }));
 		expect(plan.colourSpace).toBe('display-p3');
 		expect(plan.iccProfile).toBeDefined();
 	});
@@ -54,7 +104,7 @@ describe('colour', () => {
 	it('reads an sRGB ICC profile as sRGB', () => {
 		// The other half of the same rule. Treating this as wide gamut and
 		// converting would oversaturate an image that was already correct.
-		expect(planHeifImage(buildHeif({ icc: iccProfile(0.4361) })).colourSpace).toBe('srgb');
+		expect(planHeifImage(buildHeif({ icc: iccProfile(SRGB) })).colourSpace).toBe('srgb');
 	});
 
 	it('falls back to sRGB on a profile too short to read', () => {
@@ -67,6 +117,67 @@ describe('colour', () => {
 		const profile = new Uint8Array(200);
 		new DataView(profile.buffer).setUint32(128, 0xffffffff);
 		expect(planHeifImage(buildHeif({ icc: profile })).colourSpace).toBe('srgb');
+	});
+});
+
+describe('the wide gamut predicate', () => {
+	it('recognises Display P3', () => {
+		expect(iccIsWideGamut(iccProfile(DISPLAY_P3))).toBe(true);
+	});
+
+	it.each([
+		['sRGB', SRGB],
+		['Adobe RGB', ADOBE_RGB],
+		['ProPhoto', PROPHOTO],
+		['Rec.2020', REC2020],
+	])('does not read %s as Display P3', (_label, colourants) => {
+		// The regression this is here for: deciding from the red colourant
+		// alone puts every one of the last three above any threshold that
+		// admits P3, so those files were tagged P3 and their pixels converted
+		// into a gamut their own profile denies. Only sRGB fails a red-only
+		// test correctly, which is why a red-only test looked right.
+		expect(iccIsWideGamut(iccProfile(colourants))).toBe(false);
+		expect(planHeifImage(buildHeif({ icc: iccProfile(colourants) })).colourSpace).toBe('srgb');
+	});
+
+	it('refuses a profile with a P3 red and an Adobe RGB green', () => {
+		// Nobody writes this file. It exists so that "all three" is tested as
+		// all three rather than as "the first one that matched".
+		const mixed: readonly Colourant[] = [
+			DISPLAY_P3[0] as Colourant,
+			ADOBE_RGB[1] as Colourant,
+			DISPLAY_P3[2] as Colourant,
+		];
+		expect(iccIsWideGamut(iccProfile(mixed))).toBe(false);
+	});
+
+	it('refuses a profile that carries only the red colourant', () => {
+		// A truncated or unusual profile is not P3 on the strength of the one
+		// tag it happens to have, and false is the safe answer: the picture is
+		// then left alone rather than converted.
+		expect(iccIsWideGamut(iccProfile([DISPLAY_P3[0] as Colourant]))).toBe(false);
+	});
+
+	it('refuses a profile with no tags at all', () => {
+		expect(iccIsWideGamut(iccProfile([]))).toBe(false);
+	});
+
+	it('stops at the end of a tag table that claims more entries than it has', () => {
+		// The count is the file talking about itself and can be wrong. Walking
+		// past the buffer throws a RangeError out of the DataView rather than
+		// returning anything, so this reaching an answer at all is the check:
+		// the four real tags are read, the imaginary ones are not.
+		const profile = iccProfile(DISPLAY_P3);
+		new DataView(profile.buffer, profile.byteOffset).setUint32(128, 400);
+		expect(iccIsWideGamut(profile)).toBe(true);
+	});
+
+	it('refuses a profile whose colourant points past the end', () => {
+		// The `desc` tag is written first, so the red colourant is the second
+		// entry and its offset field sits twelve bytes into the table.
+		const profile = iccProfile(DISPLAY_P3);
+		new DataView(profile.buffer, profile.byteOffset).setUint32(132 + 12 + 4, 0xffff);
+		expect(iccIsWideGamut(profile)).toBe(false);
 	});
 });
 
@@ -251,6 +362,134 @@ describe('gain maps', () => {
 		// base's quarter turn swaps its own.
 		const image = await assembleHeifImage(map, fakeTileDecoder());
 		expect([image.width, image.height]).toEqual([64, 32]);
+	});
+});
+
+describe('transparency', () => {
+	it('plans the alpha plane beside the picture', () => {
+		const plan = planHeifImage(buildHeif({ columns: 1, rows: 1, alpha: {} }));
+		expect(plan.hasAlphaAuxiliary).toBe(true);
+		expect([plan.alphaAuxiliary?.width, plan.alphaAuxiliary?.height]).toEqual([
+			plan.width,
+			plan.height,
+		]);
+		expect(plan.alphaAuxiliary?.tiles).toHaveLength(1);
+	});
+
+	it('plans an alpha plane that is itself a grid', () => {
+		// A tiled photograph stores its transparency tiled the same way, so the
+		// plane goes through the same grid arithmetic as the picture rather
+		// than through a second copy of it that could disagree.
+		const plan = planHeifImage(buildHeif({ columns: 2, rows: 2, tileSize: 64, alpha: {} }));
+		expect(plan.alphaAuxiliary?.tiles).toHaveLength(4);
+		expect([plan.alphaAuxiliary?.width, plan.alphaAuxiliary?.height]).toEqual([120, 124]);
+	});
+
+	it('decodes the plane to the size of the picture it covers', async () => {
+		const plan = planHeifImage(buildHeif({ columns: 2, rows: 2, alpha: {} }));
+		const alpha = plan.alphaAuxiliary;
+		if (!alpha) throw new Error('the fixture should have planned an alpha plane');
+		const image = await assembleHeifImage(alpha, fakeTileDecoder());
+		expect([image.width, image.height]).toEqual([plan.displayWidth, plan.displayHeight]);
+	});
+
+	it('takes the MIAF urn as well as the HEVC one', () => {
+		// A file carries one or the other depending on how old the writer is,
+		// and nothing downstream can tell the difference.
+		const plan = planHeifImage(
+			buildHeif({ columns: 1, rows: 1, alpha: { auxType: ALPHA_AUX_TYPE_MIAF } }),
+		);
+		expect(plan.alphaAuxiliary).toBeDefined();
+	});
+
+	it('does not take a depth map for transparency', () => {
+		// One digit apart in the urn, the same grey rectangle on screen, and a
+		// substring match cannot tell them apart. Multiplying a photograph by
+		// its depth map fades it out with distance and throws nothing.
+		const plan = planHeifImage(
+			buildHeif({ columns: 1, rows: 1, alpha: { auxType: DEPTH_AUX_TYPE } }),
+		);
+		expect(plan.hasAlphaAuxiliary).toBe(false);
+		expect(plan.alphaAuxiliary).toBeUndefined();
+	});
+
+	it('ignores an auxiliary that never says what it is', () => {
+		const plan = planHeifImage(buildHeif({ columns: 1, rows: 1, alpha: { withoutAuxType: true } }));
+		expect(plan.hasAlphaAuxiliary).toBe(false);
+	});
+
+	it('ignores an alpha plane auxiliary to some other item', () => {
+		// A plane that covers something else belongs to that something else. A
+		// reader searching by urn alone would take it and put it on the
+		// photograph anyway.
+		const plan = planHeifImage(buildHeif({ columns: 1, rows: 1, alpha: { attachedTo: 99 } }));
+		expect(plan.hasAlphaAuxiliary).toBe(false);
+	});
+
+	it('does not mistake the gain map for an alpha plane', () => {
+		// Both hang off the photograph by `auxl`, both are hidden, both are
+		// grey. The urn is the only thing that separates them, which is why it
+		// is checked before the item is planned rather than after.
+		const plan = planHeifImage(buildHeif({ gainMap: {} }));
+		expect(plan.hasGainMap).toBe(true);
+		expect(plan.hasAlphaAuxiliary).toBe(false);
+	});
+
+	it('reads a gain map and an alpha plane off the same photograph', () => {
+		// What a screenshot of an HDR photograph looks like: three pictures in
+		// the container, two of them accessories to the first.
+		const plan = planHeifImage(buildHeif({ columns: 2, rows: 2, gainMap: {}, alpha: {} }));
+		expect(plan.gainMap).toBeDefined();
+		expect(plan.alphaAuxiliary).toBeDefined();
+		expect(plan.tiles).toHaveLength(4);
+	});
+
+	it('turns the plane by its own rotation, so it still lines up', () => {
+		// Both items carry the same `irot` in a real file, and the sizes are
+		// compared after it has been applied. Comparing the stored sizes
+		// instead would be right by accident here and wrong the moment a
+		// portrait picture met a plane whose rotation was recorded differently.
+		const plan = planHeifImage(buildHeif({ columns: 2, rows: 2, rotation: 90, alpha: {} }));
+		expect(plan.alphaAuxiliary?.orientation).toEqual(plan.orientation);
+		expect([plan.alphaAuxiliary?.displayWidth, plan.alphaAuxiliary?.displayHeight]).toEqual([
+			plan.displayWidth,
+			plan.displayHeight,
+		]);
+	});
+
+	it.each([
+		['wider than', { width: 200 }],
+		['taller than', { height: 200 }],
+	])('drops a plane %s the picture, and keeps the picture', (_label, size) => {
+		// Coverage is stored at the picture's own size by every writer, so a
+		// plane that is not that size means this is the wrong item or the file
+		// disagrees with itself. Stretching it would put the holes in the
+		// wrong places with nothing anywhere saying so.
+		const plan = planHeifImage(buildHeif({ columns: 1, rows: 1, alpha: size }));
+		expect(plan.hasAlphaAuxiliary).toBe(true);
+		expect(plan.alphaAuxiliary).toBeUndefined();
+		expect(plan.tiles.length).toBeGreaterThan(0);
+	});
+
+	it.each([
+		['is damaged', { withoutConfig: true }],
+		['is a structure this reader refuses', { itemType: 'iovl' }],
+	])('drops a plane that %s, and keeps the picture', (_label, alpha) => {
+		// The same rule the gain map already follows, and for the same reason:
+		// there is a regression in this package where a damaged accessory
+		// refused the whole photograph, and a picture that comes back opaque is
+		// a far better answer than one that does not come back.
+		const plan = planHeifImage(buildHeif({ columns: 1, rows: 1, alpha }));
+		expect(plan.hasAlphaAuxiliary).toBe(true);
+		expect(plan.alphaAuxiliary).toBeUndefined();
+		expect(plan.width).toBeGreaterThan(0);
+		expect(plan.tiles.length).toBeGreaterThan(0);
+	});
+
+	it('reports nothing at all when the picture is opaque', () => {
+		const plan = planHeifImage(buildHeif({}));
+		expect(plan.hasAlphaAuxiliary).toBe(false);
+		expect(plan.alphaAuxiliary).toBeUndefined();
 	});
 });
 

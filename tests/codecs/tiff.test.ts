@@ -1,13 +1,19 @@
 import { describe, expect, it } from 'vitest';
 
 import { MsbBitWriter } from '../../src/bits.js';
+import { decodePng } from '../../src/codecs/png/decode.js';
 import { deflate } from '../../src/codecs/png/deflate.js';
 import { decodeCcitt } from '../../src/codecs/tiff/ccitt.js';
-import { decodeTiff, readTiffIccProfile } from '../../src/codecs/tiff/decode.js';
+import { decodeTiff, decodeTiffFloat, readTiffIccProfile } from '../../src/codecs/tiff/decode.js';
 import { encodeTiff } from '../../src/codecs/tiff/encode.js';
+import { convert } from '../../src/convert.js';
+import { installDefaultCodecs, resetDefaultCodecs } from '../../src/defaults.js';
+import { emptyCapabilities } from '../../src/detect/capabilities.js';
 import { CodecUnavailableError, DecodeFailedError, EncodeFailedError } from '../../src/errors.js';
+import { readExif } from '../../src/metadata/exif.js';
 import { createRaster } from '../../src/raster/image.js';
-import type { ColourSpace, RasterImage } from '../../src/types.js';
+import { clearRegistry, registerDecoder } from '../../src/registry.js';
+import type { ColourSpace, Orientation, RasterImage } from '../../src/types.js';
 
 /* ── Building files by hand ───────────────────────────────────────────── */
 
@@ -2892,5 +2898,802 @@ describe('TIFF round trips', () => {
 
 		expect(back.colourSpace).toBe('srgb');
 		expect(pixelsOf(back)).toEqual([200, 100, 50, 255]);
+	});
+});
+
+/* ── Reading a TIFF as light ──────────────────────────────────────────── */
+
+/**
+ * The environment the conversion below runs in.
+ *
+ * No canvas and no video decoder, so every rung of both ladders is a pure one.
+ * `CompressionStream` is the exception because Node has it and the PNG on the
+ * other end needs it.
+ */
+const PURE_ONLY = emptyCapabilities({ compressionStream: true });
+
+/** What every decoder in this package reports: the pixels came back the right way up. */
+const UPRIGHT: Orientation = { rotation: 0, mirror: 'none', source: 'none' };
+
+function float32(values: readonly number[], little = true): Uint8Array {
+	const out = new Uint8Array(values.length * 4);
+	const view = new DataView(out.buffer);
+	values.forEach((value, i) => view.setFloat32(i * 4, value, little));
+	return out;
+}
+
+/** A float TIFF, from the field values the specification defines and nothing else. */
+function floatFile(
+	width: number,
+	height: number,
+	samples: number,
+	values: readonly number[],
+	extra: readonly FieldSpec[] = [],
+): Uint8Array {
+	return makeTiff({
+		width,
+		height,
+		samples,
+		bits: 32,
+		photometric: samples >= 3 ? 2 : 1,
+		data: float32(values),
+		extra: [{ tag: 339, type: SHORT, values: new Array<number>(samples).fill(3) }, ...extra],
+	});
+}
+
+async function expectFloatRefusal(file: Uint8Array, pattern: RegExp): Promise<void> {
+	let thrown: unknown;
+	try {
+		await decodeTiffFloat(file);
+	} catch (error) {
+		thrown = error;
+	}
+	expect(thrown).toBeInstanceOf(DecodeFailedError);
+	const error = thrown as DecodeFailedError;
+	expect(error.code).toBe('decode/failed');
+	expect(error.message).toMatch(pattern);
+	expect(error.message.endsWith('.')).toBe(true);
+}
+
+/** Positions in the sorted order, so two arrangements can be compared without their values. */
+function ranks(values: readonly number[]): number[] {
+	const sorted = [...values].sort((a, b) => a - b);
+	return values.map((value) => sorted.indexOf(value));
+}
+
+function reds(image: { data: Float32Array | Uint8ClampedArray }): number[] {
+	return Array.from(image.data).filter((_, i) => i % 4 === 0);
+}
+
+describe('decodeTiffFloat', () => {
+	it('refuses an integer TIFF from its directory alone, before a strip is touched', async () => {
+		// The strip offset points past the end of the file, so a reader that
+		// expanded the samples before it looked at the sample format would fail
+		// with the second sentence rather than the first. That ordering is what
+		// keeps `convert` from unpacking every ordinary TIFF twice on its way to
+		// a PNG, because the light ladder runs first and unconditionally.
+		const file = makeTiff({ width: 1, height: 1, data: bytes(1, 2, 3), offsets: [0xffff] });
+
+		await expectFloatRefusal(file, /integers rather than IEEE floating point/);
+		await expectRefusal(file, /ends before/);
+	});
+
+	it('refuses signed integer samples', async () => {
+		const file = makeTiff({
+			width: 1,
+			height: 1,
+			bits: 16,
+			samples: 1,
+			photometric: 1,
+			data: bytes(0, 0),
+			extra: [{ tag: 339, type: SHORT, values: [2] }],
+		});
+
+		await expectFloatRefusal(file, /integers rather than IEEE floating point/);
+	});
+
+	it('refuses a float TIFF whose samples never pass 1', async () => {
+		await expectFloatRefusal(floatFile(4, 1, 1, [0, 0.25, 0.5, 1]), /never pass 1/);
+	});
+
+	it('converts a bounded float TIFF to PNG with its pixels unchanged', async () => {
+		// The regression the refusal above exists for, through the whole
+		// pipeline. `convert` runs the light ladder first and unconditionally,
+		// so the decoder registered here is the shape `defaults.ts` gets once a
+		// float TIFF reader is wired into it, and the refusal is the only thing
+		// that keeps this file on the byte ladder. `toneMap` meters log average
+		// luminance against 0.18 with no shortcut for a bounded image, so a
+		// `FloatImage` reaching the encoder would arrive several stops bright.
+		//
+		// The four values are what ImageMagick reads back out of its own
+		// `-depth 32 -define quantum:format=floating-point` file, and they are
+		// what this package produced before there was a light ladder at all.
+		let askedForLight = false;
+		installDefaultCodecs();
+		registerDecoder({
+			id: 'tiff-pure-light',
+			formats: ['tiff'],
+			path: 'pure',
+			// Ahead of the reader `defaults.ts` already registers, so that both
+			// ladders reach this one and the assertions below are about it.
+			priority: 39,
+			async available() {
+				return true;
+			},
+			async decode(input) {
+				return { image: await decodeTiff(input), orientation: UPRIGHT };
+			},
+			async decodeFloat(input) {
+				askedForLight = true;
+				return { image: await decodeTiffFloat(input), orientation: UPRIGHT };
+			},
+		});
+		try {
+			const file = floatFile(4, 1, 1, [0, 0.25, 0.5, 1]);
+			const result = await convert(file, { to: 'png' }, PURE_ONLY);
+			const png = await decodePng(result.bytes);
+
+			// Asked for light, refused, and read again as bytes. Nothing metered
+			// anything, which is the whole point.
+			expect(askedForLight).toBe(true);
+			expect(result.report.decoderId).toBe('tiff-pure-light');
+			expect(result.report.toneMapped).toBeUndefined();
+			expect(Array.from(png.data)).toEqual([
+				0, 0, 0, 255, 64, 64, 64, 255, 128, 128, 128, 255, 255, 255, 255, 255,
+			]);
+		} finally {
+			clearRegistry();
+			resetDefaultCodecs();
+		}
+	});
+
+	it('refuses WhiteIsZero light, which has no ceiling to invert against', async () => {
+		const file = makeTiff({
+			width: 2,
+			height: 1,
+			bits: 32,
+			samples: 1,
+			photometric: 0,
+			data: float32([0.5, 3]),
+			extra: [{ tag: 339, type: SHORT, values: [3] }],
+		});
+
+		await expectFloatRefusal(file, /WhiteIsZero/);
+	});
+
+	it('reads thirty-two bit float colour as the light it stores', async () => {
+		const image = await decodeTiffFloat(floatFile(2, 1, 3, [0.25, 0.5, 2, 4, 0.125, 1.5]));
+
+		expect([image.width, image.height]).toEqual([2, 1]);
+		expect(image.colourSpace).toBe('srgb');
+		expect(image.hasAlpha).toBe(false);
+		// Every one of these is exact in binary32, so an approximate match here
+		// would be hiding a conversion that should not have happened.
+		expect(Array.from(image.data)).toEqual([0.25, 0.5, 2, 1, 4, 0.125, 1.5, 1]);
+	});
+
+	it('spreads a single float channel across three', async () => {
+		const image = await decodeTiffFloat(floatFile(2, 1, 1, [0.5, 3]));
+
+		expect(Array.from(image.data)).toEqual([0.5, 0.5, 0.5, 1, 3, 3, 3, 1]);
+	});
+
+	it('reads sixteen bit half floats as light', async () => {
+		// 0x3800 is 0.5 and 0x4000 is 2 in IEEE 754 binary16, little endian here
+		// because the file's header said so.
+		const file = makeTiff({
+			width: 2,
+			height: 1,
+			bits: 16,
+			samples: 1,
+			photometric: 1,
+			data: bytes(0x00, 0x38, 0x00, 0x40),
+			extra: [{ tag: 339, type: SHORT, values: [3] }],
+		});
+
+		expect(Array.from((await decodeTiffFloat(file)).data)).toEqual([0.5, 0.5, 0.5, 1, 2, 2, 2, 1]);
+	});
+
+	it('carries unassociated alpha through as coverage', async () => {
+		const file = floatFile(
+			2,
+			1,
+			4,
+			[0.25, 0.5, 0.75, 0.5, 2, 2, 2, 1],
+			[{ tag: 338, type: SHORT, values: [2] }],
+		);
+		const image = await decodeTiffFloat(file);
+
+		expect(image.hasAlpha).toBe(true);
+		expect(Array.from(image.data)).toEqual([0.25, 0.5, 0.75, 0.5, 2, 2, 2, 1]);
+	});
+
+	it('divides associated alpha back out of the light', async () => {
+		const file = floatFile(
+			2,
+			1,
+			4,
+			[0.5, 0.5, 0.5, 0.5, 2, 2, 2, 1],
+			[{ tag: 338, type: SHORT, values: [1] }],
+		);
+
+		expect(Array.from((await decodeTiffFloat(file)).data)).toEqual([1, 1, 1, 0.5, 2, 2, 2, 1]);
+	});
+
+	it('reports no alpha where a fourth channel is present and fully covered', async () => {
+		const file = floatFile(
+			2,
+			1,
+			4,
+			[0.25, 0.5, 0.75, 1, 2, 2, 2, 1],
+			[{ tag: 338, type: SHORT, values: [2] }],
+		);
+
+		expect((await decodeTiffFloat(file)).hasAlpha).toBe(false);
+	});
+
+	it('reads a Deflate compressed float TIFF, which is what GDAL writes', async () => {
+		const file = makeTiff({
+			width: 4,
+			height: 1,
+			bits: 32,
+			samples: 1,
+			photometric: 1,
+			compression: 8,
+			data: await deflate(float32([0.5, 3, 0.25, 4])),
+			extra: [{ tag: 339, type: SHORT, values: [3] }],
+		});
+
+		expect(reds(await decodeTiffFloat(file))).toEqual([0.5, 3, 0.25, 4]);
+	});
+
+	it.each([
+		[1, [2, 3, 4, 5]],
+		[2, [3, 2, 5, 4]],
+		[3, [5, 4, 3, 2]],
+		[4, [4, 5, 2, 3]],
+		[5, [2, 4, 3, 5]],
+		[6, [4, 2, 5, 3]],
+		[7, [5, 3, 4, 2]],
+		[8, [3, 5, 2, 4]],
+	])('turns the light the way orientation %i asks for', async (tag, expected) => {
+		const file = makeTiff({
+			width: 2,
+			height: 2,
+			bits: 32,
+			samples: 1,
+			photometric: 1,
+			data: float32([2, 3, 4, 5]),
+			extra: [
+				{ tag: 274, type: SHORT, values: [tag] },
+				{ tag: 339, type: SHORT, values: [3] },
+			],
+		});
+		const image = await decodeTiffFloat(file);
+
+		expect(reds(image)).toEqual(expected);
+		// The byte path turns the same file through `applyOrientation`, and the
+		// tone map in front of it is monotonic in luminance, so the two have to
+		// arrange the picture identically. That is the assertion that does not
+		// depend on the table above having been worked out correctly, and it is
+		// the one that catches a mirror and a rotation applied in the wrong
+		// order, which only shows on orientations 5 and 7.
+		expect(ranks(reds(await decodeTiff(file)))).toEqual(ranks(expected));
+	});
+
+	it('swaps the dimensions of a picture the orientation turns', async () => {
+		const file = makeTiff({
+			width: 3,
+			height: 1,
+			bits: 32,
+			samples: 1,
+			photometric: 1,
+			data: float32([2, 3, 4]),
+			extra: [
+				{ tag: 274, type: SHORT, values: [6] },
+				{ tag: 339, type: SHORT, values: [3] },
+			],
+		});
+		const image = await decodeTiffFloat(file);
+
+		expect([image.width, image.height]).toEqual([1, 3]);
+		expect(reds(image)).toEqual([2, 3, 4]);
+	});
+
+	it('refuses something that is not a TIFF at all', async () => {
+		await expectFloatRefusal(bytes(1, 2, 3, 4, 5, 6, 7, 8), /II or MM/);
+	});
+});
+
+/* ── EXIF, on the way out ─────────────────────────────────────────────── */
+
+/** Bytes per value, by field type, for the twelve TIFF 6.0 defines. */
+const TYPE_BYTES: Record<number, number> = {
+	1: 1,
+	2: 1,
+	3: 2,
+	4: 4,
+	5: 8,
+	6: 1,
+	7: 1,
+	8: 2,
+	9: 4,
+	10: 8,
+	11: 4,
+	12: 8,
+};
+
+interface OutEntry {
+	readonly tag: number;
+	readonly type: number;
+	readonly count: number;
+	/** Where the twelve byte entry starts, which is where a short value sits too. */
+	readonly entryAt: number;
+	/** Where the value is, inline or at the offset the entry names. */
+	readonly valueAt: number;
+}
+
+/**
+ * Read one little endian directory, the way the specification lays it out.
+ *
+ * Written here rather than borrowed from the decoder so that the encoder is
+ * checked against the format rather than against its own reader.
+ */
+function readIfd(file: Uint8Array, at: number): OutEntry[] {
+	const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+	const count = view.getUint16(at, true);
+	const out: OutEntry[] = [];
+	for (let i = 0; i < count; i += 1) {
+		const entryAt = at + 2 + i * 12;
+		const type = view.getUint16(entryAt + 2, true);
+		const values = view.getUint32(entryAt + 4, true);
+		const size = (TYPE_BYTES[type] ?? 0) * values;
+		out.push({
+			tag: view.getUint16(entryAt, true),
+			type,
+			count: values,
+			entryAt,
+			valueAt: size <= 4 ? entryAt + 8 : view.getUint32(entryAt + 8, true),
+		});
+	}
+	return out;
+}
+
+function ifd0Of(file: Uint8Array): OutEntry[] {
+	const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+	return readIfd(file, view.getUint32(4, true));
+}
+
+function tagged(entries: readonly OutEntry[], tag: number): OutEntry | undefined {
+	return entries.find((entry) => entry.tag === tag);
+}
+
+function longAt(file: Uint8Array, at: number): number {
+	return new DataView(file.buffer, file.byteOffset, file.byteLength).getUint32(at, true);
+}
+
+function textOf(file: Uint8Array, entry: OutEntry): string {
+	let out = '';
+	for (let i = 0; i < entry.count; i += 1) {
+		const byte = file[entry.valueAt + i] as number;
+		if (byte === 0) break;
+		out += String.fromCharCode(byte);
+	}
+	return out;
+}
+
+/** The sub-directory a pointer tag names, or nothing where the tag is absent. */
+function subIfdOf(file: Uint8Array, tag: number): OutEntry[] | undefined {
+	const pointer = tagged(ifd0Of(file), tag);
+	if (!pointer) return undefined;
+	return readIfd(file, longAt(file, pointer.valueAt));
+}
+
+function ascii(text: string): number[] {
+	return [...text].map((character) => character.charCodeAt(0));
+}
+
+function patch16(file: Uint8Array, at: number, value: number): Uint8Array {
+	const out = file.slice();
+	new DataView(out.buffer).setUint16(at, value, true);
+	return out;
+}
+
+function patch32(file: Uint8Array, at: number, value: number): Uint8Array {
+	const out = file.slice();
+	new DataView(out.buffer).setUint32(at, value, true);
+	return out;
+}
+
+interface ExifSpec {
+	readonly ifd0: readonly FieldSpec[];
+	readonly exif?: readonly FieldSpec[];
+	readonly gps?: readonly FieldSpec[];
+	readonly little?: boolean;
+}
+
+/**
+ * An EXIF payload, laid out from the TIFF 6.0 and Exif 2.3 rules by hand.
+ *
+ * This is the shape that makes carrying EXIF into another TIFF awkward, so the
+ * fixture has to have it honestly: a byte order mark, the number 42, IFD0, and
+ * sub-directories at offsets counted from byte zero of this block rather than
+ * from byte zero of whatever it is eventually put inside.
+ */
+function buildExif(spec: ExifSpec): Uint8Array {
+	const little = spec.little ?? true;
+	const subs: { tag: number; fields: readonly FieldSpec[] }[] = [];
+	if (spec.exif) subs.push({ tag: 34665, fields: spec.exif });
+	if (spec.gps) subs.push({ tag: 34853, fields: spec.gps });
+
+	const ifd0: FieldSpec[] = [
+		...spec.ifd0,
+		...subs.map((sub) => ({ tag: sub.tag, type: LONG, values: [0] })),
+	].sort((a, b) => a.tag - b.tag);
+	const directories: FieldSpec[][] = [
+		ifd0,
+		...subs.map((sub) => [...sub.fields].sort((a, b) => a.tag - b.tag)),
+	];
+
+	// Where each directory and each long value goes, in one pass. A pointer is
+	// four bytes whatever it holds, so the layout does not depend on the offsets
+	// that are still unknown at this point.
+	const directoryAt: number[] = [];
+	const valueAt: number[][] = [];
+	let at = 8;
+	for (const fields of directories) {
+		directoryAt.push(at);
+		at += 2 + fields.length * 12 + 4;
+		const offsets: number[] = [];
+		for (const field of fields) {
+			const size = valueBytes(field, little).length;
+			if (size <= 4) {
+				offsets.push(-1);
+				continue;
+			}
+			at += at & 1;
+			offsets.push(at);
+			at += size;
+		}
+		valueAt.push(offsets);
+	}
+
+	const out = new Uint8Array(at);
+	const view = new DataView(out.buffer);
+	out[0] = little ? 0x49 : 0x4d;
+	out[1] = little ? 0x49 : 0x4d;
+	view.setUint16(2, 42, little);
+	view.setUint32(4, directoryAt[0] as number, little);
+
+	directories.forEach((fields, d) => {
+		const start = directoryAt[d] as number;
+		view.setUint16(start, fields.length, little);
+		fields.forEach((field, i) => {
+			// Only IFD0 names sub-directories. A pointer tag inside one of them is
+			// whatever the fixture said it was, which is how a nested pointer can
+			// be tested at all.
+			const sub = d === 0 ? subs.findIndex((entry) => entry.tag === field.tag) : -1;
+			const resolved = sub < 0 ? field : { ...field, values: [directoryAt[sub + 1] as number] };
+			const to = start + 2 + i * 12;
+			view.setUint16(to, resolved.tag, little);
+			view.setUint16(to + 2, resolved.type, little);
+			view.setUint32(to + 4, valueCount(resolved), little);
+			const value = valueBytes(resolved, little);
+			const where = (valueAt[d] as number[])[i] as number;
+			if (where < 0) {
+				out.set(value, to + 8);
+			} else {
+				view.setUint32(to + 8, where, little);
+				out.set(value, where);
+			}
+		});
+		view.setUint32(start + 2 + fields.length * 12, 0, little);
+	});
+	return out;
+}
+
+/** A payload with a camera, a capture time, an exposure and a location in it. */
+function cameraExif(little = true): Uint8Array {
+	return buildExif({
+		little,
+		ifd0: [
+			{ tag: 271, type: ASCII, values: ascii('Canon\0') },
+			{ tag: 272, type: ASCII, values: ascii('Canon EOS 5D\0') },
+			{ tag: 305, type: ASCII, values: ascii('Digital Photo Professional\0') },
+			{ tag: 306, type: ASCII, values: ascii('2019:07:04 11:22:33\0') },
+			// Carried nowhere. The pixels an encoder is handed are upright, so a
+			// tag saying they are not would turn every portrait photograph.
+			{ tag: 274, type: SHORT, values: [6] },
+			// Structure of the picture the payload came off, not of this one.
+			{ tag: 256, type: LONG, values: [5616] },
+			{ tag: 259, type: SHORT, values: [6] },
+		],
+		exif: [
+			{ tag: 0x829a, type: RATIONAL, values: [1, 200] },
+			{ tag: 0x8827, type: SHORT, values: [400] },
+			{ tag: 0x9003, type: ASCII, values: ascii('2019:07:04 11:22:33\0') },
+		],
+		gps: [
+			{ tag: 1, type: ASCII, values: ascii('S\0') },
+			{ tag: 2, type: RATIONAL, values: [33, 1, 52, 1, 0, 1] },
+		],
+	});
+}
+
+const PIXEL = () => raster(1, 1, [10, 20, 30, 255]);
+
+describe('encodeTiff with EXIF', () => {
+	it('reads back through this package own EXIF reader', async () => {
+		const out = await encodeTiff(PIXEL(), { exif: cameraExif() });
+		const summary = readExif(out);
+
+		expect(summary?.cameraMake).toBe('Canon');
+		expect(summary?.cameraModel).toBe('Canon EOS 5D');
+		expect(summary?.software).toBe('Digital Photo Professional');
+		expect(summary?.capturedAt).toBe('2019:07:04 11:22:33');
+		expect(summary?.hasLocation).toBe(true);
+		// The payload said 6. Nothing carried it, so a reader is told the picture
+		// is upright, which it is.
+		expect(summary?.orientation).toBe(1);
+		// And the picture itself still reads.
+		expect(pixelsOf(await decodeTiff(out))).toEqual([10, 20, 30, 255]);
+	});
+
+	it('leaves the structure of the picture the payload came off behind', async () => {
+		const out = await encodeTiff(PIXEL(), { exif: cameraExif() });
+		const ifd0 = ifd0Of(out);
+
+		// 256 and 259 are in the payload with the source's values. Carrying
+		// either would either describe this file wrongly or put two entries with
+		// the same tag in one directory.
+		expect(tagged(ifd0, 256)?.count).toBe(1);
+		expect(longAt(out, tagged(ifd0, 256)?.valueAt as number)).toBe(1);
+		expect(tagged(ifd0, 274)).toBeUndefined();
+		const tags = ifd0.map((entry) => entry.tag);
+		expect(new Set(tags).size).toBe(tags.length);
+		expect(tags).toEqual([...tags].sort((a, b) => a - b));
+	});
+
+	it('places both sub-directories where TIFF 6.0 says a directory may go', async () => {
+		const out = await encodeTiff(PIXEL(), { exif: cameraExif() });
+
+		for (const tag of [34665, 34853]) {
+			const pointer = tagged(ifd0Of(out), tag) as OutEntry;
+			// A pointer is one LONG, which is what makes it four bytes and puts it
+			// inside the entry.
+			expect(pointer.type).toBe(LONG);
+			expect(pointer.count).toBe(1);
+
+			const at = longAt(out, pointer.valueAt);
+			expect(at % 2).toBe(0);
+			expect(at).toBeGreaterThan(8);
+			expect(at).toBeLessThan(out.length);
+
+			const sub = readIfd(out, at);
+			const tags = sub.map((entry) => entry.tag);
+			expect(tags).toEqual([...tags].sort((a, b) => a - b));
+			expect(new Set(tags).size).toBe(tags.length);
+			// A sub-directory has no successor, so the chain ends inside it.
+			expect(longAt(out, at + 2 + sub.length * 12)).toBe(0);
+
+			for (const entry of sub) {
+				const size = (TYPE_BYTES[entry.type] as number) * entry.count;
+				if (size <= 4) continue;
+				expect(entry.valueAt % 2).toBe(0);
+				expect(entry.valueAt + size).toBeLessThanOrEqual(out.length);
+			}
+		}
+		expect(out.length % 2).toBe(0);
+	});
+
+	it('rebases the values inside a sub-directory rather than pointing at a copy', async () => {
+		const out = await encodeTiff(PIXEL(), { exif: cameraExif() });
+		const sub = subIfdOf(out, 34665) as OutEntry[];
+
+		// 1/200 as two longs, read out of this file at the offset this file's own
+		// entry names. A spliced payload would resolve this offset somewhere in
+		// the strip data instead.
+		const exposure = tagged(sub, 0x829a) as OutEntry;
+		expect(exposure.type).toBe(RATIONAL);
+		expect([longAt(out, exposure.valueAt), longAt(out, exposure.valueAt + 4)]).toEqual([1, 200]);
+		// A short fits in the entry, so it is not rebased at all.
+		const iso = tagged(sub, 0x8827) as OutEntry;
+		expect(iso.valueAt).toBe(iso.entryAt + 8);
+		expect(
+			new DataView(out.buffer, out.byteOffset, out.byteLength).getUint16(iso.valueAt, true),
+		).toBe(400);
+		expect(textOf(out, tagged(sub, 0x9003) as OutEntry)).toBe('2019:07:04 11:22:33');
+
+		const gps = subIfdOf(out, 34853) as OutEntry[];
+		const latitude = tagged(gps, 2) as OutEntry;
+		expect(latitude.count).toBe(3);
+		expect(longAt(out, latitude.valueAt)).toBe(33);
+		expect(longAt(out, latitude.valueAt + 8)).toBe(52);
+	});
+
+	it('swaps the numbers of a big endian payload rather than copying its bytes', async () => {
+		// The payload is MM and this encoder writes II. A rational copied byte for
+		// byte comes back as 16777216/3355443200, which is a number rather than
+		// visible damage, and a shutter speed of 1/200 reading as its own reverse
+		// is exactly the sort of thing nobody notices for a year.
+		const out = await encodeTiff(PIXEL(), { exif: cameraExif(false) });
+		const sub = subIfdOf(out, 34665) as OutEntry[];
+		const exposure = tagged(sub, 0x829a) as OutEntry;
+
+		expect([longAt(out, exposure.valueAt), longAt(out, exposure.valueAt + 4)]).toEqual([1, 200]);
+		expect(
+			new DataView(out.buffer, out.byteOffset, out.byteLength).getUint16(
+				(tagged(sub, 0x8827) as OutEntry).valueAt,
+				true,
+			),
+		).toBe(400);
+		expect(readExif(out)?.cameraMake).toBe('Canon');
+		expect(textOf(out, tagged(sub, 0x9003) as OutEntry)).toBe('2019:07:04 11:22:33');
+	});
+
+	it('drops the maker note by name and keeps everything beside it', async () => {
+		const payload = buildExif({
+			ifd0: [{ tag: 271, type: ASCII, values: ascii('NIKON CORPORATION\0') }],
+			exif: [
+				{ tag: 0x9003, type: ASCII, values: ascii('2020:01:01 00:00:00\0') },
+				// A real one holds offsets counted from the original file's header,
+				// which nothing outside the camera maker can rebase.
+				{ tag: 37500, type: UNDEFINED, values: Array.from({ length: 64 }, (_, i) => i) },
+				{ tag: 40965, type: LONG, values: [8] },
+			],
+		});
+		const out = await encodeTiff(PIXEL(), { exif: payload });
+		const sub = subIfdOf(out, 34665) as OutEntry[];
+
+		expect(sub.map((entry) => entry.tag)).toEqual([0x9003]);
+		expect(readExif(out)?.cameraMake).toBe('NIKON CORPORATION');
+	});
+
+	it('writes no pointer for a sub-directory whose every entry was dropped', async () => {
+		const payload = buildExif({
+			ifd0: [{ tag: 271, type: ASCII, values: ascii('Sony\0') }],
+			exif: [{ tag: 37500, type: UNDEFINED, values: [1, 2, 3, 4, 5, 6, 7, 8] }],
+		});
+		const out = await encodeTiff(PIXEL(), { exif: payload });
+
+		expect(tagged(ifd0Of(out), 34665)).toBeUndefined();
+		expect(readExif(out)?.cameraMake).toBe('Sony');
+	});
+
+	it('writes an ICC profile and EXIF into the same directory', async () => {
+		const profile = Uint8Array.from({ length: 301 }, (_, i) => (i * 7) & 0xff);
+		const out = await encodeTiff(PIXEL(), { exif: cameraExif(), iccProfile: profile });
+
+		expect(Array.from(readTiffIccProfile(out) as Uint8Array)).toEqual(Array.from(profile));
+		expect(readExif(out)?.cameraMake).toBe('Canon');
+		expect(out.length % 2).toBe(0);
+	});
+
+	it('keeps a multi-strip picture readable with metadata after it', async () => {
+		const image = noise(64, 600, false);
+		const out = await encodeTiff(image, { exif: cameraExif() });
+
+		expect(pixelsOf(await decodeTiff(out))).toEqual(pixelsOf(image));
+		expect(readExif(out)?.cameraModel).toBe('Canon EOS 5D');
+	});
+
+	it('writes nothing for a payload that is empty or is not a TIFF', async () => {
+		for (const exif of [
+			new Uint8Array(0),
+			bytes(1, 2, 3),
+			bytes(1, 2, 3, 4, 5, 6, 7, 8),
+			// The right byte order mark and the wrong version, which is what a
+			// BigTIFF block would look like here.
+			bytes(0x49, 0x49, 43, 0, 8, 0, 0, 0),
+		]) {
+			const out = await encodeTiff(PIXEL(), { exif });
+			expect(tagged(ifd0Of(out), 34665)).toBeUndefined();
+			expect(tagged(ifd0Of(out), 271)).toBeUndefined();
+		}
+	});
+
+	it('writes nothing for a payload whose first directory is not where it says', async () => {
+		const payload = buildExif({ ifd0: [{ tag: 271, type: ASCII, values: ascii('Canon\0') }] });
+
+		for (const offset of [0, 4, payload.length - 1]) {
+			const out = await encodeTiff(PIXEL(), { exif: patch32(payload, 4, offset) });
+			expect(tagged(ifd0Of(out), 271)).toBeUndefined();
+		}
+	});
+
+	it('stops at the end of a directory that claims more entries than it has', async () => {
+		const payload = buildExif({ ifd0: [{ tag: 271, type: ASCII, values: ascii('Canon\0') }] });
+		// Forty entries in a directory that holds one. Reading past the end would
+		// throw out of the encoder rather than produce a file.
+		const out = await encodeTiff(PIXEL(), { exif: patch16(payload, 8, 40) });
+
+		expect(textOf(out, tagged(ifd0Of(out), 271) as OutEntry)).toBe('Canon');
+	});
+
+	it.each([
+		['an offset before the header', 8, 4],
+		['an offset past the end', 8, 0xfffe],
+		['a count nothing that size could hold', 4, 0xffffff],
+	])('skips a payload entry with %s', async (_name, field, value) => {
+		const payload = buildExif({
+			ifd0: [{ tag: 271, type: ASCII, values: ascii('Nikon Corporation\0') }],
+		});
+		const entry = tagged(readIfd(payload, 8), 271) as OutEntry;
+		const broken = patch32(payload, entry.entryAt + field, value);
+
+		expect(tagged(ifd0Of(await encodeTiff(PIXEL(), { exif: broken })), 271)).toBeUndefined();
+	});
+
+	it('skips a payload entry whose type TIFF does not define', async () => {
+		const payload = buildExif({ ifd0: [{ tag: 271, type: 99, values: [1, 2, 3] }] });
+
+		expect(tagged(ifd0Of(await encodeTiff(PIXEL(), { exif: payload })), 271)).toBeUndefined();
+	});
+
+	it.each([
+		['is not a long', { tag: 34665, type: SHORT, values: [8] }],
+		['names more than one directory', { tag: 34665, type: LONG, values: [8, 8] }],
+		['points outside the payload', { tag: 34665, type: LONG, values: [0xfffe] }],
+	])('does not follow an EXIF pointer that %s', async (_name, pointer) => {
+		const payload = buildExif({
+			ifd0: [{ tag: 271, type: ASCII, values: ascii('Fujifilm\0') }, pointer],
+		});
+		const out = await encodeTiff(PIXEL(), { exif: payload });
+
+		expect(tagged(ifd0Of(out), 34665)).toBeUndefined();
+		expect(textOf(out, tagged(ifd0Of(out), 271) as OutEntry)).toBe('Fujifilm');
+	});
+
+	it('carries a tag the payload repeats exactly once', async () => {
+		const payload = buildExif({
+			ifd0: [
+				{ tag: 271, type: ASCII, values: ascii('First\0') },
+				{ tag: 271, type: ASCII, values: ascii('Second\0') },
+			],
+		});
+		const out = await encodeTiff(PIXEL(), { exif: payload });
+		const makes = ifd0Of(out).filter((entry) => entry.tag === 271);
+
+		expect(makes.length).toBe(1);
+		expect(textOf(out, makes[0] as OutEntry)).toBe('First');
+	});
+
+	it('stops copying when the payload describes more bytes than it holds', async () => {
+		// Two entries pointing at one value, which nothing forbids and which lets
+		// a payload claim far more metadata than its own length. The copy is
+		// bounded by the size of the original, so the second one is left behind.
+		const text = ascii('x'.repeat(119) + '\0');
+		const payload = buildExif({
+			ifd0: [
+				{ tag: 270, type: ASCII, values: text },
+				{ tag: 305, type: ASCII, values: text },
+			],
+		});
+		const first = tagged(readIfd(payload, 8), 270) as OutEntry;
+		const second = tagged(readIfd(payload, 8), 305) as OutEntry;
+		const shared = patch32(payload, second.entryAt + 8, first.valueAt);
+		const out = await encodeTiff(PIXEL(), { exif: shared.slice(0, first.valueAt + 120) });
+
+		expect(tagged(ifd0Of(out), 270)).toBeDefined();
+		expect(tagged(ifd0Of(out), 305)).toBeUndefined();
+	});
+
+	it('stops copying part way through a sub-directory for the same reason', async () => {
+		const text = ascii('x'.repeat(119) + '\0');
+		const payload = buildExif({
+			ifd0: [],
+			exif: [
+				{ tag: 0x9003, type: ASCII, values: text },
+				{ tag: 0x9286, type: UNDEFINED, values: text },
+			],
+		});
+		const pointer = tagged(readIfd(payload, 8), 34665) as OutEntry;
+		const sub = readIfd(payload, longAt(payload, pointer.valueAt));
+		const first = tagged(sub, 0x9003) as OutEntry;
+		const second = tagged(sub, 0x9286) as OutEntry;
+		const shared = patch32(payload, second.entryAt + 8, first.valueAt);
+		const out = await encodeTiff(PIXEL(), { exif: shared.slice(0, first.valueAt + 120) });
+
+		expect((subIfdOf(out, 34665) as OutEntry[]).map((entry) => entry.tag)).toEqual([0x9003]);
 	});
 });

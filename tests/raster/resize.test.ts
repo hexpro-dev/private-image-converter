@@ -524,6 +524,17 @@ describe('resampling light', () => {
 		expect(out.data[3]).toBeCloseTo(0.5, 5);
 	});
 
+	it('writes a wholly transparent output pixel as zero rather than dividing by it', () => {
+		// Every source pixel here is fully transparent, so the recovered alpha
+		// is zero and the unpremultiply has nothing to divide by. Without the
+		// guard this is 0/0 in four channels, and a NaN in a float image is not
+		// a visible failure: it survives the encode and lands in the file.
+		const image = lightOf(4, 1, () => [7, 7, 7, 0]);
+		const out = resizeFloat(image, 2, 1);
+		expect([...out.data]).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+		expect([...out.data].every((value) => Number.isFinite(value))).toBe(true);
+	});
+
 	it('hands back the same image when nothing changes size', () => {
 		const image = lightOf(2, 2, () => [1, 1, 1, 1]);
 		expect(resizeFloat(image, 2, 2)).toBe(image);

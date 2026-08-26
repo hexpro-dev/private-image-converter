@@ -3,6 +3,12 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
 	test: {
 		include: ['tests/**/*.test.ts'],
+		// The unhandled-rejection guard, installed for every file rather than
+		// only for the fuzz suite that needed it first. A rejection nobody
+		// awaited is the failure that took a tab down on roughly one malformed
+		// input in twenty, and it is invisible to an ordinary assertion: the
+		// test passes and the process is poisoned.
+		setupFiles: ['tests/fuzz/setup.ts'],
 		coverage: {
 			provider: 'v8',
 			reporter: ['text', 'lcov'],

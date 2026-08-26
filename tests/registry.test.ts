@@ -187,6 +187,7 @@ const SHIPPED_ENCODERS = [
 	['hdr-pure', 10, 'pure', false],
 	['exr-pure', 10, 'pure', false],
 	['avif-webcodecs', 10, 'webcodecs', false],
+	['webp-animated', 5, 'canvas', true],
 	['pcx-pure', 10, 'pure', false],
 	['ras-pure', 10, 'pure', false],
 	['xbm-pure', 10, 'pure', false],
@@ -210,6 +211,11 @@ const ENCODE_MECHANISM_PATHS = {
 	native: 'canvas',
 	webcodecs: 'webcodecs',
 	pure: 'pure',
+	// The animated WebP encoder writes its container here and gets each frame's
+	// bytes from the canvas, so the canvas is what it depends on and what it
+	// has to report. The suffix names what it adds rather than what it runs on,
+	// which is why it needs its own row instead of falling out of the pattern.
+	animated: 'canvas',
 } as const;
 
 const MECHANISM_PATHS = {

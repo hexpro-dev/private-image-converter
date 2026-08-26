@@ -25,6 +25,7 @@ export const avifEncoder: Encoder = {
 	path: 'webcodecs',
 	priority: 10,
 	gainMaps: true,
+	exif: true,
 	async available(capabilities) {
 		return capabilities.av1VideoEncoder;
 	},

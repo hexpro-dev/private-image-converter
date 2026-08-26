@@ -28,6 +28,21 @@
  * primary item rather than the `tmap` is the part worth saying out loud: a
  * reader that has never heard of gain maps then shows the ordinary photograph
  * instead of failing on a derived item it cannot build.
+ *
+ * EXIF is an item as well, where the caller has any: an `infe` of type `Exif`,
+ * its bytes in `mdat` beside the pictures, and a `cdsc` reference tying it to
+ * the picture. Two things about it are easy to write backwards, and neither
+ * fails loudly. The reference runs from the metadata item to the image,
+ * because `cdsc` reads as "describes" and the EXIF is what does the
+ * describing; the other way round, the file still parses and every reader
+ * reports no EXIF at all. And the payload is not the TIFF block on its own:
+ * ISO/IEC 23008-12 puts a four byte offset to the TIFF header in front of it,
+ * zero here because the header is what follows. Being out by four in either
+ * direction is quiet. Omit the field and the reader in `src/heif/` takes the
+ * byte order mark and the magic number for it, lands well past the end of the
+ * item, and reports no EXIF; write it twice and the reader hands back a TIFF
+ * whose first four bytes are zeroes, which is a photograph's metadata read at
+ * the wrong offset by everything downstream.
  */
 
 import { EncodeFailedError } from '../../errors.js';
@@ -231,6 +246,16 @@ export interface AvifMuxSpec {
 	readonly gainMap?: AvifGainMapSpec;
 	readonly iccProfile?: Uint8Array;
 	/**
+	 * EXIF from the TIFF header onwards, carried through untouched.
+	 *
+	 * Never parsed here. Whoever handed it over is responsible for what is in
+	 * it, including the orientation tag, which has to read as upright by the
+	 * time it arrives: the pixels in the AV1 frame beside it are already the
+	 * right way up, so a rotation left in the EXIF turns the photograph a
+	 * second time in whatever opens it next.
+	 */
+	readonly exif?: Uint8Array;
+	/**
 	 * Whether the coded samples use all 256 codes.
 	 *
 	 * Defaults to true, which is what a writer that controls its own encoder
@@ -298,7 +323,14 @@ function buildMeta(
 	);
 	const iloc = fullBox('iloc', 0, 0, u8(0x44), u8(0x00), u16(items.length), ...locations);
 
-	const ipmaEntries = items.map((item) =>
+	// An item that claims nothing gets no entry at all, rather than an entry
+	// with a count of zero. Both spellings parse, and the second is three bytes
+	// saying that a metadata item is a metadata item, but the reason to prefer
+	// the first is that it is what libavif and Apple both write: an `ipma` that
+	// names an item and then associates nothing with it is a shape no real file
+	// has, and the first reader to meet one is where it will be found out.
+	const described = items.filter((item) => item.associations.length > 0);
+	const ipmaEntries = described.map((item) =>
 		concat([
 			u16(item.id),
 			u8(item.associations.length),
@@ -310,7 +342,7 @@ function buildMeta(
 			...item.associations.map((a) => u8((a.essential ? 0x80 : 0x00) | a.index)),
 		]),
 	);
-	const ipma = fullBox('ipma', 0, 0, u32(items.length), ...ipmaEntries);
+	const ipma = fullBox('ipma', 0, 0, u32(described.length), ...ipmaEntries);
 	const iprp = box('iprp', properties.container(), ipma);
 
 	const children = [hdlr, pitm, iloc, iinf, iprp];
@@ -451,6 +483,32 @@ export function muxAvif(spec: AvifMuxSpec): Uint8Array {
 		// Base first, gain map second. The order is the meaning: swapping them
 		// asks a reader to brighten the map by the photograph.
 		references.push({ type: 'dimg', from: tmapId, to: [colourId, gainMapId] });
+	}
+
+	// Last of the items, and last in `mdat`, both on purpose. Every id above is
+	// handed out in the order the pictures are planned and then named by number
+	// in an `auxl` or a `dimg`, so an item inserted ahead of them renumbers a
+	// reference table that nothing here would notice had gone wrong. An empty
+	// payload counts as nothing to write: an `Exif` item holding nothing but the
+	// offset field below is a claim of metadata with none behind it, and the
+	// reader in `src/heif/` reports it as absent anyway.
+	if (spec.exif && spec.exif.length > 0) {
+		const exifId = nextId;
+		nextId += 1;
+		// The four byte field is the distance from the end of itself to the
+		// TIFF header, which is zero when the header follows immediately. The
+		// reader honours whatever is written here rather than assuming zero, so
+		// a file from elsewhere with padding in front of its TIFF still opens.
+		const payload = concat([u32(0), spec.exif]);
+		items.push({
+			id: exifId,
+			type: 'Exif',
+			hidden: false,
+			offset: place(payload),
+			length: payload.length,
+			associations: [],
+		});
+		references.push({ type: 'cdsc', from: exifId, to: [colourId] });
 	}
 
 	// `tmap` is how a file announces that it holds a gain map, and it goes in

@@ -255,6 +255,60 @@ function readHeader(bytes: Uint8Array, view: DataView): PsdHeader {
 	return { large, channels, width, height, depth, mode, colourChannels, rowBytes };
 }
 
+/**
+ * Read four big endian bytes without a DataView and without a sign.
+ *
+ * Shifting the top byte left by 24 makes anything from 0x80 up negative, and a
+ * negative dimension multiplied by the other one is a product that slips under
+ * every ceiling it is compared against. Multiplying keeps the value unsigned.
+ */
+function readU32(bytes: Uint8Array, at: number): number {
+	return (
+		(bytes[at] as number) * 0x1000000 +
+		(((bytes[at + 1] as number) << 16) |
+			((bytes[at + 2] as number) << 8) |
+			(bytes[at + 3] as number))
+	);
+}
+
+/**
+ * The size the 26 byte header declares, read on its own and before any decode.
+ *
+ * A Photoshop composite is compressed, and both of the compressions this
+ * reader implements put a decompressor between the header and the pixels. The
+ * ratio checks further down refuse a claim the remaining bytes could not
+ * possibly produce, but ZIP's best case is 1032 to 1, so a file of a few
+ * hundred kilobytes can honestly describe a picture whose raster is well over
+ * a gigabyte, and that raster is allocated on the strength of the header. This
+ * is what lets a caller with a budget say no first, for the cost of reading
+ * eight bytes.
+ *
+ * Height is stored before width, which is the trap the whole file is built
+ * around and which is just as easy to get wrong here as in `readHeader`.
+ * Reading them the usual way round produces a plausible transposed answer
+ * rather than an error, so a caller would refuse the wrong files and let the
+ * wrong files through, in both directions at once.
+ *
+ * The version is checked so that a file which merely starts with the four
+ * bytes "8BPS" does not get a size reported for it. Nothing else is
+ * validated: this is not the place where a Photoshop file is judged, and
+ * `readHeader` has a sentence for every way one can be wrong.
+ */
+export function measurePsd(
+	bytes: Uint8Array,
+): { readonly width: number; readonly height: number } | undefined {
+	if (bytes.length < HEADER_BYTES) return undefined;
+	if (bytes[0] !== 0x38 || bytes[1] !== 0x42 || bytes[2] !== 0x50 || bytes[3] !== 0x53) {
+		return undefined;
+	}
+	const version = ((bytes[4] as number) << 8) | (bytes[5] as number);
+	if (version !== 1 && version !== 2) return undefined;
+	const height = readU32(bytes, 14);
+	const width = readU32(bytes, 18);
+	if (width < 1 || height < 1) return undefined;
+	return { width, height };
+}
+
 interface Sections {
 	/**
 	 * The colour table, present only for an indexed image.

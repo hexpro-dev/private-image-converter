@@ -90,11 +90,24 @@ const ALPHA_MODE_PREMULTIPLIED = 2;
 /**
  * The largest image this decoder will allocate for.
  *
- * The same ceiling the QOI, TGA and PNM readers use. The converter applies its
- * own `maxPixels` on top of this; this one exists so the decoder is safe to
- * call on its own.
+ * The converter applies its own `maxPixels` on top of this; this one exists so
+ * the decoder is safe to call on its own. The number is the converter's own
+ * default budget rather than the four hundred million it used to be: two
+ * ceilings five times apart are not two defences, and nothing a caller would
+ * accept ever lived in the range between them.
+ *
+ * Worth saying what this is not, because the same problem in PNG and PCX is
+ * answered with a `measure` hook and this file deliberately has none. Nothing
+ * sits between a DDS header and its surface: every layout here costs a fixed
+ * number of bytes a pixel, and the cheapest of them is BC1 at half a byte, so
+ * the `requireBytes` further down proves the file really is that long before
+ * the raster is allocated. A DDS cannot declare an image its own length does
+ * not back up, which is the entire reason a header measurement is worth having
+ * in the formats that can. One here would refuse the same files this already
+ * refuses, one step earlier, and would be another place to get the block size
+ * arithmetic wrong.
  */
-const MAX_PIXELS = 400_000_000;
+const MAX_PIXELS = 80_000_000;
 
 function fail(detail: string): never {
 	throw new DecodeFailedError('dds', DECODER_ID, detail);
