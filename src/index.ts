@@ -125,6 +125,27 @@ export {
 } from './errors.js';
 export type { ConverterErrorCode, HeifStage } from './errors.js';
 
+/**
+ * The metadata readers and the one writer.
+ *
+ * Exported because an integrator doing its own conversion still has to answer
+ * "what was in this file" and "how do I put it back", and both are easy to get
+ * subtly wrong: EXIF written back without neutralising its orientation tag
+ * turns every portrait photograph sideways, and a second ICC profile spliced
+ * into a JPEG that already had one produces a file whose colour depends on the
+ * reader.
+ */
+export {
+	findExif,
+	orientationFromExif,
+	readExif,
+	withUprightOrientation,
+} from './metadata/exif.js';
+export type { ExifSummary } from './metadata/exif.js';
+export { declaresWideGamut, findIccProfile, iccIsWideGamut } from './metadata/icc.js';
+export { spliceJpegMetadata } from './metadata/jpegSegments.js';
+export type { JpegMetadata } from './metadata/jpegSegments.js';
+
 export { attempt, err, ok, unwrap } from './result.js';
 export type { Result } from './result.js';
 

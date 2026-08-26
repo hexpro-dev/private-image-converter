@@ -14,6 +14,7 @@
 
 import { EncodeFailedError } from '../../errors.js';
 import type { EncodeOptions, FormatId, RasterImage } from '../../types.js';
+import { spliceJpegMetadata } from '../../metadata/jpegSegments.js';
 import { rasterToCanvas, toBlob } from '../../raster/canvas.js';
 import { flatten } from '../../raster/image.js';
 
@@ -72,6 +73,19 @@ export async function encodeNative(
 			'native',
 			'this browser does not support that output format and quietly returned a different one instead',
 		);
+	}
+
+	// A canvas encodes pixels and nothing else, so everything the decoder found
+	// is gone by this line unless it is put back. Only JPEG for now: it is the
+	// format people convert to in order to send a photograph somewhere, and it
+	// is the one whose segment structure makes the insertion safe. WebP would
+	// need a RIFF chunk and PNG never reaches here, because this package's own
+	// encoder outranks the canvas for it.
+	if (format === 'jpeg') {
+		return spliceJpegMetadata(bytes, {
+			exif: options.exif,
+			iccProfile: options.iccProfile,
+		});
 	}
 	return bytes;
 }

@@ -150,10 +150,7 @@ export async function decodeAnimatedNative(
 				frames.length > 1
 					? {
 							frames,
-							// `repetitionCount` is Infinity for a file that loops
-							// forever, and our contract spells that 0 because
-							// every container on disk does.
-							loopCount: Number.isFinite(track.repetitionCount) ? track.repetitionCount : 0,
+							loopCount: loopCountFrom(track.repetitionCount),
 						}
 					: undefined,
 			truncated: total > wanted,
@@ -161,6 +158,27 @@ export async function decodeAnimatedNative(
 	} finally {
 		decoder.close();
 	}
+}
+
+/**
+ * WebCodecs counts repeats. This package counts plays. They disagree at zero.
+ *
+ * `ImageTrack.repetitionCount` is the number of times the animation repeats
+ * *after* the first pass, with `Infinity` for a file that loops forever, so a
+ * GIF carrying no `NETSCAPE` extension reports 0 and means "play once".
+ * `Animation.loopCount` here is the value the container stores, where 0 means
+ * forever, which is what every format on disk means by it.
+ *
+ * Mapping 0 straight through therefore said "forever" about the one file that
+ * most explicitly did not ask for it, and a play-once GIF looped without end in
+ * every browser with an `ImageDecoder`. Anything above zero passes through
+ * unchanged, which is what keeps a round trip stable: `ImageDecoder` derives
+ * that number from the same `NETSCAPE` field the pure reader hands back, and
+ * this package deliberately does not try to reinterpret it.
+ */
+export function loopCountFrom(repetitionCount: number): number {
+	if (!Number.isFinite(repetitionCount)) return 0;
+	return repetitionCount <= 0 ? 1 : repetitionCount;
 }
 
 function normaliseDelay(duration: number | null): number {

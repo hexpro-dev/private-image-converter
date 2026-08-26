@@ -1,0 +1,23 @@
+# Keeps the action pins moving.
+#
+# Every `uses:` in .github/workflows names a commit sha, which stops a tag
+# being moved under us but also freezes the action at whatever it was on the
+# day it was pinned. Nobody rereads a workflow file for fun, so this opens the
+# pull request instead. Dependabot rewrites the sha and the version in the
+# trailing comment together.
+#
+# Only github-actions is watched here. The npm devDependencies are updated by
+# hand, and the package has no runtime dependencies to update.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # One pull request for the lot. These move together and reviewing them
+    # separately is six times the reading for the same decision.
+    groups:
+      actions:
+        patterns:
+          - '*'
+    open-pull-requests-limit: 5

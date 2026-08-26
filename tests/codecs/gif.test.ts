@@ -4,6 +4,7 @@ import { LsbBitWriter } from '../../src/bits.js';
 import { decodeGif, decodeGifAnimation } from '../../src/codecs/gif/decode.js';
 import { encodeGif } from '../../src/codecs/gif/encode.js';
 import { lzwDecode, lzwEncode } from '../../src/codecs/gif/lzw.js';
+import { loopCountFrom } from '../../src/codecs/native/animated.js';
 import { DecodeFailedError, EncodeFailedError } from '../../src/errors.js';
 import { createRaster } from '../../src/raster/image.js';
 import type { AnimationFrame, ColourSpace, RasterImage } from '../../src/types.js';
@@ -1660,5 +1661,42 @@ describe('decodeGif refusals', () => {
 		const file = buildGif({ width: 1, height: 1, palette: [RED, GREEN], frames });
 
 		expect(pixelsOf(decodeGif(file))).toEqual([255, 0, 0, 255]);
+	});
+});
+
+/* ── The two loop conventions ─────────────────────────────────────────── */
+
+describe('translating a repetition count into a loop count', () => {
+	it('spells forever as zero', () => {
+		// `Animation.loopCount` uses the container convention, where 0 means
+		// play without end, because that is what every format on disk means.
+		expect(loopCountFrom(Number.POSITIVE_INFINITY)).toBe(0);
+		expect(loopCountFrom(Number.NaN)).toBe(0);
+	});
+
+	it('turns a repetition count of zero into one play, not into forever', () => {
+		// The regression. WebCodecs counts repeats *after* the first pass, so a
+		// GIF carrying no NETSCAPE extension reports 0 and means "play once".
+		// Passing that through said "forever" about the one file that most
+		// explicitly did not ask for it, and every such GIF looped without end
+		// in any browser with an ImageDecoder while behaving correctly in
+		// Firefox, which has none.
+		expect(loopCountFrom(0)).toBe(1);
+	});
+
+	it('passes a real count through unchanged, so a round trip is stable', () => {
+		// ImageDecoder derives these from the same NETSCAPE field the pure
+		// reader hands back, and this package deliberately does not reinterpret
+		// that field, so the two rungs have to agree on it.
+		expect(loopCountFrom(1)).toBe(1);
+		expect(loopCountFrom(3)).toBe(3);
+		expect(loopCountFrom(65_535)).toBe(65_535);
+	});
+
+	it('treats a negative count as forever rather than as a negative play count', () => {
+		// Blink spells infinite as -1 internally and WebCodecs is specified to
+		// surface Infinity, but a value that escaped the mapping must not become
+		// a loop count no encoder can write.
+		expect(loopCountFrom(-1)).toBe(1);
 	});
 });

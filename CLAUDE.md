@@ -116,11 +116,61 @@ not 90. Also, every browser applies EXIF orientation while decoding, so
 applying it again after a native decode double-rotates. Both mistakes only show
 on photographs taken sideways, which is most of them.
 
+**EXIF goes out through `withUprightOrientation`, never straight.** The decoder
+contract at the top of this section says the pixels arrive already the right
+way up, so the orientation tag that came off the file describes a rotation
+which has already happened. Copy the block across unchanged and every
+reader honouring that tag rotates the photograph a second time: every portrait
+photograph comes out sideways in most viewers and correct in the few that
+ignore EXIF, which is the combination nobody catches. `convert` rewrites the
+tag to 1 before handing the block to an encoder. It is a two byte overwrite in
+place rather than a rebuild, because an EXIF block holds offsets into itself
+from directories this reader deliberately does not parse.
+
 **A canvas asked for a format it cannot write returns a PNG.** It does not
 throw and it does not return null. Safari has never written WebP and does
 exactly this, so somebody clicks convert, gets `photo.webp`, and it is a PNG.
 Every canvas encode here sniffs the bytes that came back. Do not "simplify"
 that away.
+
+**A canvas cannot be asked with a constant, and cannot be asked once.**
+`MAX_CANVAS_AREA` is iOS Safari's 16,777,216 and it is now only the floor below
+which no browser is worth asking. Applied everywhere, as the gate on both
+ladders, it refused 6000 by 4000 JPEGs on desktop machines with sixteen times
+the headroom, and it refused the 24 megapixel photographs recent iPhones shoot
+on the phone that shot them. A one-off probe at startup is no better: the
+iOS limit is a budget measured across every live surface rather than a fixed
+area, so the answer moves with whatever else the tab is holding. `openCanvas`
+and `canvasHolds` therefore allocate the real surface, paint one pixel and read
+it back. `openCanvas` then hands that surface to the caller and `canvasHolds`
+releases it, because the budget counts live canvases and waiting for the
+collector would charge the probe against the allocation it was probing for. The
+readback is the load bearing part of both. iOS does not throw when it runs out;
+it hands back a canvas of exactly the requested size whose pixels are all zero
+and accepts every drawing call onto it in silence, so without the readback the
+failure is a file full of transparent black rather than an error.
+
+**`SurfaceTooLargeError` is a decline. `ImageTooLargeError` is a refusal.**
+Both ladders in `convert` walk past the first and stop on the second, and the
+difference is why an iPhone photograph converts at all. Safari's own HEIC
+decoder is the top rung and it has to draw the `ImageBitmap` onto a canvas to
+read pixels back; the container reader on the rung below never needs one. While
+the decline shared a class with the hard ceiling, the ladder stopped on it, the
+rung that would have worked was never asked, and the tool refused the exact
+file it is named after. Merging the two classes puts that back, and so does
+catching `SurfaceTooLargeError` alongside `ImageTooLargeError` in either loop.
+Its message says "something else may be able to read it" for the same reason,
+since the error only reaches a caller when nothing else could run.
+
+**`Decoder.measure` is for the formats with a decompressor in the middle.**
+`maxPixels` checked against the image that came back is not a defence: a four
+kilobyte PNG whose IHDR claims 20000 by 15000 has already been handed a
+gigabyte-shaped inflate budget by the time anything measures it. PNG, GIF, PSD
+and PCX read their headers first through `measure`, before the decompressor is
+given a size to work to. The uncompressed readers deliberately do not have one,
+and adding it to them is work for nothing: a file cannot declare an image its
+own length will not back up, and each of those readers already refuses a header
+its own byte count contradicts.
 
 **Detect the colour space per image, never in a batch.** An iPhone photograph
 decodes to Display P3. Writing those numbers untagged makes the picture flat,
@@ -128,6 +178,20 @@ and running the same conversion over something already sRGB oversaturates it by
 about as much. On a wide gamut display both mistakes look plausible, so the
 check is measurement rather than eye. The source profile is carried through to
 the output where the format can hold one.
+
+**`iccIsWideGamut` exists twice, and that is deliberate.** One copy is in
+`src/metadata/icc.ts`, one in `src/heif/image.ts`, because `eslint.config.js`
+forbids `src/heif/**` from importing `src/metadata/**` so the container reader
+stays liftable into a package of its own. Nine numbers duplicated is cheaper
+than taking that fence down. The two must answer identically, and
+`tests/metadata/icc.test.ts` imports both and compares them across a table of
+profiles, so neither is edited without the other. Both test all three
+colourants rather than red alone: any threshold on red that admits Display P3
+also admits Adobe RGB, ProPhoto and Rec.2020, whose reds sit further out again,
+and those files were then given a Display P3 readback and had their own profile
+written verbatim beside the new numbers. P3 pixels tagged Adobe RGB renders
+wrong in every colour managed viewer and right in everything that ignores
+profiles, which is what got it past a review.
 
 **`src/heif/**` imports nothing outside itself** except the shared errors,
 result and types modules and `src/raster/`. It is a reader for a published ISO
@@ -186,10 +250,34 @@ about what restoring to background means. The disagreement is settled once, in
 each reader, and `Animation.frames` carries composited full frames. An encoder
 that received patches would have to reimplement both rule sets.
 
+**WebCodecs and this package disagree about what zero loops means.**
+`ImageTrack.repetitionCount` counts repeats: `0` is a file that plays once and
+`Infinity` is one that plays forever. `Animation.loopCount` counts plays and
+spells forever as `0`, because every container on disk does, which is why the
+pure GIF reader returns 1 for a file with no `NETSCAPE` extension in it. The
+two agree on 5 and mean opposite things at 0, and `loopCountFrom` in
+`src/codecs/native/animated.ts` is the single place the translation happens.
+Copying the number straight across is what the code used to do, and a play-once
+GIF looped forever in Chrome while the pure reader beside it, which runs
+wherever `ImageDecoder` is missing, returned 1 for the same bytes. Nothing
+threw and every frame was correct, which is why it survived. `loopCountFrom` is
+exported purely so the translation can be tested; the rung around it needs a
+browser and is excluded from coverage, so those tests are the only thing
+holding it.
+
 **`CompressionStream` is the zlib.** It is what makes a real PNG encoder
 possible with no dependency. It offers no level control, so the output is a few
 percent larger than zopfli would manage and still smaller than the canvas
 manages, because the filters are chosen adaptively. That trade is deliberate.
+
+**A `write()` that has resolved has not read your buffer yet.** Node's
+compression stream queues the chunk and reads it when it gets round to it, so a
+caller that fills one scratch buffer, writes it, and refills it for the next
+batch hands the compressor whatever the buffer happened to hold at that moment.
+The PNG encoder allocates a fresh buffer per batch for exactly this reason, and
+"reuse the buffer, it is about to be overwritten anyway" is the tidy-up that
+corrupts the middle of a file with no error anywhere. It passes every round
+trip test whose image fits in a single batch, which is all of the small ones.
 
 **Tone mapping belongs to the encoder, never the decoder.** Radiance and
 OpenEXR readers hand back `FloatImage`, and `convert` reduces it only when the
@@ -198,6 +286,19 @@ that an EXR going to a Radiance file went through eight bits in the middle,
 losing the range both formats exist for, while `tone` had nothing to act on
 because the exposure had already been chosen inside the reader. A decoder that
 calls `toneMap` is reintroducing that bug.
+
+**`decodeTiffFloat` refuses on sight, and both refusals earn their place.**
+`convert` runs the light ladder ahead of the ordinary one for every decoder
+that offers a `decodeFloat`, so every TIFF of any kind passes through this
+function first. The sample format test therefore sits above `readPage` and
+`readSamples` rather than inside them: moved down, an ordinary integer TIFF is
+parsed twice on its way to being decoded once, on the commonest job this reader
+has. The second refusal is the one that looks removable. A float TIFF whose
+samples never pass 1 is a display picture that happens to be stored in floats,
+which is what a compositor writes as a final frame, and handing that on as
+light meters it against 0.18 and brings it back several stops too bright.
+Neither refusal reaches a user, because `convert` catches it and falls through
+to `decode`.
 
 **A gain map's parameter block is bytes, never fields.** `GainMap.metadata` is
 the ISO 21496-1 block exactly as the source stored it, and it is copied into
@@ -256,11 +357,16 @@ Deliberate refusals, which are decisions rather than gaps waiting to be filled:
   obligations that a free tool has no way to meet.
 - **Interlaced PNG**, overlay and identity derived HEIF images, and RLE
   compressed BMP. Each is refused by name with a message saying so.
-- **HDR gain maps.** The standard range base is decoded and the result says the
-  gain map was dropped. Silently returning the base of an HDR photograph is
-  correct behaviour and the wrong surprise.
-- **Writing PSD, DDS or EXR.** Reading one is a service to somebody who has the
+- **Rewriting a gain map's parameters.** The block is copied into AVIF, which
+  uses the same specification, and is not parsed on the way. Anywhere else the
+  standard range base is written and the report says the gain map was dropped,
+  which is a complete photograph rather than a broken one and still the wrong
+  surprise to leave unannounced.
+- **Writing PSD or DDS.** Reading one is a service to somebody who has the
   file. Writing one badly is a file they discover is wrong a month later.
+  Radiance and OpenEXR are written, because both are simple enough to write
+  correctly and because losing the range on the way out is the failure this
+  package exists to avoid.
 - **Developing a camera raw.** The embedded preview is extracted, which is the
   camera's own rendering. Demosaicing, white balancing and profiling a sensor
   is a different project and the module comment says so.

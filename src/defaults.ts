@@ -175,6 +175,17 @@ function nativeAnimatedDecoder(format: FormatId): Decoder {
 			return {
 				image: decoded.image,
 				animation: decoded.animation,
+				// This rung outranks the still-image one wherever `ImageDecoder`
+				// exists, so without this a WebP in Chrome reported no metadata
+				// at all while the same file in Safari reported all of it. The
+				// browser strips EXIF during the decode either way; it has to be
+				// read off the container here.
+				exif: findExif(bytes, format),
+				// Carried rather than dropped. The reader has a frame cap, and a
+				// five hundred frame GIF that came back with three hundred used
+				// to be reported as "all 300 frames kept", which is a sentence
+				// that is true about the result and false about the file.
+				truncatedFrames: decoded.truncated || undefined,
 				orientation: { rotation: 0, mirror: 'none', source: 'decoder' },
 			};
 		},
@@ -199,6 +210,10 @@ function nativeEncoder(format: FormatId): Encoder {
 		// be noticed later, because the day it starts working is the day it
 		// would silently start dropping gain maps.
 		priority: OURS_FIRST.has(format) ? 20 : 10,
+		// Only JPEG. `encodeNative` splices the segments back into a JPEG after
+		// the canvas has finished with it, and no other canvas format here has
+		// somewhere to put them.
+		exif: format === 'jpeg',
 		async available(capabilities) {
 			return capabilities.canvasEncode.has(info.mime);
 		},

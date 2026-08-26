@@ -44,6 +44,10 @@ result.report.metadata;
 //   cameraMake: 'Apple', cameraModel: 'iPhone 16 Pro Max', tagCount: 59 }
 ```
 
+Keeping it is a choice somebody makes rather than the default. The Metadata
+section below says which output formats can carry a block and what the report
+says when the one you chose cannot.
+
 That is a property of the code rather than a promise about intent. The check
 worth doing yourself is the simplest one. Turn your connection off and use it
 anyway.
@@ -99,6 +103,16 @@ decode HEVC on the platform, in this order:
 | Our container reader plus `VideoDecoder` | Chromium with HEVC decode hardware, which is most machines |
 | A decoder you register yourself          | Everywhere else                                            |
 
+The rungs are tried in order, and they also decline to each other. The
+browser's own decoder returns an `ImageBitmap`, and the only way to get pixels
+out of one is to draw it onto a canvas, which on a phone will not hold a 24
+megapixel photograph. So that rung declines with `codec/surface-too-large`, and
+the container reader below it assembles the same photograph into a plain array
+with no canvas anywhere. That is the difference between a recent iPhone
+photograph converting and being refused: while the decline shared an error
+class with the tool's own size ceiling it stopped the ladder instead, and the
+rung that would have worked was never asked.
+
 The first two need nothing installed. Chromium exposes HEVC only where the
 hardware exists, which covers roughly 97% of Macs, 86% of Windows machines and
 81% of Android devices, and Firefox does not expose it at all. On those,
@@ -128,13 +142,22 @@ A decoder must return an image that is already the right way up. That is the
 contract, and it exists because doing it the other way rotated every portrait
 photograph twice.
 
+Transparency is a second picture. A HEIC keeps its alpha as a separate
+monochrome image tied to the photograph by an `auxl` reference, so a sticker,
+an exported logo or a screenshot with rounded corners has two coded images in
+it. Both are decoded and the alpha is applied to the picture. A plane that is
+malformed, or a different size from the photograph, is let go of rather than
+allowed to refuse the file, and `report.droppedAlpha` says that happened.
+Safari's own decoder composites the alpha itself, so on that rung there is
+nothing left to do.
+
 ## What it supports
 
 |                       | Reads                                                      | Writes                                |
 | --------------------- | ---------------------------------------------------------- | ------------------------------------- |
 | Everyday              | PNG, JPEG, WebP, AVIF, GIF, BMP, TIFF                      | PNG, JPEG, WebP, AVIF, GIF, BMP, TIFF |
 | Phone and camera      | HEIC, JPEG XL, camera raw                                  |                                       |
-| Animated              | GIF, APNG, animated WebP and AVIF                          | GIF, APNG                             |
+| Animated              | GIF, APNG, animated WebP and AVIF                          | GIF, APNG, WebP                       |
 | Icons                 | ICO, CUR, Apple icon suites                                | ICO, Apple icon suites                |
 | Design and games      | Photoshop PSD and PSB, DDS                                 |                                       |
 | High dynamic range    | Radiance HDR, OpenEXR                                      | Radiance HDR, OpenEXR                 |
@@ -155,8 +178,9 @@ and Edge have and Safari and Firefox do not yet, and `report.encodePath` says
 PNG is written by this package rather than by a canvas, which means 24 bit
 output when there is no alpha to carry, an indexed palette when the picture has
 few enough colours for that to be lossless, the source ICC profile embedded so
-a wide gamut photograph survives, and no canvas size ceiling. On a phone
-photograph it comes out smaller than the canvas manages.
+a wide gamut photograph survives, an `eXIf` chunk when metadata was asked for,
+and no canvas size ceiling. On a phone photograph it comes out smaller than the
+canvas manages.
 
 ### Animation
 
@@ -169,6 +193,17 @@ encoder.
 const result = await convert(gifBytes, { to: 'apng' });
 result.report.frames; // 12
 ```
+
+Animated WebP is written as well, and the cost of it is worth knowing before
+somebody compares the output with `cwebp`'s. No browser writes an animated WebP
+from a canvas, so each frame is encoded here as an ordinary still and the
+container is assembled around them. Every frame is therefore a keyframe, where
+a purpose-built encoder stores most frames as the difference from the one
+before, and on a mostly static animation that difference is large. The file is
+still a fraction of the GIF it usually came from, because even a keyframe-only
+WebP is a modern lossy codec against 256 colours and LZW. It needs a browser
+whose canvas writes WebP, which Chromium and Firefox do and Safari does not,
+and on Safari no WebP comes out at all, animated or still.
 
 Converting to a format that cannot animate keeps the first frame and says so
 with `report.droppedFrames`, rather than dropping eleven frames in silence.
@@ -212,6 +247,12 @@ png.report.toneMapped; // true
 png.report.exposureStops; // -2
 ```
 
+A floating point TIFF is read as light as well, and only when its samples
+actually pass 1. A float TIFF bounded by 1 is a display picture that happens to
+be stored in floats, which is what a compositor writes out as a final frame,
+and metering one of those against middle grey hands back a photograph several
+stops too bright. It is read the ordinary way instead.
+
 **An HDR photograph from a phone** is a different thing: an ordinary picture
 plus a second, smaller one saying how much brighter each part of it should get,
 and a short parameter block saying how to read the second against the headroom
@@ -246,6 +287,42 @@ Deliberately not supported, as decisions rather than gaps:
 - **Interlaced PNG**, HEIF overlays and identity derivations, RLE compressed
   BMP. Each is refused by name.
 
+## Metadata
+
+EXIF is read from JPEG, PNG, TIFF and HEIC. It is stripped by default, which is
+what somebody converting a photograph to put on the internet wants, and
+`report.metadata` says what was in the file so an interface can name it instead
+of saying "metadata". A WebP's block is read by the same code, but a browser
+with `ImageDecoder` sends every WebP to its frame decoder, which does not hand
+the block over, so do not count on WebP metadata in Chromium.
+
+Ask for it back with `metadata: 'preserve'`:
+
+```ts
+const result = await convert(jpegBytes, { to: 'png', metadata: 'preserve' });
+result.report.metadataKept; // 'kept'
+```
+
+Three output formats here can hold an EXIF block: PNG in an `eXIf` chunk, TIFF
+in its own directories, and AVIF as an `Exif` item with a `cdsc` reference back
+to the picture. Everything else writes the picture and nothing beside it. JPEG
+and WebP go out through the browser's canvas encoder, which strips metadata
+whether you meant it to or not, so `metadata: 'preserve'` into a JPEG reports
+`metadataKept: 'stripped'`. It is reported from what the encoder that actually
+ran declared it can carry, not from what was asked for, because a setting that
+quietly does nothing is worse than one that says so.
+
+The orientation tag is rewritten to 1 on the way out. Every decoder here hands
+back pixels that are already upright, so carrying the source's orientation
+across would tell the next reader to rotate a photograph that has already been
+rotated. Nothing else in the block is touched, and a block with no orientation
+tag in it is copied as it came.
+
+An ICC colour profile is not metadata for this purpose and is carried
+regardless of the setting. It describes how to read the pixels rather than who
+took them, and dropping it would change how the picture looks. That is the
+next section.
+
 ## Colour
 
 An iPhone photograph is in Display P3, not sRGB. Writing those numbers into an
@@ -254,20 +331,69 @@ on something already sRGB oversaturates it by about as much. So the colour
 space is detected per image, from the file, and the source ICC profile is
 carried into the output where the format can hold one.
 
+The test for a wide gamut profile checks all three colourants rather than red
+alone. Adobe RGB, ProPhoto and Rec.2020 all have a red primary further out than
+Display P3's, so a threshold on red admits them too, and an Adobe RGB
+photograph then gets a P3 readback and its own profile written verbatim beside
+the new numbers: P3 pixels tagged Adobe RGB. Every colour-managed viewer
+honours that tag and pulls the picture towards a gamut it was never in, and
+anything that ignores profiles shows it correctly, which is what lets the file
+past a review.
+
 By default a wide gamut image stays wide where the target can express it. Pass
 `colour: 'srgb'` to narrow it deliberately.
 
 ## Sizes
 
-A 48 megapixel photograph is a 195 MB buffer before anything else happens, and
-iOS Safari refuses a single canvas above about 16.7 million pixels. The HEIC
-path composites its tiles into a plain array and the PNG encoder writes from
-that array, so neither needs a canvas and neither hits that ceiling. Paths that
-do need one decline rather than fail, so the ladder falls through to one that
-does not.
+`convert` refuses anything above 80 megapixels by default. Raise or lower that
+with `maxPixels`. Where a format states its dimensions in a header sitting in
+front of a decompressor, the claim is checked before the decompressor is handed
+a budget shaped by it, so a four kilobyte PNG whose header declares 20000 by
+15000 is a sentence rather than a gigabyte allocation. PNG, GIF, PSD and PCX
+read their headers that way. The formats that store pixels plainly do not need
+to, because a file cannot declare an image its own length will not back up.
 
-`convert` refuses anything above 80 megapixels by default. Raise it with
-`maxPixels` if you know what your users are converting.
+Under that ceiling the binding limit is the drawing surface, and it is not a
+constant. iOS Safari holds far less than desktop Chrome, and what it holds is a
+budget across every live canvas rather than a fixed area, so it moves with
+whatever else the tab is doing. Nothing here guesses at it. A path that needs a
+canvas allocates one, paints a pixel and reads it back, because iOS does not
+throw when it runs out: it hands back a canvas of the size you asked for whose
+pixels are all zero, and accepts every drawing call onto it in silence.
+
+A path that cannot get the surface it needs declines with
+`codec/surface-too-large` and the ladder walks past it to a path that needs no
+canvas. The HEIC container reader composites its tiles into a plain array and
+the PNG encoder writes from that array, so a 24 megapixel iPhone photograph
+converts on the phone that took it even though a canvas there could not hold
+it. That code only reaches a caller when nothing else could run either, and
+even then it is a decline rather than a verdict on the file. Convert it again
+with `resize`, which is what the message says.
+
+### Resizing
+
+`resize` caps the longest side and keeps the aspect ratio. It never upscales:
+asking for a longer side than the picture has leaves it alone.
+
+```ts
+const result = await convert(bytes, { to: 'jpeg', resize: { longestSide: 2048 } });
+result.report.width; // 2048
+result.report.resizedFrom; // { width: 8064, height: 6048 }
+```
+
+One number rather than a width and a height, because a portrait photograph and
+a landscape one both want "no bigger than this" and asking for both invites the
+stretch nobody wants. It runs before the alpha flatten and the gamut narrow so
+those walk the smaller picture, and it runs per frame for an animation.
+`report.resizedFrom` is absent when nothing moved, so an interface tests for
+the field rather than comparing two pairs of numbers to find there is nothing
+to say.
+
+A 48 megapixel photograph is a 195 MB buffer before anything else happens, and
+that is the number `resize` exists for. Probing the canvas hands a desktop
+browser back the headroom a constant was taking off it, and the container
+reader gets a phone photograph past a surface that could not hold it. Neither
+of those makes a 48 megapixel picture cheap on a phone. Making it smaller does.
 
 ## The offline app
 

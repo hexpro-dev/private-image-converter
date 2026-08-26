@@ -10,6 +10,16 @@
  * is already sRGB into P3 and then writing it untagged oversaturates it by
  * roughly the same amount that dropping a P3 tag washes one out. Neither
  * throws, and on a wide gamut display both look plausible.
+ *
+ * ## This predicate exists twice
+ *
+ * `src/heif/image.ts` carries its own copy, because ESLint forbids
+ * `src/heif/**` from importing `src/metadata/**` and the container reader needs
+ * the same answer. The duplication is deliberate and fenced rather than
+ * accidental. `tests/metadata/icc.test.ts` imports both and asserts they agree
+ * over a table of real profiles, so the two cannot drift; a change here without
+ * the matching change there fails that test rather than shipping two different
+ * ideas of what wide gamut means.
  */
 
 /**
