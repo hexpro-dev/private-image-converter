@@ -141,6 +141,50 @@ installed for every test file, so a decoder that reports a damaged file
 correctly and leaves a rejected promise behind it fails the run instead of
 ending the process.
 
+### The offline page, from a keyboard and with a screen reader
+
+**The drop area is no longer a button with controls inside it.** It was a div
+with `role="button"` holding a heading, the "Choose a file" label and the
+input: a control nested in a control, which a screen reader can present as
+neither. It is a plain drop target now, and a click anywhere on it still opens
+the picker. From the keyboard the file input itself is the control. It is
+clipped out of sight rather than hidden, so it stays in the tab order, and the
+label after it shows the focus ring while it has focus, which it never did
+before. Enter and Space open the picker.
+
+**Errors are announced, and an error in a batch stays on screen.** The notice
+was a live region that started `hidden`, and a region revealed at the same
+moment as its text is often not announced. There are two regions now, in the
+page from the start and never hidden: errors go to an alert and progress to a
+status. Converting several files used to clear the notice after every success,
+so an error for the first file was wiped by the second before anybody had read
+it. The outcome is said once, at the end, with a line for each file that
+failed.
+
+**A finished conversion is announced in a sentence rather than as the whole
+card.** The results list was a live region, so each result read out its file
+name, both formats, both sizes, the timing and the word Save as one run. The
+list is not live any more. The status region says "Converted. photo.png is
+first in the list." out of sight, because the card already says so on screen,
+and each Save button is described by its file name.
+
+**The quality slider keeps its name.** Its value sat inside its label, so the
+slider was called "Quality 0.92" and renamed itself on every step. The label is
+"Quality", the slider reports its own value, and the number beside the label is
+hidden from screen readers.
+
+**Faint text passes AA.** `--faint` was #7d6b60, which is 3.5:1 on the raised
+panel and 4.0:1 on the page, under the 4.5:1 text needs. It carries the hint
+under the drop heading, the details under each result, the labels in the facts
+list and the footer. It is #958276 now, 4.9:1 on the panel. The format picker's
+border was 1.2:1 against the panel and is 3.5:1 or better.
+
+The build test checks the parts of this that live in the markup: the file
+input's place in the tab order and its focus ring, no control inside another,
+the two live regions, a results list that is not live, and a slider label with
+no value in it. The behaviour was checked by driving the built file in Chromium
+with axe at WCAG 2.2 AA, which reports nothing.
+
 ### Fixed before it shipped
 
 **Portrait photographs came out rotated by 540 degrees.** The HEIF path applies

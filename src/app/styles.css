@@ -13,7 +13,12 @@
 	--edge: #2e2015;
 	--ink: #f2e9e2;
 	--dim: #b3a196;
-	--faint: #7d6b60;
+	/* 4.9:1 on the raised panel, the darkest ground it sits on. It was #7d6b60,
+	   which is 3.5:1 there and short of the 4.5:1 text needs. */
+	--faint: #958276;
+	/* The edge of a control, 3:1 or better against the panel and the control's
+	   own fill so the control can be found. --edge is decoration at 1.2:1. */
+	--edge-control: #7d6b60;
 	--accent: #ff5722;
 	--accent-light: #ff8a65;
 	--glow: rgba(255, 87, 34, 0.24);
@@ -51,13 +56,28 @@ body {
 	padding: clamp(2rem, 6vw, 5rem) clamp(1rem, 4vw, 2.5rem) 4rem;
 }
 
+/*
+ * Out of sight, still in the accessibility tree and still focusable. The file
+ * input wears this, so it stays in the tab order, and the label after it is the
+ * button people see. The label shows the focus ring while the input has focus.
+ */
 .visually-hidden {
 	position: absolute;
 	width: 1px;
 	height: 1px;
+	margin: -1px;
+	padding: 0;
+	border: 0;
 	overflow: hidden;
 	clip: rect(0 0 0 0);
+	clip-path: inset(50%);
 	white-space: nowrap;
+}
+
+:focus-visible,
+.visually-hidden:focus-visible + .button {
+	outline: 2px solid var(--accent-light);
+	outline-offset: 3px;
 }
 
 .eyebrow {
@@ -108,11 +128,6 @@ h1 {
 		background-color 200ms ease;
 }
 
-.drop:focus-visible {
-	outline: 2px solid var(--accent-light);
-	outline-offset: -4px;
-}
-
 .drop[data-dragging='true'] {
 	border-color: var(--accent);
 	background: rgba(255, 87, 34, 0.06);
@@ -156,7 +171,7 @@ input[type='range'] {
 	accent-color: var(--accent);
 	background: var(--surface);
 	color: var(--ink);
-	border: 1px solid var(--edge);
+	border: 1px solid var(--edge-control);
 	border-radius: 8px;
 	padding: 0.45rem 0.6rem;
 	font: inherit;
@@ -210,6 +225,14 @@ input[type='range'] {
 
 .notice[data-kind='error'] {
 	border-color: rgba(255, 87, 34, 0.5);
+}
+
+.notice p {
+	margin: 0;
+}
+
+.notice p + p {
+	margin-top: 0.4rem;
 }
 
 .results {

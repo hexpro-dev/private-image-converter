@@ -717,6 +717,87 @@ describe('the copy the built document ships', () => {
 	});
 });
 
+/** The opening tag of the element carrying this id, or undefined. */
+function tagWithId(id: string): string | undefined {
+	return new RegExp(`<[a-z][a-z0-9]*\\b[^>]*\\sid="${id}"[^>]*>`).exec(markup)?.[0];
+}
+
+describe('the built document can be used without a mouse and without a screen', () => {
+	// None of this shows in a screenshot, and each item was wrong once. They are
+	// properties of the markup the browser is handed, so they are checked here
+	// rather than left to somebody remembering to try a keyboard and a screen
+	// reader before a release.
+
+	it('says what language it is in', () => {
+		expect(markup).toMatch(/<html lang="en">/);
+		expect(markup).toMatch(/<title>[^<]+<\/title>/);
+	});
+
+	it('keeps the file input in the tab order, with a visible focus ring on its label', () => {
+		// The input is clipped out of sight rather than hidden, because `hidden`
+		// and `display: none` both take it out of the tab order. The label that
+		// follows it is the button people see, and wears the focus ring while the
+		// input has focus. That selector needs the label to come straight after
+		// the input.
+		const input = tagWithId('file');
+		expect(input, 'the file input is missing').toBeDefined();
+		expect(input).toContain('class="visually-hidden"');
+		expect(input).not.toMatch(/\shidden\b|tabindex/);
+		expect(markup).toMatch(
+			/id="file"[^>]*\/>\s*<label class="button button--primary" for="file">Choose a file<\/label>/,
+		);
+		expect(style).toContain('.visually-hidden:focus-visible+.button');
+		const rule = /\.visually-hidden\{([^}]*)\}/.exec(style)?.[1] ?? '';
+		expect(rule).toContain('position:absolute');
+		expect(rule).not.toMatch(/display:\s*none|visibility:\s*hidden/);
+	});
+
+	it('nests no control inside another', () => {
+		// The drop area used to be a div with role="button" holding a heading, the
+		// label and the input: a control inside a control, which a screen reader
+		// can present as neither. It is a plain drop target now, and the file
+		// input is the control.
+		expect(markup).not.toMatch(/role="button"/);
+		expect(markup).not.toMatch(/tabindex=/);
+		for (const found of markup.matchAll(/<(label|button|a|summary)\b[^>]*>([\s\S]*?)<\/\1>/g)) {
+			expect(found[2], `a control inside a <${found[1]}>`).not.toMatch(
+				/<(?:input|button|select|textarea|a|label)\b/,
+			);
+		}
+	});
+
+	it('has its live regions in the page from the start, never hidden', () => {
+		// A region that is inserted, or unhidden, at the same moment as its text
+		// is often not announced. These two are there before anything happens and
+		// only their contents change.
+		for (const [id, role] of [
+			['status', 'role="status"'],
+			['alert', 'role="alert"'],
+		] as const) {
+			const tag = tagWithId(id);
+			expect(tag, `#${id} is missing`).toBeDefined();
+			expect(tag).toContain(role);
+			expect(tag, `#${id} starts hidden`).not.toMatch(/\shidden\b/);
+		}
+	});
+
+	it('does not read out the whole result card when one arrives', () => {
+		// The results list was a live region, so every finished conversion read
+		// the file name, the format, both sizes, the timing and the word Save as
+		// one sentence. The status region says what happened instead.
+		expect(tagWithId('results')).not.toMatch(/aria-live|role=/);
+		expect(markup.match(/aria-live=/g) ?? []).toHaveLength(0);
+	});
+
+	it('gives the quality slider a name that does not change as it moves', () => {
+		// The value used to sit inside the label, so the slider's name was
+		// "Quality 0.92" and changed on every step. The slider announces its own
+		// value, and the number on screen is hidden from screen readers.
+		expect(markup).toMatch(/<label for="quality">Quality<\/label>/);
+		expect(tagWithId('quality-value')).toContain('aria-hidden="true"');
+	});
+});
+
 describe('the size of the built document', () => {
 	// The bounds are deliberately wide, because the bundle moves with every
 	// codec added and this should not need editing for that. The floor catches
