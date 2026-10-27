@@ -69,6 +69,13 @@ repository and this workflow filename. Renaming the workflow file or moving the
 repository invalidates it, and that is the intended behaviour. Job names are not
 part of that configuration.
 
+npm only accepts a trusted publisher on a package that already exists, so 0.1.0
+was published by hand (`npm publish --access public`, which runs
+`prepublishOnly`) before its tag was pushed. The workflow checks the registry
+first and skips the publish when the version is already there, so that tag
+still produced the GitHub release, its `SHA256SUMS` and the attestation. Every
+later version goes through the workflow alone.
+
 `npm` is installed explicitly in that job because trusted publishing needs npm
 11.5.1 or later and Node 22 ships with 10.
 
