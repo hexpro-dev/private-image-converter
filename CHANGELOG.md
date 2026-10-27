@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.0
 
-First working version. Nothing has been published yet.
+The first published release.
 
 ### The HEIC path
 
