@@ -32,18 +32,50 @@ const quality = $<HTMLInputElement>('quality');
 const qualityValue = $<HTMLSpanElement>('quality-value');
 const qualityField = $<HTMLDivElement>('quality-field');
 const keepMetadata = $<HTMLInputElement>('keep-metadata');
-const notice = $<HTMLDivElement>('notice');
+const status = $<HTMLDivElement>('status');
+const alert = $<HTMLDivElement>('alert');
 const results = $<HTMLElement>('results');
 
-function say(text: string, kind: 'info' | 'error' = 'info'): void {
-	notice.textContent = text;
-	notice.dataset.kind = kind;
-	notice.hidden = false;
+/**
+ * Put a notice on screen, in the live region that suits it.
+ *
+ * Both regions are in the document from the start and are never hidden: a
+ * region that appears at the same moment as its text is often not announced.
+ * Errors go to the alert, which interrupts, and progress to the status, which
+ * waits its turn. Each line is a paragraph of its own, so a batch with several
+ * failures reads as several sentences rather than one run on.
+ */
+function say(lines: string | readonly string[], kind: 'info' | 'error' = 'info'): void {
+	clearNotice();
+	const box = document.createElement('div');
+	box.className = 'notice';
+	box.dataset.kind = kind;
+	for (const line of typeof lines === 'string' ? [lines] : lines) {
+		const paragraph = document.createElement('p');
+		paragraph.textContent = line;
+		box.append(paragraph);
+	}
+	(kind === 'error' ? alert : status).append(box);
+}
+
+/**
+ * Tell a screen reader something a sighted person can already see.
+ *
+ * A finished conversion is a new card at the top of the list. That is plain on
+ * screen and silent otherwise, so the same news goes into the status region,
+ * out of sight.
+ */
+function announce(text: string): void {
+	clearNotice();
+	const line = document.createElement('p');
+	line.className = 'visually-hidden';
+	line.textContent = text;
+	status.append(line);
 }
 
 function clearNotice(): void {
-	notice.hidden = true;
-	notice.textContent = '';
+	status.textContent = '';
+	alert.textContent = '';
 }
 
 function updateQualityVisibility(): void {
@@ -88,6 +120,9 @@ function metadataLine(result: ConvertResult): string | undefined {
 	return `Removed ${removed.join(', ')}.`;
 }
 
+/** Numbers the cards, for the ids their Save buttons point at. */
+let resultCount = 0;
+
 function render(result: ConvertResult, filename: string, blob: Blob): void {
 	const card = document.createElement('article');
 	card.className = 'result';
@@ -121,6 +156,7 @@ function render(result: ConvertResult, filename: string, blob: Blob): void {
 	const name = document.createElement('p');
 	name.className = 'result__name';
 	name.textContent = filename;
+	name.id = `result-${++resultCount}`;
 
 	const meta = document.createElement('p');
 	meta.className = 'result__meta';
@@ -186,6 +222,9 @@ function render(result: ConvertResult, filename: string, blob: Blob): void {
 	save.className = 'button button--primary';
 	save.type = 'button';
 	save.textContent = 'Save';
+	// Every card has a button called Save. The file name tells them apart, as a
+	// description, so the name stays the word on the button.
+	save.setAttribute('aria-describedby', name.id);
 	save.addEventListener('click', () => {
 		try {
 			downloadBlob(blob, filename);
@@ -206,10 +245,11 @@ let running = false;
 async function take(files: readonly File[]): Promise<void> {
 	if (files.length === 0 || running) return;
 	running = true;
-	clearNotice();
 	say(files.length === 1 ? 'Converting.' : `Converting ${files.length} images.`);
 
 	const to = target.value as FormatId;
+	const failures: string[] = [];
+	let lastName = '';
 	for (const file of files) {
 		try {
 			const bytes = new Uint8Array(await file.arrayBuffer());
@@ -219,18 +259,35 @@ async function take(files: readonly File[]): Promise<void> {
 				metadata: keepMetadata.checked ? 'preserve' : 'strip',
 			});
 			const blob = new Blob([result.bytes as BlobPart], { type: result.mime });
-			render(result, outputName(file.name, result.extension), blob);
-			clearNotice();
+			lastName = outputName(file.name, result.extension);
+			render(result, lastName, blob);
 		} catch (error) {
 			// A converter error carries a sentence written to be read. Anything
 			// else is a bug here and says so rather than pretending otherwise.
-			say(
-				isConverterError(error) ? error.message : 'Something went wrong converting that file.',
-				'error',
-			);
+			const reason = isConverterError(error)
+				? error.message
+				: 'Something went wrong converting that file.';
+			failures.push(files.length === 1 ? reason : `${file.name}: ${reason}`);
 		}
 	}
 	running = false;
+
+	// Said once, at the end. Clearing the notice after each success used to
+	// wipe the error for an earlier file in the same batch before anybody had
+	// read it.
+	const converted = files.length - failures.length;
+	if (failures.length > 0) {
+		say(
+			files.length === 1 ? failures : [`Converted ${converted} of ${files.length}.`, ...failures],
+			'error',
+		);
+	} else {
+		announce(
+			files.length === 1
+				? `Converted. ${lastName} is first in the list.`
+				: `Converted ${converted} images. They are first in the list.`,
+		);
+	}
 }
 
 drop.addEventListener('dragover', (event) => {
@@ -245,12 +302,16 @@ drop.addEventListener('drop', (event) => {
 	drop.dataset.dragging = 'false';
 	void take(Array.from(event.dataTransfer?.files ?? []));
 });
-drop.addEventListener('click', () => fileInput.click());
-drop.addEventListener('keydown', (event) => {
-	if (event.key === 'Enter' || event.key === ' ') {
-		event.preventDefault();
-		fileInput.click();
-	}
+// The whole drop area opens the picker for a pointer. From the keyboard the
+// file input is the control: it is focusable, its label shows the focus ring,
+// and Enter or Space opens it. The area is not a button itself, because a
+// button holding a heading, a label and an input is a control nested in a
+// control, which a screen reader cannot present as either.
+drop.addEventListener('click', (event) => {
+	// The label opens the picker on its own, and the click it sends to the input
+	// bubbles here as well.
+	if (event.target instanceof Element && event.target.closest('label, input')) return;
+	fileInput.click();
 });
 
 fileInput.addEventListener('change', () => {
