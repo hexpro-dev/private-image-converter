@@ -1,9 +1,29 @@
-# private-image-converter
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/hexpro-dev/.github/main/profile/assets/banner-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/hexpro-dev/.github/main/profile/assets/banner-light.png">
+  <img alt="Hex Pro: Software for People" src="https://raw.githubusercontent.com/hexpro-dev/.github/main/profile/assets/banner-light.png" width="100%">
+</picture>
+
+<p align="center">
+  <a href="https://hex.pro"><img alt="hex.pro" src="https://img.shields.io/badge/hex.pro-the%20company-0B76D9?style=flat-square&labelColor=1b2530"></a>
+  <a href="https://apps.hex.pro"><img alt="apps.hex.pro" src="https://img.shields.io/badge/apps.hex.pro-apps%20%26%20tools-0B76D9?style=flat-square&labelColor=1b2530"></a>
+  <a href="https://citadel.hex.pro"><img alt="citadel.hex.pro" src="https://img.shields.io/badge/citadel.hex.pro-file%20sync-0B76D9?style=flat-square&labelColor=1b2530"></a>
+  <a href="https://games.hex.pro"><img alt="Hex Games" src="https://img.shields.io/badge/Hex%20Games-the%20game%20studio-9F9F9F?style=flat-square&logo=github&logoColor=white&labelColor=1b2530"></a>
+  <img alt="Australian owned and operated" src="https://img.shields.io/badge/Australian-owned%20%26%20operated-9F9F9F?style=flat-square&labelColor=1b2530">
+</p>
+
+# Private Image Converter: Free Image Converter with No Upload and No Server
 
 Convert images in the browser, including HEIC from an iPhone, without uploading
 them anywhere. Twenty-six formats, including the awkward ones: TIFF, Photoshop,
 DDS, OpenEXR, Radiance HDR, Apple icon suites and the preview inside a camera
 raw file.
+
+[![npm: @hexpro/private-image-converter](https://img.shields.io/npm/v/@hexpro/private-image-converter?style=flat-square&logo=npm&label=%40hexpro%2Fprivate-image-converter&color=ff5722)](https://www.npmjs.com/package/@hexpro/private-image-converter)
+[![Use it online](https://img.shields.io/badge/apps.hex.pro-Use_it_online-ff5722?style=flat-square)](https://apps.hex.pro/tools/private-image-converter)
+[![Offline app](https://img.shields.io/github/v/release/hexpro-dev/private-image-converter?style=flat-square&label=offline%20app&color=5ba3f5)](https://github.com/hexpro-dev/private-image-converter/releases/latest)
+[![Licence: MIT](https://img.shields.io/badge/licence-MIT-5ba3f5?style=flat-square)](LICENSE)
+[![No runtime dependencies](https://img.shields.io/badge/runtime_dependencies-none-9b958c?style=flat-square)](package.json)
 
 An HDR photograph off a phone stays an HDR photograph when it becomes an AVIF,
 and an OpenEXR keeps its full range when it becomes a Radiance file. Both are
