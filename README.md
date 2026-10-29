@@ -12,7 +12,9 @@
   <img alt="Australian owned and operated" src="https://img.shields.io/badge/Australian-owned%20%26%20operated-9F9F9F?style=flat-square&labelColor=1b2530">
 </p>
 
-# Private Image Converter: Free Image Converter with No Upload and No Server
+# Private Image Converter
+
+> _Free Image Converter with No Upload and No Server_
 
 Convert images in the browser, including HEIC from an iPhone, without uploading
 them anywhere. Twenty-six formats, including the awkward ones: TIFF, Photoshop,
