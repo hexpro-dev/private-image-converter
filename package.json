@@ -1,5 +1,4 @@
 {
-	"dependencies": {},
 	"name": "@hexpro/private-image-converter",
 	"version": "0.1.0",
 	"description": "Convert images between formats entirely in the browser, including HEIC from an iPhone, with no upload and no runtime dependencies",
@@ -77,6 +76,7 @@
 		"test:coverage": "vitest run --coverage",
 		"prepublishOnly": "pnpm run clean && pnpm run build:all && pnpm run typecheck && pnpm run test"
 	},
+	"dependencies": {},
 	"devDependencies": {
 		"@eslint/js": "^9.39.5",
 		"@types/node": "^22.20.5",
